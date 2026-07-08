@@ -8,7 +8,7 @@ from app.db.models.knowledge_base import KnowledgeBase, KnowledgeBaseMember
 from app.db.models.llm_call_log import LlmCallLog
 from app.db.models.refresh_token import RefreshToken
 from app.db.models.retrieval_log import RetrievalLog
-from app.db.models.user_memory import UserMemory
+from app.db.models.user_memory import UserMemory, UserMemoryEvent, UserMemoryRecallLog, UserMemoryUpdateJob
 from app.db.models.user import User
 
 __all__ = [
@@ -27,4 +27,7 @@ __all__ = [
     "RetrievalLog",
     "User",
     "UserMemory",
+    "UserMemoryEvent",
+    "UserMemoryRecallLog",
+    "UserMemoryUpdateJob",
 ]

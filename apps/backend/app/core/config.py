@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PRODUCTION_ENVS = {"prod", "production"}
 INSECURE_JWT_SECRETS = {"", "change-me", "dev-only-change-me", "dev-only-change-me-dev-secret-32-bytes"}
 MIN_PRODUCTION_JWT_SECRET_LENGTH = 32
+ALLOWED_MEMORY_UPDATE_MODES = {"sync", "async", "disabled"}
 
 
 class Settings(BaseSettings):
@@ -18,6 +19,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "knowledge_chunks"
+    memory_qdrant_collection: str = "user_memories"
+    memory_vector_index_enabled: bool = False
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"
@@ -30,6 +33,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = 30
     agent_graph_backend: str = "langgraph"
     short_memory_max_messages: int = 12
+    memory_context_max_chars: int = 3000
+    memory_context_max_tokens: int = 900
+    memory_update_mode: str = "sync"
     memory_semantic_threshold: float = 0.82
     embedding_provider: str = "openai_compatible"
     embedding_base_url: str = "https://api.openai.com/v1"
@@ -94,6 +100,8 @@ def validate_runtime_settings(settings: Settings) -> None:
         errors.append("EMBEDDING_PROVIDER must be openai_compatible in production")
     if not settings.embedding_api_key.strip():
         errors.append("EMBEDDING_API_KEY must be set in production")
+    if settings.memory_update_mode.strip().lower() not in ALLOWED_MEMORY_UPDATE_MODES:
+        errors.append("MEMORY_UPDATE_MODE must be one of sync, async, disabled")
 
     if errors:
         raise RuntimeError("Invalid production settings: " + "; ".join(errors))

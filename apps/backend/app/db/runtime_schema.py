@@ -9,12 +9,27 @@ def ensure_runtime_schema(engine: Engine) -> None:
     inspector = inspect(engine)
     dialect = engine.dialect.name
 
-    Base.metadata.create_all(bind=engine, tables=[Base.metadata.tables["departments"]])
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[
+            Base.metadata.tables["departments"],
+            Base.metadata.tables["user_memory_events"],
+            Base.metadata.tables["user_memory_recall_logs"],
+            Base.metadata.tables["user_memory_update_jobs"],
+        ],
+    )
     add_column_if_missing(engine, inspector, "users", "department_id", "department_id VARCHAR(36)")
     add_column_if_missing(engine, inspector, "users", "security_level", "security_level INTEGER NOT NULL DEFAULT 1")
     add_column_if_missing(engine, inspector, "knowledge_bases", "department_id", "department_id VARCHAR(36)")
     add_column_if_missing(engine, inspector, "documents", "security_level", "security_level INTEGER NOT NULL DEFAULT 1")
     add_column_if_missing(engine, inspector, "conversations", "summary", "summary TEXT")
+    add_column_if_missing(
+        engine,
+        inspector,
+        "conversations",
+        "summary_message_count",
+        "summary_message_count INTEGER NOT NULL DEFAULT 0",
+    )
     add_column_if_missing(engine, inspector, "conversations", "search_scope", "search_scope VARCHAR(30) NOT NULL DEFAULT 'single'")
     add_column_if_missing(engine, inspector, "conversations", "search_department_id", "search_department_id VARCHAR(36)")
     make_column_nullable_if_supported(engine, inspector, "conversations", "knowledge_base_id")

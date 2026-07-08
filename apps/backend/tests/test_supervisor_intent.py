@@ -21,8 +21,15 @@ class SupervisorIntentTests(unittest.TestCase):
     def test_memory_recall_routes_to_memory(self) -> None:
         self.assertEqual(normalize_intent("memory", "你记得我什么？"), "memory")
 
+    def test_full_memory_recall_routes_to_memory_even_if_llm_says_rag(self) -> None:
+        self.assertEqual(normalize_intent("rag", "\u4f60\u90fd\u8bb0\u5f97\u6211\u4ec0\u4e48\uff1f"), "memory")
+
     def test_enterprise_question_overrides_memory_label(self) -> None:
         self.assertEqual(normalize_intent("memory", "我的报销政策是什么？"), "rag")
+
+    def test_enterprise_memory_wording_still_routes_to_rag(self) -> None:
+        self.assertEqual(normalize_intent("rag", "你记得报销政策吗？"), "rag")
+        self.assertEqual(normalize_intent("memory", "你记得报销政策吗？"), "rag")
 
 
 if __name__ == "__main__":

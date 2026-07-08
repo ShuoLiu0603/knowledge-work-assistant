@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from app.db.models.document import Document, DocumentChunk
 from app.rag.advanced_retrieval import (
@@ -10,6 +11,7 @@ from app.rag.advanced_retrieval import (
     plan_retrieval_queries,
     retrieve_bm25_routes,
 )
+from app.rag.query_rewrite import QueryRewritePlan
 from app.rag.retrieval import RetrievedChunk
 from app.schemas.knowledge_base import KnowledgeBaseCreate
 from app.services.knowledge_base_service import create_knowledge_base
@@ -17,15 +19,38 @@ from helpers import create_user, isolated_session
 
 
 class AdvancedRetrievalTests(unittest.TestCase):
-    def test_plan_uses_original_query_and_limited_sub_queries(self) -> None:
-        normalized, sub_queries, retrieval_queries = plan_retrieval_queries(
-            "请问 RAG 和长期记忆分别怎么参与回答？"
+    def test_plan_uses_llm_rewrite_and_limited_sub_queries(self) -> None:
+        rewrite_plan = QueryRewritePlan(
+            rewritten_query="RAG retrieval and long-term memory answer flow",
+            sub_questions=["RAG retrieval flow", "long-term memory answer flow"],
         )
 
-        self.assertEqual(normalized, "RAG 和长期记忆分别怎么参与回答")
-        self.assertEqual(retrieval_queries[0], "请问 RAG 和长期记忆分别怎么参与回答？")
-        self.assertLessEqual(len(sub_queries), 3)
-        self.assertEqual(retrieval_queries[1:], sub_queries)
+        with patch("app.rag.advanced_retrieval.rewrite_query", return_value=rewrite_plan):
+            rewritten, sub_queries, retrieval_queries = plan_retrieval_queries(
+                "How do RAG and long-term memory participate in answering?"
+            )
+
+        self.assertEqual(rewritten, "RAG retrieval and long-term memory answer flow")
+        self.assertEqual(sub_queries, ["RAG retrieval flow", "long-term memory answer flow"])
+        self.assertEqual(
+            retrieval_queries,
+            [
+                "How do RAG and long-term memory participate in answering?",
+                "RAG retrieval and long-term memory answer flow",
+                "RAG retrieval flow",
+                "long-term memory answer flow",
+            ],
+        )
+
+    def test_plan_falls_back_when_llm_rewrite_is_unavailable(self) -> None:
+        rewrite_plan = QueryRewritePlan(rewritten_query="RAG fallback behavior", sub_questions=[])
+
+        with patch("app.rag.advanced_retrieval.rewrite_query", return_value=rewrite_plan):
+            rewritten, sub_queries, retrieval_queries = plan_retrieval_queries("Please explain RAG?")
+
+        self.assertEqual(rewritten, "RAG fallback behavior")
+        self.assertEqual(sub_queries, [])
+        self.assertEqual(retrieval_queries, ["Please explain RAG?", "RAG fallback behavior"])
 
     def test_rrf_dedupes_chunks_and_rewards_multi_route_hits(self) -> None:
         chunk_a = make_chunk("a", score=0.3)
@@ -132,6 +157,28 @@ class AdvancedRetrievalTests(unittest.TestCase):
 
             self.assertEqual({item.chunk.file_name for item in routes["bm25_original"]}, {"first.md", "second.md"})
 
+    def test_bm25_can_match_file_and_section_metadata(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "bm25-metadata@example.com", "BM25 Metadata")
+            kb = create_knowledge_base(session, user.id, KnowledgeBaseCreate(name="Metadata BM25 KB"))
+            document = make_document_row(kb.id, "travel-policy.md", "metadata-bm25", status="indexed")
+            session.add(document)
+            session.flush()
+            chunk = make_chunk_row(document, "hotel reimbursement limit is 300")
+            chunk.title_path = "Finance / Travel"
+            chunk.section_name = "Travel Rules"
+            session.add(chunk)
+            session.commit()
+
+            routes = retrieve_bm25_routes(
+                session,
+                kb.id,
+                ["travel rules"],
+                route_limit=10,
+                max_security_level=1,
+            )
+
+            self.assertEqual([item.chunk.file_name for item in routes["bm25_original"]], ["travel-policy.md"])
 
 def make_chunk(chunk_id: str, score: float, content: str | None = None) -> RetrievedChunk:
     return RetrievedChunk(

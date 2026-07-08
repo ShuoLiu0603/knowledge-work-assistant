@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.db.session import engine
-from app.rag.vector_store import qdrant_request
+from app.rag.vector_store import get_qdrant_client
 
 
 HealthCheck = dict[str, str]
@@ -53,7 +53,7 @@ def check_redis() -> HealthCheck:
 
 def check_qdrant() -> HealthCheck:
     try:
-        qdrant_request("GET", "/collections", timeout=3)
+        get_qdrant_client(timeout=3).get_collections()
         return ok()
     except Exception as exc:
         return failed(exc)

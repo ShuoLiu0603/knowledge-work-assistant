@@ -5,8 +5,8 @@ from sqlalchemy import delete
 from app.core.config import get_settings
 from app.db.models.document import Document, DocumentChunk
 from app.db.session import SessionLocal, init_db
-from app.rag.loaders import parse_document
-from app.rag.splitters import split_blocks
+from app.rag.loaders import load_documents
+from app.rag.splitters import split_documents
 from app.rag.vector_store import delete_document_vectors, upsert_document_chunks
 from app.storage.minio_client import download_bytes
 from app.workers.celery_app import celery_app
@@ -29,16 +29,16 @@ def process_document(document_id: str) -> dict[str, int | str]:
             db.commit()
 
             file_bytes = download_bytes(document.object_key)
-            blocks = parse_document(file_bytes, document.file_name, document.file_ext)
-            if not blocks:
+            loaded_documents = load_documents(file_bytes, document.file_name, document.file_ext)
+            if not loaded_documents:
                 raise ValueError("No readable text was extracted from the document")
 
             document.status = "chunking"
             db.add(document)
             db.commit()
 
-            chunks = split_blocks(
-                blocks,
+            chunks = split_documents(
+                loaded_documents,
                 chunk_size=settings.default_chunk_size,
                 chunk_overlap=settings.default_chunk_overlap,
             )
@@ -54,17 +54,18 @@ def process_document(document_id: str) -> dict[str, int | str]:
             delete_document_vectors(document.id)
             chunk_rows: list[DocumentChunk] = []
             for index, chunk in enumerate(chunks):
+                metadata = chunk.metadata
                 chunk_row = DocumentChunk(
                     document_id=document.id,
                     knowledge_base_id=document.knowledge_base_id,
                     chunk_index=index,
-                    content=chunk.content,
-                    token_count=chunk.token_count,
-                    title_path=chunk.title_path,
-                    page_number=chunk.page_number,
-                    section_name=chunk.section_name,
+                    content=chunk.page_content,
+                    token_count=int(metadata.get("token_count") or 0),
+                    title_path=metadata_text(metadata, "title_path"),
+                    page_number=metadata_int(metadata, "page_number"),
+                    section_name=metadata_text(metadata, "section_name"),
                     security_level=document.security_level,
-                    extra_metadata=chunk.metadata,
+                    extra_metadata=metadata,
                 )
                 db.add(chunk_row)
                 chunk_rows.append(chunk_row)
@@ -92,3 +93,13 @@ def process_document(document_id: str) -> dict[str, int | str]:
             except Exception:
                 pass
             return {"document_id": document.id, "status": document.status, "chunk_count": 0}
+
+
+def metadata_text(metadata: dict, key: str) -> str | None:
+    value = metadata.get(key)
+    return value if isinstance(value, str) else None
+
+
+def metadata_int(metadata: dict, key: str) -> int | None:
+    value = metadata.get(key)
+    return value if isinstance(value, int) else None

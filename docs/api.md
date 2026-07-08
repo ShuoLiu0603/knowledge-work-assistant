@@ -112,9 +112,17 @@ Agent trace 用于展示 Memory、Supervisor、RAG、Summary、Writing 等节点
 | Method | Path | 说明 |
 |---|---|---|
 | GET | `/api/memories` | 当前用户长期记忆列表，可按 `status` 过滤 |
+| GET | `/api/memories/export` | 导出当前用户的记忆、记忆事件、召回日志和异步更新任务 |
+| GET | `/api/memories/recall-metrics` | 当前用户记忆召回质量聚合指标 |
+| GET | `/api/memories/update-jobs` | 当前用户异步记忆更新任务列表，可按 `status` 过滤 |
+| POST | `/api/memories/update-jobs/{job_id}/retry` | 重试 queued 或 failed 记忆更新任务 |
 | POST | `/api/memories` | 手动创建长期记忆 |
 | PATCH | `/api/memories/{memory_id}` | 更新记忆内容、状态、分类或类型 |
+| POST | `/api/memories/{memory_id}/approve` | 批准一条 pending 记忆并激活 |
+| POST | `/api/memories/{memory_id}/reject` | 拒绝一条 pending 记忆并标记为 ignored |
+| POST | `/api/memories/{memory_id}/restore` | 恢复一条 soft-deleted 记忆 |
 | DELETE | `/api/memories/{memory_id}` | 删除长期记忆 |
+| DELETE | `/api/memories/{memory_id}/purge` | 永久清除单条记忆和对应向量索引，保留 purge 审计快照 |
 
 长期记忆服务会对用户偏好执行精确去重、相似合并和冲突覆盖，避免重复 active 记录。
 

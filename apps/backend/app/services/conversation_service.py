@@ -159,6 +159,7 @@ def stream_message_response(
             search_scope=conversation.search_scope,
             department_id=conversation.search_department_id,
             conversation_id=conversation.id,
+            message_id=user_message.id,
             cancel_event=cancel_event,
         ):
             if stream_event["type"] == "token":
@@ -244,6 +245,7 @@ def run_agent_streaming(
     search_scope: str,
     department_id: str | None,
     conversation_id: str,
+    message_id: str | None = None,
     cancel_event: Event | None = None,
 ) -> Iterator[dict]:
     queue: Queue[tuple[str, object | None]] = Queue()
@@ -267,6 +269,7 @@ def run_agent_streaming(
                 search_scope=search_scope,
                 department_id=department_id,
                 conversation_id=conversation_id,
+                message_id=message_id,
                 on_token=enqueue_token,
             )
             queue.put(("agent_run_id", run.id))

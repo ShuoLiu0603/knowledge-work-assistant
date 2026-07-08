@@ -1,228 +1,125 @@
 from __future__ import annotations
 
-import csv
-import re
-from dataclasses import dataclass, field
-from io import BytesIO, StringIO
+import os
+import warnings
+from importlib import import_module
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from docx import Document as DocxDocument
-from pypdf import PdfReader
+from langchain_core.documents import Document
+
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+SUPPORTED_EXTENSIONS = {"pdf", "docx", "txt", "md", "csv"}
+MARKDOWN_HEADERS = [
+    ("#", "h1"),
+    ("##", "h2"),
+    ("###", "h3"),
+    ("####", "h4"),
+    ("#####", "h5"),
+    ("######", "h6"),
+]
 
 
-@dataclass
-class ParsedBlock:
-    text: str
-    page_number: int | None = None
-    title_path: str | None = None
-    section_name: str | None = None
-    block_type: str = "paragraph"
-    metadata: dict = field(default_factory=dict)
+def load_documents(file_bytes: bytes, file_name: str, file_ext: str) -> list[Document]:
+    ext = normalize_extension(file_ext)
+    with TemporaryDirectory() as temp_dir:
+        file_path = Path(temp_dir) / temporary_file_name(file_name, ext)
+        file_path.write_bytes(file_bytes)
+        documents = build_loader(file_path, ext).load()
 
-
-def parse_document(file_bytes: bytes, file_name: str, file_ext: str) -> list[ParsedBlock]:
-    ext = file_ext.lower().lstrip(".")
-    if ext == "pdf":
-        return parse_pdf(file_bytes, file_name)
-    if ext == "docx":
-        return parse_docx(file_bytes, file_name)
-    if ext == "txt":
-        return parse_txt(file_bytes, file_name)
     if ext == "md":
-        return parse_markdown(file_bytes, file_name)
+        documents = split_markdown_documents(documents)
+
+    return [normalize_document(document, file_name, ext) for document in documents if document.page_content.strip()]
+
+
+def build_loader(file_path: Path, ext: str):
+    if ext == "pdf":
+        PyPDFLoader = import_community_loader("langchain_community.document_loaders.pdf", "PyPDFLoader")
+        return PyPDFLoader(str(file_path), mode="page")
+    if ext == "docx":
+        Docx2txtLoader = import_community_loader("langchain_community.document_loaders.word_document", "Docx2txtLoader")
+        return Docx2txtLoader(str(file_path))
     if ext == "csv":
-        return parse_csv(file_bytes, file_name)
-    raise ValueError(f"Unsupported file extension: {file_ext}")
+        CSVLoader = import_community_loader("langchain_community.document_loaders.csv_loader", "CSVLoader")
+        return CSVLoader(str(file_path), autodetect_encoding=True)
+    if ext in {"txt", "md"}:
+        TextLoader = import_community_loader("langchain_community.document_loaders.text", "TextLoader")
+        return TextLoader(str(file_path), autodetect_encoding=True)
+    raise ValueError(f"Unsupported file extension: {ext}")
 
 
-def clean_text(value: str) -> str:
-    normalized = value.replace("\u3000", " ")
-    normalized = re.sub(r"[ \t\r\f\v]+", " ", normalized)
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    return normalized.strip()
+def import_community_loader(module_path: str, class_name: str):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        module = import_module(module_path)
+    return getattr(module, class_name)
 
 
-def decode_text(file_bytes: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
-        try:
-            return file_bytes.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return file_bytes.decode("utf-8", errors="replace")
+def split_markdown_documents(documents: list[Document]) -> list[Document]:
+    from langchain_text_splitters.markdown import MarkdownHeaderTextSplitter
 
-
-def parse_pdf(file_bytes: bytes, file_name: str) -> list[ParsedBlock]:
-    reader = PdfReader(BytesIO(file_bytes))
-    blocks: list[ParsedBlock] = []
-    for index, page in enumerate(reader.pages, start=1):
-        text = clean_text(page.extract_text() or "")
-        if text:
-            blocks.append(
-                ParsedBlock(
-                    text=text,
-                    page_number=index,
-                    block_type="page",
-                    metadata={"file_name": file_name},
+    splitter = MarkdownHeaderTextSplitter(headers_to_split_on=MARKDOWN_HEADERS, strip_headers=False)
+    split_documents: list[Document] = []
+    for document in documents:
+        for section in splitter.split_text(document.page_content):
+            split_documents.append(
+                Document(
+                    page_content=section.page_content,
+                    metadata={**document.metadata, **section.metadata},
                 )
             )
-    return blocks
+    return split_documents or documents
 
 
-def parse_docx(file_bytes: bytes, file_name: str) -> list[ParsedBlock]:
-    document = DocxDocument(BytesIO(file_bytes))
-    headings: list[str] = []
-    blocks: list[ParsedBlock] = []
-
-    for paragraph in document.paragraphs:
-        text = clean_text(paragraph.text)
-        if not text:
-            continue
-
-        style_name = paragraph.style.name if paragraph.style else ""
-        if style_name.startswith("Heading"):
-            level = _heading_level(style_name)
-            headings = headings[: level - 1]
-            headings.append(text)
-            blocks.append(
-                ParsedBlock(
-                    text=text,
-                    title_path=" / ".join(headings),
-                    section_name=text,
-                    block_type="heading",
-                    metadata={"file_name": file_name, "style": style_name},
-                )
-            )
-        else:
-            blocks.append(
-                ParsedBlock(
-                    text=text,
-                    title_path=" / ".join(headings) or None,
-                    section_name=headings[-1] if headings else None,
-                    block_type="paragraph",
-                    metadata={"file_name": file_name, "style": style_name},
-                )
-            )
-
-    for table_index, table in enumerate(document.tables, start=1):
-        rows = []
-        for row in table.rows:
-            cells = [clean_text(cell.text) for cell in row.cells]
-            if any(cells):
-                rows.append(" | ".join(cells))
-        if rows:
-            blocks.append(
-                ParsedBlock(
-                    text="\n".join(rows),
-                    title_path=" / ".join(headings) or None,
-                    section_name=headings[-1] if headings else None,
-                    block_type="table",
-                    metadata={"file_name": file_name, "table_index": table_index},
-                )
-            )
-
-    return blocks
+def normalize_document(document: Document, file_name: str, ext: str) -> Document:
+    metadata = normalize_metadata(document.metadata, file_name, ext)
+    return Document(page_content=document.page_content.strip(), metadata=metadata)
 
 
-def parse_txt(file_bytes: bytes, file_name: str) -> list[ParsedBlock]:
-    text = decode_text(file_bytes)
-    paragraphs = [clean_text(part) for part in re.split(r"\n\s*\n", text)]
-    return [
-        ParsedBlock(text=paragraph, block_type="paragraph", metadata={"file_name": file_name})
-        for paragraph in paragraphs
-        if paragraph
-    ]
+def normalize_metadata(metadata: dict, file_name: str, ext: str) -> dict:
+    normalized = {key: value for key, value in metadata.items() if key != "source"}
+    normalized["file_name"] = file_name
+    normalized["source_ext"] = f".{ext}"
+    normalized["block_type"] = block_type_for(ext)
+
+    page = normalized.get("page")
+    if isinstance(page, int):
+        normalized["page_number"] = page + 1
+
+    row = normalized.get("row")
+    if ext == "csv" and isinstance(row, int):
+        normalized["row_number"] = row + 1
+
+    title_parts = [normalized[key] for _, key in MARKDOWN_HEADERS if normalized.get(key)]
+    if title_parts:
+        normalized["title_path"] = " / ".join(title_parts)
+        normalized["section_name"] = title_parts[-1]
+
+    return normalized
 
 
-def parse_markdown(file_bytes: bytes, file_name: str) -> list[ParsedBlock]:
-    text = decode_text(file_bytes)
-    headings: list[str] = []
-    buffer: list[str] = []
-    blocks: list[ParsedBlock] = []
-
-    def flush_buffer() -> None:
-        content = clean_text("\n".join(buffer))
-        if content:
-            blocks.append(
-                ParsedBlock(
-                    text=content,
-                    title_path=" / ".join(headings) or None,
-                    section_name=headings[-1] if headings else None,
-                    block_type="paragraph",
-                    metadata={"file_name": file_name},
-                )
-            )
-        buffer.clear()
-
-    for line in text.splitlines():
-        heading_match = re.match(r"^(#{1,6})\s+(.+)$", line)
-        if heading_match:
-            flush_buffer()
-            level = len(heading_match.group(1))
-            heading = clean_text(heading_match.group(2))
-            headings = headings[: level - 1]
-            headings.append(heading)
-            blocks.append(
-                ParsedBlock(
-                    text=heading,
-                    title_path=" / ".join(headings),
-                    section_name=heading,
-                    block_type="heading",
-                    metadata={"file_name": file_name, "level": level},
-                )
-            )
-        else:
-            buffer.append(line)
-
-    flush_buffer()
-    return blocks
+def block_type_for(ext: str) -> str:
+    if ext == "pdf":
+        return "page"
+    if ext == "csv":
+        return "table"
+    if ext == "md":
+        return "section"
+    return "paragraph"
 
 
-def parse_csv(file_bytes: bytes, file_name: str) -> list[ParsedBlock]:
-    text = decode_text(file_bytes)
-    sample = text[:2048]
-    try:
-        dialect = csv.Sniffer().sniff(sample)
-    except csv.Error:
-        dialect = csv.excel
-
-    reader = csv.reader(StringIO(text), dialect)
-    rows = list(reader)
-    if not rows:
-        return []
-
-    header = rows[0]
-    data_rows = rows[1:] if header else rows
-    blocks: list[ParsedBlock] = []
-    batch_size = 20
-
-    for start in range(0, len(data_rows), batch_size):
-        batch = data_rows[start : start + batch_size]
-        lines = [f"Columns: {', '.join(header)}"] if header else []
-        for row_index, row in enumerate(batch, start=start + 1):
-            cells = []
-            for column_index, value in enumerate(row):
-                column_name = header[column_index] if column_index < len(header) else f"column_{column_index + 1}"
-                cells.append(f"{column_name}: {clean_text(value)}")
-            lines.append(f"Row {row_index}: " + "; ".join(cells))
-
-        blocks.append(
-            ParsedBlock(
-                text="\n".join(lines),
-                block_type="table",
-                metadata={
-                    "file_name": file_name,
-                    "row_start": start + 1,
-                    "row_end": start + len(batch),
-                    "source_ext": Path(file_name).suffix.lower(),
-                },
-            )
-        )
-
-    return blocks
+def normalize_extension(file_ext: str) -> str:
+    ext = file_ext.lower().lstrip(".")
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"Unsupported file extension: {file_ext}")
+    return ext
 
 
-def _heading_level(style_name: str) -> int:
-    match = re.search(r"(\d+)$", style_name)
-    if not match:
-        return 1
-    return max(1, min(6, int(match.group(1))))
+def temporary_file_name(file_name: str, ext: str) -> str:
+    raw_name = Path(file_name or f"upload.{ext}").name.strip() or f"upload.{ext}"
+    if Path(raw_name).suffix.lower().lstrip(".") == ext:
+        return raw_name
+    stem = Path(raw_name).stem or "upload"
+    return f"{stem}.{ext}"

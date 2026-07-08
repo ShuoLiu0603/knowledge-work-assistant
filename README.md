@@ -5,7 +5,7 @@
 ## 本地启动
 
 ```bash
-docker compose -f infra/docker-compose.yml --env-file .env.example up --build
+docker compose -f infra/docker-compose.yml --env-file .env up --build
 ```
 
 常用地址：

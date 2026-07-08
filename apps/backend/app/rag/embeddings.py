@@ -51,27 +51,25 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             raise TypeError("Embedding input must be a list of strings")
 
         try:
-            from openai import OpenAI
+            from langchain_openai import OpenAIEmbeddings
         except ImportError as exc:
-            raise RuntimeError("openai is required for embedding calls.") from exc
+            raise RuntimeError("langchain-openai is required for embedding calls.") from exc
 
-        client = OpenAI(
+        embeddings = OpenAIEmbeddings(
+            model=self.model,
             api_key=self.api_key,
             base_url=self.base_url,
+            dimensions=self.dimension,
             timeout=30,
+            chunk_size=self.batch_size,
+            tiktoken_enabled=False,
+            check_embedding_ctx_length=False,
         )
 
         vectors: list[list[float]] = []
         try:
             for batch in batched(texts, self.batch_size):
-                response = client.embeddings.create(
-                    model=self.model,
-                    input=batch,
-                    dimensions=self.dimension,
-                    encoding_format="float",
-                )
-                rows = sorted(response.data, key=lambda item: item.index)
-                vectors.extend([list(map(float, row.embedding)) for row in rows])
+                vectors.extend([list(map(float, vector)) for vector in embeddings.embed_documents(batch)])
         except Exception as exc:
             raise RuntimeError(f"Embedding provider request failed: {exc}") from exc
 

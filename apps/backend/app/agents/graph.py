@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import fields
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypedDict
 
 from sqlalchemy.orm import Session
 
@@ -15,6 +17,13 @@ from app.agents.writing_agent import draft_with_rag
 from app.core.config import get_settings
 
 
+class AgentGraphPayload(TypedDict):
+    state: AgentGraphState
+
+
+AgentNode = Callable[[Session, AgentGraphState], AgentGraphState]
+
+
 def run_agent_graph(db: Session, state: AgentGraphState) -> AgentGraphState:
     started_at = datetime.now(timezone.utc)
     if state.knowledge_base_id:
@@ -23,11 +32,14 @@ def run_agent_graph(db: Session, state: AgentGraphState) -> AgentGraphState:
     actual_backend = requested_backend
     try:
         if requested_backend == "langgraph":
-            _run_langgraph_nodes(db, state)
+            returned_state = _run_langgraph_nodes(db, state)
+            if returned_state is not state:
+                copy_state_values(returned_state, state)
         else:
             actual_backend = "sequential"
             _run_sequential_nodes(db, state)
-        state.status = "completed"
+        if state.status == "running":
+            state.status = "completed"
     except Exception as exc:
         state.status = "failed"
         state.error_message = str(exc)
@@ -54,6 +66,11 @@ def run_agent_graph(db: Session, state: AgentGraphState) -> AgentGraphState:
     return state
 
 
+def copy_state_values(source: AgentGraphState, target: AgentGraphState) -> None:
+    for field in fields(AgentGraphState):
+        setattr(target, field.name, getattr(source, field.name))
+
+
 def normalize_backend(value: str | None) -> str:
     normalized = (value or "langgraph").strip().lower()
     return normalized if normalized in {"langgraph", "sequential"} else "langgraph"
@@ -73,13 +90,19 @@ def _run_langgraph_nodes(db: Session, state: AgentGraphState) -> AgentGraphState
     except ImportError as exc:
         raise ImportError("LangGraph is required when AGENT_GRAPH_BACKEND=langgraph.") from exc
 
-    graph = StateGraph(dict)
-    graph.add_node("load_memory", lambda payload: _node_payload(load_memory_context(db, payload["state"])))
-    graph.add_node("supervisor", lambda payload: _node_payload(route_intent(db, payload["state"])))
-    graph.add_node("rag_agent", lambda payload: _node_payload(answer_with_rag(db, payload["state"])))
-    graph.add_node("summary_agent", lambda payload: _node_payload(summarize_with_rag(db, payload["state"])))
-    graph.add_node("writing_agent", lambda payload: _node_payload(draft_with_rag(db, payload["state"])))
-    graph.add_node("update_memory", lambda payload: _node_payload(update_user_memories(db, payload["state"])))
+    graph = build_agent_graph(db, StateGraph, END)
+    result = graph.compile().invoke({"state": state})
+    return result["state"]
+
+
+def build_agent_graph(db: Session, state_graph_cls, end_node):
+    graph = state_graph_cls(AgentGraphPayload)
+    graph.add_node("load_memory", langgraph_node(db, load_memory_context))
+    graph.add_node("supervisor", langgraph_node(db, route_intent))
+    graph.add_node("rag_agent", langgraph_node(db, answer_with_rag))
+    graph.add_node("summary_agent", langgraph_node(db, summarize_with_rag))
+    graph.add_node("writing_agent", langgraph_node(db, draft_with_rag))
+    graph.add_node("update_memory", langgraph_node(db, update_user_memories))
 
     graph.set_entry_point("load_memory")
     graph.add_edge("load_memory", "supervisor")
@@ -95,14 +118,15 @@ def _run_langgraph_nodes(db: Session, state: AgentGraphState) -> AgentGraphState
     graph.add_edge("rag_agent", "update_memory")
     graph.add_edge("summary_agent", "update_memory")
     graph.add_edge("writing_agent", "update_memory")
-    graph.add_edge("update_memory", END)
-
-    result = graph.compile().invoke({"state": state})
-    return result["state"]
+    graph.add_edge("update_memory", end_node)
+    return graph
 
 
-def _node_payload(state: AgentGraphState) -> dict[str, AgentGraphState]:
-    return {"state": state}
+def langgraph_node(db: Session, handler: AgentNode) -> Callable[[AgentGraphPayload], AgentGraphPayload]:
+    def run(payload: AgentGraphPayload) -> AgentGraphPayload:
+        return {"state": handler(db, payload["state"])}
+
+    return run
 
 
 def _route_after_supervisor(payload: dict[str, Any]) -> str:

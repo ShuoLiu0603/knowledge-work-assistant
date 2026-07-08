@@ -1,136 +1,58 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import math
-from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime, timezone
 
-import redis
-from fastapi import HTTPException, status
+from fastapi import HTTPException, status as http_status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models.conversation import Conversation, Message
-from app.db.models.user_memory import UserMemory
+from app.db.models.user_memory import UserMemory, UserMemoryEvent, UserMemoryRecallLog, UserMemoryUpdateJob
 from app.llm.provider import MemoryCandidate, MemoryOperation, get_llm_provider
-from app.rag.embeddings import get_embedding_provider
+from app.memory import commands as memory_commands
+from app.memory import context as memory_contexts
+from app.memory import editor as memory_editor
+from app.memory import embedding as memory_embedding
+from app.memory import events as memory_events
+from app.memory import jobs as memory_jobs
+from app.memory import policy as memory_policy
+from app.memory import repository as memory_repository
+from app.memory import retrieval as memory_retrieval
+from app.memory import short_term
+from app.memory import vector_index as memory_vector_index
+from app.memory.types import MemoryAction, MemoryEmbedding, MemorySource
 from app.services.llm_log_service import create_llm_call_log
 
-ALLOWED_MEMORY_STATUSES = {"active", "pending", "superseded", "ignored"}
-AUTO_MEMORY_CONFIDENCE = 0.75
-PENDING_MEMORY_CONFIDENCE = 0.55
-AUTO_OPERATION_CONFIDENCE = 0.8
-SUPERSEDE_OPERATION_CONFIDENCE = 0.85
-PENDING_OPERATION_CONFIDENCE = 0.6
-MAX_MEMORY_OPERATIONS = 3
-STICKY_MEMORY_CATEGORIES = {"response_detail", "language", "format"}
-MEMORY_RECALL_MARKERS = (
-    "你记得",
-    "还记得",
-    "记住了什么",
-    "记了什么",
-    "长期记忆",
-    "我的偏好",
-    "我的项目",
-    "我的角色",
-    "我的名字",
-    "我叫什么",
-    "我的工作",
-    "我偏好",
-    "我喜欢什么",
-    "你知道我",
-    "关于我",
-    "remember about me",
-    "what do you remember",
-    "my preference",
-    "my preferences",
-    "my project",
-    "my role",
-    "my name",
-    "my job",
-    "about me",
-)
-
-
-@dataclass(frozen=True)
-class MemoryAction:
-    action: str
-    memory_id: str | None
-    content: str
-    reason: str
+ALLOWED_MEMORY_STATUSES = memory_policy.ALLOWED_MEMORY_STATUSES
+AUTO_MEMORY_CONFIDENCE = memory_policy.AUTO_MEMORY_CONFIDENCE
+PENDING_MEMORY_CONFIDENCE = memory_policy.PENDING_MEMORY_CONFIDENCE
+PENDING_OPERATION_CONFIDENCE = memory_policy.PENDING_OPERATION_CONFIDENCE
+MAX_MEMORY_OPERATIONS = memory_policy.MAX_MEMORY_OPERATIONS
+MEMORY_EDITOR_CONTEXT_LIMIT = memory_policy.MEMORY_EDITOR_CONTEXT_LIMIT
+MEMORY_EDITOR_CANDIDATE_LIMIT = memory_policy.MEMORY_EDITOR_CANDIDATE_LIMIT
+MEMORY_SOURCE_MAX_CHARS = memory_policy.MEMORY_SOURCE_MAX_CHARS
+SUMMARY_DELTA_MAX_CHARS = memory_policy.SUMMARY_DELTA_MAX_CHARS
+FULL_MEMORY_RECALL_LIMIT = memory_policy.FULL_MEMORY_RECALL_LIMIT
+STICKY_MEMORY_CATEGORIES = memory_policy.STICKY_MEMORY_CATEGORIES
+ALLOWED_MEMORY_UPDATE_JOB_STATUSES = {"queued", "processing", "completed", "failed"}
 
 
 def get_redis_client():
-    settings = get_settings()
-    try:
-        return redis.Redis.from_url(settings.redis_url, decode_responses=True)
-    except Exception:
-        return None
+    return short_term.get_redis_client()
 
 
 def append_short_term_memory(user_id: str, conversation_id: str | None, role: str, content: str) -> None:
-    if not conversation_id or not content.strip():
-        return
-    client = get_redis_client()
-    if client is None:
-        return
-    settings = get_settings()
-    key = short_memory_key(user_id, conversation_id)
-    payload = json.dumps(
-        {
-            "role": role,
-            "content": content.strip()[:2000],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
-        ensure_ascii=False,
-    )
-    try:
-        client.lpush(key, payload)
-        client.ltrim(key, 0, settings.short_memory_max_messages - 1)
-        client.expire(key, 60 * 60 * 24)
-    except Exception:
-        return
+    short_term.append_short_term_memory(user_id, conversation_id, role, content)
 
 
 def get_short_term_memory(user_id: str, conversation_id: str | None) -> list[dict]:
-    if not conversation_id:
-        return []
-    client = get_redis_client()
-    if client is None:
-        return []
-    key = short_memory_key(user_id, conversation_id)
-    try:
-        rows = client.lrange(key, 0, -1)
-    except Exception:
-        return []
-    messages = []
-    for row in reversed(rows):
-        try:
-            messages.append(json.loads(row))
-        except json.JSONDecodeError:
-            continue
-    return messages
+    return short_term.get_short_term_memory(user_id, conversation_id)
 
 
 def get_recent_db_messages(db: Session, conversation_id: str | None, limit: int = 8) -> list[dict]:
-    if not conversation_id:
-        return []
-    rows = db.scalars(
-        select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(limit)
-    ).all()
-    return [
-        {
-            "role": message.role,
-            "content": message.content,
-            "created_at": message.created_at.isoformat(),
-        }
-        for message in reversed(rows)
-    ]
+    return short_term.get_recent_db_messages(db, conversation_id, limit=limit)
 
 
 def process_user_memory(
@@ -139,26 +61,32 @@ def process_user_memory(
     text: str,
     conversation_id: str | None = None,
     assistant_text: str = "",
+    message_id: str | None = None,
 ) -> list[MemoryAction]:
-    lowered = text.lower()
-    if any(marker in text for marker in ("不要记住", "别记住", "无需记住", "不要保存", "别保存")) or any(
-        marker in lowered for marker in ("do not remember", "don't remember", "dont remember")
-    ):
+    if memory_policy.should_skip_memory_for_turn(text):
+        return [MemoryAction("ignore", None, "", "user requested no memory for this turn")]
+    if memory_policy.should_ignore_memory_request(text):
         return [MemoryAction("ignore", None, "", "user asked not to remember")]
 
     provider = get_llm_provider()
     if hasattr(provider, "review_memory_operations"):
         operations = review_memory_operations_with_logging(db, provider, user_id, text, assistant_text, conversation_id)
         actions = [
-            process_memory_operation(db, user_id, operation, source_text=memory_source_text(text, assistant_text))
+            process_memory_operation(
+                db,
+                user_id,
+                operation,
+                source=memory_source_from_turn(db, conversation_id, text, evidence=operation.evidence, message_id=message_id),
+            )
             for operation in operations[:MAX_MEMORY_OPERATIONS]
         ]
         return actions or [MemoryAction("ignore", None, "", "no durable memory operation")]
 
     candidates = extract_memory_candidates_with_logging(db, provider, user_id, text, conversation_id)
+    source = memory_source_from_turn(db, conversation_id, text, message_id=message_id)
     actions: list[MemoryAction] = []
     for candidate in candidates:
-        action = process_memory_candidate(db, user_id, candidate, source_text=text)
+        action = process_memory_candidate(db, user_id, candidate, source=source)
         actions.append(action)
     if not actions:
         actions.append(MemoryAction("ignore", None, "", "no durable preference found"))
@@ -176,7 +104,7 @@ def review_memory_operations_with_logging(
     review = provider.review_memory_operations(
         user_message=user_message,
         assistant_message=assistant_message,
-        existing_memories=list_memory_editor_context(db, user_id),
+        existing_memories=list_memory_editor_context(db, user_id, user_message),
     )
     create_llm_call_log(
         db,
@@ -224,66 +152,9 @@ def process_memory_operation(
     db: Session,
     user_id: str,
     operation: MemoryOperation,
-    source_text: str,
+    source: MemorySource,
 ) -> MemoryAction:
-    if operation.action == "ignore":
-        return MemoryAction("ignore", operation.target_memory_id, operation.content, operation.reason or "memory editor ignored")
-
-    normalized = normalize_memory_content(operation.content)
-    if not normalized:
-        return MemoryAction("ignore", operation.target_memory_id, "", "memory operation has no content")
-
-    candidate = candidate_from_operation(operation)
-    exact = find_exact_memory(db, user_id, hash_content(normalized), statuses={"active", "pending"})
-    if exact and operation.action in {"create", "pending"}:
-        return touch_exact_memory(db, exact, candidate)
-
-    if operation.action == "create":
-        if can_auto_create(operation):
-            memory = create_memory_from_operation(db, user_id, operation, normalized, source_text, status="active")
-            return MemoryAction("create", memory.id, memory.content, operation.reason or "memory editor created memory")
-        return create_pending_memory_from_operation(db, user_id, operation, normalized, source_text)
-
-    if operation.action == "pending":
-        return create_pending_memory_from_operation(db, user_id, operation, normalized, source_text)
-
-    target = get_operation_target(db, user_id, operation.target_memory_id)
-    if target is None:
-        return MemoryAction("ignore", None, operation.content, "target memory not found")
-
-    if operation.action == "update":
-        if not can_auto_update(operation):
-            return create_pending_memory_from_operation(db, user_id, operation, normalized, source_text)
-        target.content = operation.content
-        target.normalized_content = normalized
-        target.content_hash = hash_content(normalized)
-        target.category = resolve_operation_category(operation)
-        target.kind = operation.kind
-        target.source_text = source_text
-        target.embedding = get_embedding_provider().embed_text(normalized)
-        target.merge_count += 1
-        target.last_touched_at = datetime.now(timezone.utc)
-        target.extra_metadata = memory_operation_metadata(operation, decision="auto_update")
-        if target.status == "pending":
-            target.status = "active"
-        db.add(target)
-        db.commit()
-        db.refresh(target)
-        return MemoryAction("update", target.id, target.content, operation.reason or "memory editor updated memory")
-
-    if operation.action == "supersede":
-        if not can_auto_supersede(operation, target):
-            return create_pending_memory_from_operation(db, user_id, operation, normalized, source_text)
-        memory = create_memory_from_operation(db, user_id, operation, normalized, source_text, status="active")
-        target.status = "superseded"
-        target.superseded_by_id = memory.id
-        target.last_touched_at = datetime.now(timezone.utc)
-        db.add(target)
-        db.commit()
-        db.refresh(memory)
-        return MemoryAction("supersede", memory.id, memory.content, operation.reason or f"superseded {target.id}")
-
-    return MemoryAction("ignore", operation.target_memory_id, operation.content, "unsupported memory operation")
+    return memory_editor.process_memory_operation(db, user_id, operation, source)
 
 
 def create_memory_from_operation(
@@ -291,22 +162,10 @@ def create_memory_from_operation(
     user_id: str,
     operation: MemoryOperation,
     normalized: str,
-    source_text: str,
+    source: MemorySource,
     status: str,
 ) -> UserMemory:
-    return create_memory_row(
-        db,
-        user_id,
-        operation.content,
-        normalized,
-        hash_content(normalized),
-        resolve_operation_category(operation),
-        source_text,
-        get_embedding_provider().embed_text(normalized),
-        status=status,
-        kind=operation.kind,
-        extra_metadata=memory_operation_metadata(operation, decision=f"auto_{operation.action}"),
-    )
+    return memory_editor.create_memory_from_operation(db, user_id, operation, normalized, source, status)
 
 
 def create_pending_memory_from_operation(
@@ -314,95 +173,46 @@ def create_pending_memory_from_operation(
     user_id: str,
     operation: MemoryOperation,
     normalized: str,
-    source_text: str,
+    source: MemorySource,
 ) -> MemoryAction:
-    if operation.action != "pending" and operation.confidence < PENDING_OPERATION_CONFIDENCE:
-        return MemoryAction("ignore", operation.target_memory_id, operation.content, "memory operation confidence below threshold")
-    memory = create_memory_row(
-        db,
-        user_id,
-        operation.content,
-        normalized,
-        hash_content(normalized),
-        resolve_operation_category(operation),
-        source_text,
-        get_embedding_provider().embed_text(normalized),
-        status="pending",
-        kind=operation.kind,
-        extra_metadata=memory_operation_metadata(operation, decision="pending_user_review"),
-    )
-    return MemoryAction("pending", memory.id, memory.content, operation.reason or "memory operation requires user review")
+    return memory_editor.create_pending_memory_from_operation(db, user_id, operation, normalized, source)
 
 
 def can_auto_create(operation: MemoryOperation) -> bool:
-    return is_safe_memory_operation(operation, AUTO_OPERATION_CONFIDENCE) and operation.importance == "high"
+    return memory_policy.can_auto_create(operation)
 
 
 def can_auto_update(operation: MemoryOperation) -> bool:
-    return is_safe_memory_operation(operation, AUTO_OPERATION_CONFIDENCE) and operation.importance in {"medium", "high"}
+    return memory_policy.can_auto_update(operation)
 
 
 def can_auto_supersede(operation: MemoryOperation, target: UserMemory) -> bool:
-    return (
-        target.status == "active"
-        and is_safe_memory_operation(operation, SUPERSEDE_OPERATION_CONFIDENCE)
-        and operation.importance == "high"
-    )
+    return memory_policy.can_auto_supersede(operation, target.status)
 
 
 def is_safe_memory_operation(operation: MemoryOperation, confidence_threshold: float) -> bool:
-    return (
-        operation.confidence >= confidence_threshold
-        and operation.sensitivity == "low"
-        and bool(operation.evidence.strip())
-    )
+    return memory_policy.is_safe_memory_operation(operation, confidence_threshold)
 
 
 def get_operation_target(db: Session, user_id: str, memory_id: str | None) -> UserMemory | None:
-    if not memory_id:
-        return None
-    memory = db.get(UserMemory, memory_id)
-    if memory is None or memory.user_id != user_id:
-        return None
-    return memory
+    return memory_editor.get_operation_target(db, user_id, memory_id)
 
 
 def candidate_from_operation(operation: MemoryOperation) -> MemoryCandidate:
-    return MemoryCandidate(
-        content=operation.content,
-        kind=operation.kind,
-        category=operation.category,
-        confidence=operation.confidence,
-        sensitivity=operation.sensitivity,
-    )
+    return memory_editor.candidate_from_operation(operation)
 
 
 def resolve_operation_category(operation: MemoryOperation) -> str:
-    category = (operation.category or "").strip().lower()
-    if category and category != "general":
-        return category[:80]
-    return infer_memory_category(normalize_memory_content(operation.content))
+    return memory_policy.resolve_operation_category(operation)
 
 
 def memory_operation_metadata(operation: MemoryOperation, decision: str) -> dict:
-    return {
-        "confidence": operation.confidence,
-        "importance": operation.importance,
-        "sensitivity": operation.sensitivity,
-        "evidence": operation.evidence,
-        "reason": operation.reason,
-        "decision": decision,
-        "proposed_action": operation.action,
-        "target_memory_id": operation.target_memory_id,
-    }
+    return memory_policy.memory_operation_metadata(operation, decision)
 
 
-def list_memory_editor_context(db: Session, user_id: str) -> list[dict]:
-    memories = db.scalars(
-        select(UserMemory)
-        .where(UserMemory.user_id == user_id)
-        .order_by(UserMemory.status.asc(), UserMemory.updated_at.desc(), UserMemory.created_at.desc())
-    ).all()
+def list_memory_editor_context(db: Session, user_id: str, query: str = "") -> list[dict]:
+    memories = memory_repository.list_memory_editor_candidates(db, user_id, MEMORY_EDITOR_CANDIDATE_LIMIT)
+    ranked = rank_memory_editor_context(list(memories), query)
     return [
         {
             "id": memory.id,
@@ -411,152 +221,137 @@ def list_memory_editor_context(db: Session, user_id: str) -> list[dict]:
             "category": memory.category,
             "content": memory.content,
         }
-        for memory in memories
+        for memory in ranked[:MEMORY_EDITOR_CONTEXT_LIMIT]
     ]
 
 
-def memory_source_text(user_message: str, assistant_message: str) -> str:
-    if assistant_message.strip():
-        return f"User:\n{user_message.strip()}\n\nAssistant:\n{assistant_message.strip()}"
-    return user_message.strip()
+def rank_memory_editor_context(memories: list[UserMemory], query: str) -> list[UserMemory]:
+    return memory_retrieval.rank_editor_context(
+        memories,
+        query,
+        embed=lambda text: embed_memory_text(text).vector,
+    )
+
+
+def memory_source_from_turn(
+    db: Session,
+    conversation_id: str | None,
+    user_message: str,
+    evidence: str = "",
+    message_id: str | None = None,
+) -> MemorySource:
+    source_text = sanitize_memory_source(evidence or user_message)
+    return MemorySource(
+        text=source_text,
+        conversation_id=conversation_id,
+        message_id=message_id or latest_user_message_id(db, conversation_id, user_message),
+    )
+
+
+def latest_user_message_id(db: Session, conversation_id: str | None, user_message: str) -> str | None:
+    if not conversation_id:
+        return None
+    message = db.scalar(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.role == "user",
+            Message.content == user_message,
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(1)
+    )
+    return message.id if message else None
+
+
+def sanitize_memory_source(text: str) -> str:
+    normalized = " ".join(text.strip().split())
+    if len(normalized) <= MEMORY_SOURCE_MAX_CHARS:
+        return normalized
+    return normalized[: MEMORY_SOURCE_MAX_CHARS - 3].rstrip() + "..."
 
 
 def process_memory_candidate(
     db: Session,
     user_id: str,
     candidate: MemoryCandidate,
-    source_text: str,
+    source: MemorySource,
 ) -> MemoryAction:
-    normalized = normalize_memory_content(candidate.content)
-    if not normalized:
-        return MemoryAction("ignore", None, "", "empty memory candidate")
-    content_hash = hash_content(normalized)
-    existing = find_exact_memory(db, user_id, content_hash, statuses={"active", "pending"})
-    if existing:
-        return touch_exact_memory(db, existing, candidate)
-    if candidate.confidence < PENDING_MEMORY_CONFIDENCE:
-        return MemoryAction("ignore", None, candidate.content, "candidate confidence below threshold")
-    if candidate.sensitivity != "low" or candidate.confidence < AUTO_MEMORY_CONFIDENCE:
-        memory = create_memory_row(
+    return memory_editor.process_memory_candidate(db, user_id, candidate, source)
+
+
+def upsert_memory_candidate(db: Session, user_id: str, content: str | MemoryCandidate, source: MemorySource) -> MemoryAction:
+    return memory_editor.upsert_memory_candidate(db, user_id, content, source)
+
+
+def retrieve_relevant_memories(
+    db: Session,
+    user_id: str,
+    query: str,
+    limit: int = 5,
+    conversation_id: str | None = None,
+    message_id: str | None = None,
+) -> list[UserMemory]:
+    active = memory_repository.list_active_memories(db, user_id)
+    result = None
+    if active and not is_full_memory_recall_query(query):
+        try:
+            query_vector = embed_memory_text(query).vector
+            threshold = memory_policy.retrieval_similarity_threshold()
+            vector_hits = memory_vector_index.search_active_memories(
+                user_id,
+                query_vector,
+                limit=max(limit, FULL_MEMORY_RECALL_LIMIT),
+                score_threshold=threshold,
+            )
+            if vector_hits:
+                result = memory_retrieval.retrieve_relevant_memories_with_vector_hits(
+                    list(active),
+                    query,
+                    limit,
+                    vector_hits,
+                    threshold=threshold,
+                )
+        except Exception:
+            result = None
+    if result is None:
+        result = memory_retrieval.retrieve_relevant_memories_with_metadata(
+            list(active),
+            query,
+            limit,
+            embed=lambda text: embed_memory_text(text).vector,
+        )
+    try:
+        memory_repository.create_recall_log(
             db,
-            user_id,
-            candidate.content,
-            normalized,
-            content_hash,
-            resolve_memory_category(candidate),
-            source_text,
-            get_embedding_provider().embed_text(normalized),
-            status="pending",
-            kind=candidate.kind,
-            extra_metadata={
-                "confidence": candidate.confidence,
-                "sensitivity": candidate.sensitivity,
-                "decision": "pending_user_review",
-            },
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            query=query,
+            recall_mode=result.recall_mode,
+            requested_limit=result.requested_limit,
+            recall_limit=result.recall_limit,
+            active_count=result.active_count,
+            selected_count=len(result.selected),
+            threshold=result.threshold,
+            candidates=[memory_retrieval.recall_candidate_to_dict(candidate) for candidate in result.candidates],
+            selected_memory_ids=[memory.id for memory in result.selected],
         )
-        return MemoryAction("pending", memory.id, memory.content, "candidate requires user review")
-    return upsert_memory_candidate(db, user_id, candidate, source_text=source_text)
-
-
-def upsert_memory_candidate(db: Session, user_id: str, content: str | MemoryCandidate, source_text: str) -> MemoryAction:
-    candidate = content if isinstance(content, MemoryCandidate) else MemoryCandidate(content=content)
-    normalized = normalize_memory_content(candidate.content)
-    content_hash = hash_content(normalized)
-    existing_exact = find_exact_memory(db, user_id, content_hash, statuses={"active"})
-    if existing_exact:
-        return touch_exact_memory(db, existing_exact, candidate)
-
-    category = resolve_memory_category(candidate)
-    active_same_category = db.scalars(
-        select(UserMemory).where(
-            UserMemory.user_id == user_id,
-            UserMemory.status == "active",
-            UserMemory.category == category,
-        )
-    ).all()
-    embedding = get_embedding_provider().embed_text(normalized)
-
-    conflict = find_conflicting_memory(active_same_category, normalized, category)
-    if conflict:
-        new_memory = create_memory_row(
-            db,
-            user_id,
-            candidate.content,
-            normalized,
-            content_hash,
-            category,
-            source_text,
-            embedding,
-            kind=candidate.kind,
-            extra_metadata={
-                "confidence": candidate.confidence,
-                "sensitivity": candidate.sensitivity,
-            },
-        )
-        conflict.status = "superseded"
-        conflict.superseded_by_id = new_memory.id
-        db.add(conflict)
-        db.commit()
-        db.refresh(new_memory)
-        return MemoryAction("supersede", new_memory.id, new_memory.content, f"superseded {conflict.id}")
-
-    similar = find_similar_memory(active_same_category, embedding, normalized)
-    if similar:
-        similar.content = merge_memory_content(similar.content, candidate.content)
-        similar.normalized_content = normalize_memory_content(similar.content)
-        similar.content_hash = hash_content(similar.normalized_content)
-        similar.embedding = get_embedding_provider().embed_text(similar.normalized_content)
-        similar.merge_count += 1
-        similar.last_touched_at = datetime.now(timezone.utc)
-        db.add(similar)
-        db.commit()
-        db.refresh(similar)
-        return MemoryAction("merge", similar.id, similar.content, "semantic similarity above threshold")
-
-    new_memory = create_memory_row(
-        db,
-        user_id,
-        candidate.content,
-        normalized,
-        content_hash,
-        category,
-        source_text,
-        embedding,
-        kind=candidate.kind,
-        extra_metadata={
-            "confidence": candidate.confidence,
-            "sensitivity": candidate.sensitivity,
-        },
-    )
-    return MemoryAction("create", new_memory.id, new_memory.content, "new durable preference")
-
-
-def retrieve_relevant_memories(db: Session, user_id: str, query: str, limit: int = 5) -> list[UserMemory]:
-    active = db.scalars(
-        select(UserMemory)
-        .where(UserMemory.user_id == user_id, UserMemory.status == "active")
-        .order_by(UserMemory.last_touched_at.desc())
-    ).all()
-    if not active:
-        return []
-    sticky = [memory for memory in active if memory.category in STICKY_MEMORY_CATEGORIES]
-    non_sticky = [memory for memory in active if memory.category not in STICKY_MEMORY_CATEGORIES]
-    if not non_sticky:
-        return dedupe_memories(sticky)[:limit]
-    query_embedding = get_embedding_provider().embed_text(query)
-    scored = [
-        (memory, cosine_similarity(query_embedding, memory.embedding or []))
-        for memory in non_sticky
-    ]
-    scored.sort(key=lambda item: (item[1], item[0].last_touched_at), reverse=True)
-    threshold = retrieval_similarity_threshold()
-    semantic = [memory for memory, score in scored if score >= threshold]
-    return dedupe_memories([*sticky, *semantic])[:limit]
+    except Exception:
+        db.rollback()
+    return result.selected
 
 
 def is_memory_recall_query(query: str) -> bool:
-    normalized = " ".join(query.lower().split())
-    return any(marker in normalized for marker in MEMORY_RECALL_MARKERS)
+    return memory_policy.is_memory_recall_query(query)
+
+
+def is_full_memory_recall_query(query: str) -> bool:
+    return memory_policy.is_full_memory_recall_query(query)
+
+
+def should_skip_memory_for_turn(text: str) -> bool:
+    return memory_policy.should_skip_memory_for_turn(text)
 
 
 def build_memory_context_for_question(
@@ -568,6 +363,9 @@ def build_memory_context_for_question(
     preloaded_long_memories: list[dict] | None = None,
     conversation_summary: str | None = None,
 ) -> str:
+    if should_skip_memory_for_turn(query):
+        return format_memory_context([], [], None)
+
     short_memory = preloaded_short_memory
     if short_memory is None:
         short_memory = get_short_term_memory(user_id, conversation_id)
@@ -575,11 +373,14 @@ def build_memory_context_for_question(
         short_memory = get_recent_db_messages(db, conversation_id)
 
     if preloaded_long_memories is None:
-        memories = retrieve_relevant_memories(db, user_id, query)
+        memories = retrieve_relevant_memories(db, user_id, query, conversation_id=conversation_id)
         long_memories = [
             {
                 "content": memory.content,
                 "category": memory.category,
+                "kind": memory.kind,
+                "status": memory.status,
+                "metadata": memory.extra_metadata or {},
             }
             for memory in memories
         ]
@@ -591,22 +392,31 @@ def build_memory_context_for_question(
         conversation = db.get(Conversation, conversation_id)
         summary = conversation.summary if conversation else None
 
-    return format_memory_context(long_memories, short_memory, summary)
+    max_long_memories = FULL_MEMORY_RECALL_LIMIT if is_full_memory_recall_query(query) else 8
+    return format_memory_context(long_memories, short_memory, summary, max_long_memories=max_long_memories)
 
 
 def format_memory_context(
     long_memories: list[dict],
     short_memory: list[dict],
     conversation_summary: str | None,
+    max_long_memories: int = 8,
+    max_chars: int | None = None,
+    max_tokens: int | None = None,
 ) -> str:
-    memories = "\n".join(f"- {item.get('content')}" for item in long_memories[:8]) or "- 无"
-    recent = "\n".join(
-        f"- {item.get('role')}: {item.get('content')}"
-        for item in short_memory[-8:]
-        if item.get("content")
-    ) or "- 无"
-    summary = conversation_summary or "无"
-    return f"长期记忆:\n{memories}\n\n会话摘要:\n{summary}\n\n最近对话:\n{recent}"
+    settings = get_settings()
+    effective_max_tokens = max_tokens
+    if effective_max_tokens is None and max_chars is None:
+        effective_max_tokens = settings.memory_context_max_tokens
+    return memory_contexts.format_memory_context(
+        long_memories,
+        short_memory,
+        conversation_summary,
+        max_long_memories=max_long_memories,
+        max_chars=max_chars or settings.memory_context_max_chars,
+        max_tokens=effective_max_tokens,
+        model_name=settings.llm_model,
+    )
 
 
 def update_conversation_summary(
@@ -616,10 +426,12 @@ def update_conversation_summary(
     assistant_message: str,
     user_id: str | None = None,
 ) -> str:
-    previous = conversation.summary or ""
-    text = (
-        f"Existing summary:\n{previous}\n\n"
-        f"User:\n{user_message}\n\nAssistant:\n{assistant_message}"
+    messages, message_count = get_unprocessed_summary_messages(db, conversation)
+    text = build_conversation_summary_prompt(
+        conversation.summary or "",
+        messages,
+        fallback_user_message=user_message,
+        fallback_assistant_message=assistant_message,
     )
     provider = get_llm_provider()
     if hasattr(provider, "summarize_with_metadata"):
@@ -635,6 +447,7 @@ def update_conversation_summary(
     else:
         summary = provider.summarize(text).strip()
     conversation.summary = summary[:3000]
+    conversation.summary_message_count = message_count
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
@@ -642,16 +455,195 @@ def update_conversation_summary(
 
 
 def should_update_conversation_summary(db: Session, conversation_id: str) -> bool:
+    conversation = db.get(Conversation, conversation_id)
+    if conversation is None:
+        return False
     message_count = db.scalar(select(func.count(Message.id)).where(Message.conversation_id == conversation_id)) or 0
-    return message_count >= 10 and message_count % 4 == 0
+    processed_count = min(max(conversation.summary_message_count or 0, 0), message_count)
+    if processed_count == 0:
+        return message_count >= 10
+    return message_count - processed_count >= 4
+
+
+def get_unprocessed_summary_messages(db: Session, conversation: Conversation) -> tuple[list[Message], int]:
+    message_count = db.scalar(select(func.count(Message.id)).where(Message.conversation_id == conversation.id)) or 0
+    processed_count = min(max(conversation.summary_message_count or 0, 0), message_count)
+    messages = db.scalars(
+        select(Message)
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at.asc(), Message.id.asc())
+        .offset(processed_count)
+    ).all()
+    return list(messages), message_count
+
+
+def build_conversation_summary_prompt(
+    previous_summary: str,
+    messages: list[Message],
+    fallback_user_message: str,
+    fallback_assistant_message: str,
+) -> str:
+    if messages:
+        delta = "\n".join(f"{message.role}: {message.content}" for message in messages)
+    else:
+        delta = f"user: {fallback_user_message}\nassistant: {fallback_assistant_message}"
+    delta = delta[:SUMMARY_DELTA_MAX_CHARS]
+    return f"Existing summary:\n{previous_summary or '无'}\n\nNew messages since previous summary:\n{delta}"
 
 
 def list_user_memories(db: Session, user_id: str, status: str | None = None) -> list[UserMemory]:
-    query = select(UserMemory).where(UserMemory.user_id == user_id)
     if status:
         status = validate_memory_status(status)
-        query = query.where(UserMemory.status == status)
-    return db.scalars(query.order_by(UserMemory.updated_at.desc(), UserMemory.created_at.desc())).all()
+    return memory_repository.list_user_memories(db, user_id, status=status)
+
+
+def export_user_memory_data(db: Session, user_id: str) -> dict:
+    return {
+        "user_id": user_id,
+        "exported_at": datetime.now(timezone.utc),
+        "memories": db.scalars(
+            select(UserMemory)
+            .where(UserMemory.user_id == user_id)
+            .order_by(UserMemory.created_at.asc(), UserMemory.id.asc())
+        ).all(),
+        "events": db.scalars(
+            select(UserMemoryEvent)
+            .where(UserMemoryEvent.user_id == user_id)
+            .order_by(UserMemoryEvent.created_at.asc(), UserMemoryEvent.id.asc())
+        ).all(),
+        "recall_logs": db.scalars(
+            select(UserMemoryRecallLog)
+            .where(UserMemoryRecallLog.user_id == user_id)
+            .order_by(UserMemoryRecallLog.created_at.asc(), UserMemoryRecallLog.id.asc())
+        ).all(),
+        "update_jobs": db.scalars(
+            select(UserMemoryUpdateJob)
+            .where(UserMemoryUpdateJob.user_id == user_id)
+            .order_by(UserMemoryUpdateJob.created_at.asc(), UserMemoryUpdateJob.id.asc())
+        ).all(),
+    }
+
+
+def get_user_memory_recall_metrics(db: Session, user_id: str) -> dict:
+    logs = db.scalars(
+        select(UserMemoryRecallLog)
+        .where(UserMemoryRecallLog.user_id == user_id)
+        .order_by(UserMemoryRecallLog.created_at.asc(), UserMemoryRecallLog.id.asc())
+    ).all()
+    recall_mode_counts: Counter[str] = Counter()
+    route_counts: Counter[str] = Counter()
+    route_selected_counts: Counter[str] = Counter()
+    category_counts: Counter[str] = Counter()
+    selected_memory_counts: Counter[str] = Counter()
+    selected_total = 0
+    active_total = 0
+    empty_result_count = 0
+    fallback_count = 0
+    vector_count = 0
+    below_threshold_candidate_count = 0
+    top_scores: list[float] = []
+
+    for log in logs:
+        recall_mode_counts[log.recall_mode] += 1
+        selected_total += log.selected_count or 0
+        active_total += log.active_count or 0
+        if not log.selected_count:
+            empty_result_count += 1
+        if log.recall_mode == "fallback_no_embedding":
+            fallback_count += 1
+        if log.recall_mode == "vector":
+            vector_count += 1
+        selected_memory_counts.update(log.selected_memory_ids or [])
+
+        scored_candidates: list[float] = []
+        for candidate in log.candidates or []:
+            route = str(candidate.get("route") or "unknown")
+            route_counts[route] += 1
+            if candidate.get("selected"):
+                route_selected_counts[route] += 1
+            category = str(candidate.get("category") or "unknown")
+            category_counts[category] += 1
+            if route == "below_threshold":
+                below_threshold_candidate_count += 1
+            score = candidate.get("score")
+            if isinstance(score, int | float):
+                scored_candidates.append(float(score))
+        if scored_candidates:
+            top_scores.append(max(scored_candidates))
+
+    total_logs = len(logs)
+    return {
+        "user_id": user_id,
+        "total_logs": total_logs,
+        "recall_mode_counts": dict(sorted(recall_mode_counts.items())),
+        "route_counts": dict(sorted(route_counts.items())),
+        "route_selected_counts": dict(sorted(route_selected_counts.items())),
+        "category_counts": dict(sorted(category_counts.items())),
+        "empty_result_count": empty_result_count,
+        "empty_result_rate": ratio(empty_result_count, total_logs),
+        "fallback_count": fallback_count,
+        "vector_count": vector_count,
+        "below_threshold_candidate_count": below_threshold_candidate_count,
+        "average_selected_count": ratio(selected_total, total_logs),
+        "average_active_count": ratio(active_total, total_logs),
+        "average_top_score": round(sum(top_scores) / len(top_scores), 6) if top_scores else None,
+        "unique_selected_memory_count": len(selected_memory_counts),
+        "top_selected_memories": [
+            {"memory_id": memory_id, "count": count}
+            for memory_id, count in selected_memory_counts.most_common(10)
+        ],
+    }
+
+
+def ratio(numerator: int | float, denominator: int | float) -> float:
+    if not denominator:
+        return 0.0
+    return round(float(numerator) / float(denominator), 6)
+
+
+def list_user_memory_update_jobs(db: Session, user_id: str, status: str | None = None) -> list[UserMemoryUpdateJob]:
+    if status is not None:
+        status = validate_memory_update_job_status(status)
+    query = select(UserMemoryUpdateJob).where(UserMemoryUpdateJob.user_id == user_id)
+    if status:
+        query = query.where(UserMemoryUpdateJob.status == status)
+    return db.scalars(query.order_by(UserMemoryUpdateJob.created_at.desc(), UserMemoryUpdateJob.id.desc())).all()
+
+
+def retry_user_memory_update_job(db: Session, user_id: str, job_id: str) -> UserMemoryUpdateJob:
+    job = get_user_memory_update_job_or_404(db, user_id, job_id)
+    if job.status not in {"queued", "failed"}:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Only queued or failed memory update jobs can be retried",
+        )
+    job.status = "queued"
+    job.error_message = ""
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    try:
+        memory_jobs.dispatch_memory_update_job(job.id)
+    except Exception as exc:
+        job.error_message = f"worker dispatch failed: {exc}"
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+    return job
+
+
+def get_user_memory_update_job_or_404(db: Session, user_id: str, job_id: str) -> UserMemoryUpdateJob:
+    job = db.get(UserMemoryUpdateJob, job_id)
+    if job is None or job.user_id != user_id:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Memory update job not found")
+    return job
+
+
+def validate_memory_update_job_status(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ALLOWED_MEMORY_UPDATE_JOB_STATUSES:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid memory update job status")
+    return normalized
 
 
 def create_manual_memory(
@@ -661,24 +653,41 @@ def create_manual_memory(
     category: str = "general",
     kind: str = "preference",
 ) -> UserMemory:
-    action = upsert_memory_candidate(db, user_id, content, source_text="manual")
+    normalized = normalize_memory_content(content)
+    if not normalized:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Memory content cannot be empty")
+    action = upsert_memory_candidate(db, user_id, content, source=MemorySource(text="manual"))
     memory = db.get(UserMemory, action.memory_id) if action.memory_id else None
     if memory is None:
         memory = create_memory_row(
             db,
             user_id,
             content,
-            normalize_memory_content(content),
-            hash_content(normalize_memory_content(content)),
+            normalized,
+            hash_content(normalized),
             category,
-            "manual",
-            get_embedding_provider().embed_text(normalize_memory_content(content)),
+            MemorySource(text="manual"),
+            embed_memory_text(normalized),
+            event_reason="manual memory create",
         )
+    previous_status = memory.status
     memory.category = category or memory.category
     memory.kind = kind or memory.kind
     db.add(memory)
+    db.flush()
+    memory_events.record_memory_event(
+        db,
+        memory,
+        "manual_update",
+        actor_type="user",
+        actor_user_id=user_id,
+        reason="manual memory metadata update",
+        previous_status=previous_status,
+        new_status=memory.status,
+    )
     db.commit()
     db.refresh(memory)
+    memory_vector_index.try_sync_memory_vector(memory)
     return memory
 
 
@@ -692,43 +701,165 @@ def update_user_memory(
     kind: str | None = None,
 ) -> UserMemory:
     memory = get_user_memory_or_404(db, user_id, memory_id)
+    previous_status = memory.status
+    previous_content_hash = memory.content_hash
     if content is not None:
         normalized = normalize_memory_content(content)
-        memory.content = content
+        if not normalized:
+            raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Memory content cannot be empty")
+        embedding = embed_memory_text(normalized)
+        memory.content = content.strip()
         memory.normalized_content = normalized
         memory.content_hash = hash_content(normalized)
-        memory.embedding = get_embedding_provider().embed_text(normalized)
+        memory.embedding = embedding.vector
+        memory.embedding_model = embedding.model
+        memory.embedding_dimension = embedding.dimension
     if status is not None:
         memory.status = validate_memory_status(status)
+        if memory.status in {"active", "pending"}:
+            memory.invalid_at = None
+        elif memory.invalid_at is None:
+            memory.invalid_at = datetime.now(timezone.utc)
     if category is not None:
         memory.category = category
     if kind is not None:
         memory.kind = kind
     memory.last_touched_at = datetime.now(timezone.utc)
     db.add(memory)
+    db.flush()
+    memory_events.record_memory_event(
+        db,
+        memory,
+        "manual_update",
+        actor_type="user",
+        actor_user_id=user_id,
+        reason="manual memory update",
+        previous_status=previous_status,
+        new_status=memory.status,
+        payload={"previous_content_hash": previous_content_hash},
+    )
     db.commit()
     db.refresh(memory)
+    if memory.status == "deleted":
+        memory_vector_index.try_delete_memory_vector(memory.id)
+    else:
+        memory_vector_index.try_sync_memory_vector(memory)
+    return memory
+
+
+def approve_user_memory(db: Session, user_id: str, memory_id: str) -> UserMemory:
+    memory = get_user_memory_or_404(db, user_id, memory_id)
+    if memory.status != "pending":
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail="Only pending memories can be approved")
+    previous_status = memory.status
+    memory.status = "active"
+    memory.invalid_at = None
+    memory.last_touched_at = datetime.now(timezone.utc)
+    db.add(memory)
+    db.flush()
+    memory_events.record_memory_event(
+        db,
+        memory,
+        "approve",
+        actor_type="user",
+        actor_user_id=user_id,
+        reason="user approved pending memory",
+        previous_status=previous_status,
+        new_status=memory.status,
+    )
+    db.commit()
+    db.refresh(memory)
+    memory_vector_index.try_sync_memory_vector(memory)
+    return memory
+
+
+def reject_user_memory(db: Session, user_id: str, memory_id: str) -> UserMemory:
+    memory = get_user_memory_or_404(db, user_id, memory_id)
+    if memory.status != "pending":
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail="Only pending memories can be rejected")
+    previous_status = memory.status
+    memory.status = "ignored"
+    memory.invalid_at = datetime.now(timezone.utc)
+    memory.last_touched_at = memory.invalid_at
+    db.add(memory)
+    db.flush()
+    memory_events.record_memory_event(
+        db,
+        memory,
+        "reject",
+        actor_type="user",
+        actor_user_id=user_id,
+        reason="user rejected pending memory",
+        previous_status=previous_status,
+        new_status=memory.status,
+    )
+    db.commit()
+    db.refresh(memory)
+    memory_vector_index.try_sync_memory_vector(memory)
+    return memory
+
+
+def restore_user_memory(db: Session, user_id: str, memory_id: str) -> UserMemory:
+    memory = get_user_memory_or_404(db, user_id, memory_id)
+    if memory.status != "deleted":
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail="Only deleted memories can be restored")
+    previous_status = memory.status
+    memory.status = "active"
+    memory.invalid_at = None
+    memory.last_touched_at = datetime.now(timezone.utc)
+    db.add(memory)
+    db.flush()
+    memory_events.record_memory_event(
+        db,
+        memory,
+        "restore",
+        actor_type="user",
+        actor_user_id=user_id,
+        reason="user restored deleted memory",
+        previous_status=previous_status,
+        new_status=memory.status,
+    )
+    db.commit()
+    db.refresh(memory)
+    memory_vector_index.try_sync_memory_vector(memory)
     return memory
 
 
 def delete_user_memory(db: Session, user_id: str, memory_id: str) -> None:
     memory = get_user_memory_or_404(db, user_id, memory_id)
+    memory_commands.soft_delete_memory(db, memory, actor_user_id=user_id)
+
+
+def purge_user_memory(db: Session, user_id: str, memory_id: str) -> None:
+    memory = get_user_memory_or_404(db, user_id, memory_id)
+    memory_vector_index.try_delete_memory_vector(memory.id)
+    event = UserMemoryEvent(
+        user_id=memory.user_id,
+        memory_id=None,
+        event_type="purge",
+        actor_type="user",
+        actor_user_id=user_id,
+        source="memory_service",
+        reason="user permanently purged memory",
+        previous_status=memory.status,
+        new_status="purged",
+        payload=memory_events.memory_snapshot(memory),
+    )
+    db.add(event)
+    db.flush()
     db.delete(memory)
     db.commit()
 
 
 def get_user_memory_or_404(db: Session, user_id: str, memory_id: str) -> UserMemory:
-    memory = db.get(UserMemory, memory_id)
-    if memory is None or memory.user_id != user_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
+    memory = memory_repository.get_user_memory(db, user_id, memory_id)
+    if memory is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Memory not found")
     return memory
 
 
 def validate_memory_status(value: str) -> str:
-    normalized = value.strip().lower()
-    if normalized not in ALLOWED_MEMORY_STATUSES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid memory status")
-    return normalized
+    return memory_policy.validate_memory_status(value)
 
 
 def to_memory_action_dict(action: MemoryAction) -> dict:
@@ -741,68 +872,35 @@ def to_memory_action_dict(action: MemoryAction) -> dict:
 
 
 def short_memory_key(user_id: str, conversation_id: str) -> str:
-    return f"memory:short:{user_id}:{conversation_id}"
+    return short_term.short_memory_key(user_id, conversation_id)
 
 
 def normalize_memory_content(content: str) -> str:
-    return " ".join(content.strip().lower().split())
+    return memory_policy.normalize_memory_content(content)
 
 
 def hash_content(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return memory_policy.hash_content(content)
 
 
 def infer_memory_category(content: str) -> str:
-    if any(marker in content for marker in ("简洁", "详细", "concise", "detailed", "short", "brief")):
-        return "response_detail"
-    if any(marker in content for marker in ("中文", "英文", "chinese", "english")):
-        return "language"
-    if any(marker in content for marker in ("列表", "表格", "markdown", "格式")):
-        return "format"
-    return "general"
+    return memory_policy.infer_memory_category(content)
 
 
 def find_conflicting_memory(memories: list[UserMemory], normalized: str, category: str) -> UserMemory | None:
-    if category == "response_detail":
-        wants_brief = any(marker in normalized for marker in ("简洁", "concise", "brief", "short"))
-        wants_detail = any(marker in normalized for marker in ("详细", "detailed", "完整"))
-        for memory in memories:
-            old = memory.normalized_content
-            old_brief = any(marker in old for marker in ("简洁", "concise", "brief", "short"))
-            old_detail = any(marker in old for marker in ("详细", "detailed", "完整"))
-            if (wants_brief and old_detail) or (wants_detail and old_brief):
-                return memory
-    return None
+    return memory_editor.find_conflicting_memory(memories, normalized, category)
 
 
 def find_similar_memory(memories: list[UserMemory], embedding: list[float], normalized: str = "") -> UserMemory | None:
-    if normalized:
-        same_direction = find_same_direction_preference(memories, normalized)
-        if same_direction:
-            return same_direction
-    threshold = get_settings().memory_semantic_threshold
-    best_memory = None
-    best_score = 0.0
-    for memory in memories:
-        score = cosine_similarity(embedding, memory.embedding or [])
-        if score > best_score:
-            best_memory = memory
-            best_score = score
-    if best_memory is not None and best_score >= threshold:
-        return best_memory
-    return None
+    return memory_editor.find_similar_memory(memories, embedding, normalized)
 
 
 def find_same_direction_preference(memories: list[UserMemory], normalized: str) -> UserMemory | None:
-    wants_brief = any(marker in normalized for marker in ("简洁", "concise", "brief", "short"))
-    wants_detail = any(marker in normalized for marker in ("详细", "detailed", "完整"))
-    for memory in memories:
-        old = memory.normalized_content
-        old_brief = any(marker in old for marker in ("简洁", "concise", "brief", "short"))
-        old_detail = any(marker in old for marker in ("详细", "detailed", "完整"))
-        if (wants_brief and old_brief) or (wants_detail and old_detail):
-            return memory
-    return None
+    return memory_editor.find_same_direction_preference(memories, normalized)
+
+
+def embed_memory_text(text: str) -> MemoryEmbedding:
+    return memory_embedding.embed_memory_text(text)
 
 
 def create_memory_row(
@@ -812,34 +910,33 @@ def create_memory_row(
     normalized: str,
     content_hash: str,
     category: str,
-    source_text: str,
-    embedding: list[float],
+    source: MemorySource,
+    embedding: MemoryEmbedding,
     status: str = "active",
     kind: str = "preference",
     extra_metadata: dict | None = None,
+    event_type: str | None = None,
+    event_reason: str = "",
 ) -> UserMemory:
-    memory = UserMemory(
-        user_id=user_id,
-        content=content,
-        normalized_content=normalized,
-        content_hash=content_hash,
-        category=category,
-        source_text=source_text,
-        embedding=embedding,
+    return memory_commands.create_memory_row(
+        db,
+        user_id,
+        content,
+        normalized,
+        content_hash,
+        category,
+        source,
+        embedding,
         status=status,
         kind=kind,
-        extra_metadata=extra_metadata or {},
+        extra_metadata=extra_metadata,
+        event_type=event_type,
+        event_reason=event_reason,
     )
-    db.add(memory)
-    db.commit()
-    db.refresh(memory)
-    return memory
 
 
 def merge_memory_content(existing: str, incoming: str) -> str:
-    if incoming in existing:
-        return existing
-    return f"{existing}；{incoming}"
+    return memory_editor.merge_memory_content(existing, incoming)
 
 
 def find_exact_memory(
@@ -848,72 +945,28 @@ def find_exact_memory(
     content_hash: str,
     statuses: set[str],
 ) -> UserMemory | None:
-    return db.scalar(
-        select(UserMemory).where(
-            UserMemory.user_id == user_id,
-            UserMemory.content_hash == content_hash,
-            UserMemory.status.in_(statuses),
-        )
-    )
+    return memory_repository.find_exact_memory(db, user_id, content_hash, statuses)
 
 
 def touch_exact_memory(db: Session, memory: UserMemory, candidate: MemoryCandidate) -> MemoryAction:
-    memory.touched_count += 1
-    memory.last_touched_at = datetime.now(timezone.utc)
-    memory.extra_metadata = {
-        **(memory.extra_metadata or {}),
-        "confidence": max(metadata_confidence(memory), candidate.confidence),
-        "sensitivity": candidate.sensitivity,
-    }
-    reason = "exact content_hash match"
-    if memory.status == "pending" and candidate.sensitivity == "low" and candidate.confidence >= AUTO_MEMORY_CONFIDENCE:
-        memory.status = "active"
-        memory.extra_metadata = {
-            **memory.extra_metadata,
-            "decision": "auto_activated_from_pending",
-        }
-        reason = "pending exact match promoted to active"
-    db.add(memory)
-    db.commit()
-    db.refresh(memory)
-    return MemoryAction("touch", memory.id, memory.content, reason)
+    return memory_editor.touch_exact_memory(db, memory, candidate)
 
 
 def metadata_confidence(memory: UserMemory) -> float:
-    try:
-        return float((memory.extra_metadata or {}).get("confidence", 0))
-    except (TypeError, ValueError):
-        return 0.0
+    return memory_policy.metadata_confidence(memory)
 
 
 def resolve_memory_category(candidate: MemoryCandidate) -> str:
-    category = (candidate.category or "").strip().lower()
-    if category and category != "general":
-        return category[:80]
-    return infer_memory_category(normalize_memory_content(candidate.content))
+    return memory_policy.resolve_memory_category(candidate)
 
 
 def retrieval_similarity_threshold() -> float:
-    return max(0.2, min(0.45, get_settings().memory_semantic_threshold * 0.35))
+    return memory_policy.retrieval_similarity_threshold()
 
 
 def dedupe_memories(memories: list[UserMemory]) -> list[UserMemory]:
-    seen = set()
-    result = []
-    for memory in memories:
-        if memory.id in seen:
-            continue
-        seen.add(memory.id)
-        result.append(memory)
-    return result
+    return memory_retrieval.dedupe_memories(memories)
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
-    if not left or not right or len(left) != len(right):
-        return 0.0
-    dot = sum(a * b for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(a * a for a in left))
-    right_norm = math.sqrt(sum(b * b for b in right))
-    if left_norm == 0 or right_norm == 0:
-        return 0.0
-    return dot / (left_norm * right_norm)
+    return memory_retrieval.cosine_similarity(left, right)

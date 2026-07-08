@@ -84,7 +84,7 @@ class ConversationStreamingTests(unittest.TestCase):
                 db.refresh(run)
                 return run
 
-            with patch("app.services.conversation_service.run_agent", side_effect=fake_run_agent):
+            with patch("app.services.conversation_service.run_agent", side_effect=fake_run_agent) as run_agent:
                 body = "".join(
                     stream_message_response(
                         session,
@@ -110,6 +110,7 @@ class ConversationStreamingTests(unittest.TestCase):
             run = session.scalar(select(AgentRun).where(AgentRun.conversation_id == conversation.id))
             self.assertIsNotNone(run)
             self.assertEqual(run.message_id, assistant_messages[0].id)
+            self.assertEqual(run_agent.call_args.kwargs["message_id"], user_messages[0].id)
 
     def test_summary_failure_does_not_fail_streamed_answer(self) -> None:
         with isolated_session() as session:

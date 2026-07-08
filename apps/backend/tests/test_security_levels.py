@@ -78,30 +78,30 @@ class SecurityLevelTests(unittest.TestCase):
             self.assertEqual({item.chunk.file_name for item in high_bm25}, {"public-policy.md", "secret-policy.md"})
 
     def test_vector_search_uses_single_collection_with_security_filter(self) -> None:
-        captured_payloads = []
+        captured_queries = []
 
         class FakeEmbeddingProvider:
             def embed_text(self, _text: str) -> list[float]:
                 return [0.1, 0.2, 0.3]
 
-        def fake_qdrant_request(_method, _path, payload=None, **_kwargs):
-            if payload is not None:
-                captured_payloads.append(payload)
-            return 200, {"result": []}
+        class FakeQdrantClient:
+            def query_points(self, **kwargs):
+                captured_queries.append(kwargs)
+                return SimpleNamespace(points=[])
 
         with (
             patch("app.rag.vector_store.ensure_qdrant_collection"),
             patch("app.rag.vector_store.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.rag.vector_store.qdrant_request", side_effect=fake_qdrant_request),
+            patch("app.rag.vector_store.get_qdrant_client", return_value=FakeQdrantClient()),
         ):
             search_knowledge_base_chunks("owner-id", "kb-id", "policy", limit=3, max_security_level=2)
 
-        search_payload = captured_payloads[-1]
-        must_filters = search_payload["filter"]["must"]
-        should_filters = search_payload["filter"]["should"]
-        self.assertIn({"key": "knowledge_base_id", "match": {"value": "kb-id"}}, must_filters)
-        self.assertIn({"key": "security_level", "range": {"lte": 2}}, should_filters)
-        self.assertIn({"is_empty": {"key": "security_level"}}, should_filters)
+        query_filter = captured_queries[-1]["query_filter"].model_dump(exclude_none=True)
+        self.assertEqual(captured_queries[-1]["collection_name"], "knowledge_chunks")
+        self.assertEqual(captured_queries[-1]["limit"], 3)
+        self.assertIn({"key": "knowledge_base_id", "match": {"value": "kb-id"}}, query_filter["must"])
+        self.assertIn({"key": "security_level", "range": {"lte": 2.0}}, query_filter["should"])
+        self.assertIn({"is_empty": {"key": "security_level"}}, query_filter["should"])
 
     def test_admin_can_update_user_security_level(self) -> None:
         with isolated_session() as session:

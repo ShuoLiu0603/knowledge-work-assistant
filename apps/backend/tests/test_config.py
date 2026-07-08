@@ -62,6 +62,23 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIn("at least 32 bytes", str(error.exception))
 
+    def test_production_rejects_invalid_memory_update_mode(self) -> None:
+        settings = Settings(
+            app_env="production",
+            database_url="postgresql+psycopg://user:pass@postgres:5432/rag_app",
+            auto_create_tables=False,
+            jwt_secret_key="a-long-random-secret-value-for-prod",
+            backend_cors_origins="https://app.example.com",
+            llm_api_key="test-llm-key",
+            embedding_api_key="test-embedding-key",
+            memory_update_mode="eventually",
+        )
+
+        with self.assertRaises(RuntimeError) as error:
+            validate_runtime_settings(settings)
+
+        self.assertIn("MEMORY_UPDATE_MODE", str(error.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

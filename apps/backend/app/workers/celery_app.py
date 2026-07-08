@@ -18,3 +18,4 @@ celery_app.conf.update(
 )
 
 import app.workers.document_tasks  # noqa: E402,F401
+import app.workers.memory_tasks  # noqa: E402,F401

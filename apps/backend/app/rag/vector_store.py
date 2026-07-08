@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
-from urllib import error, parse, request
+
+from qdrant_client import QdrantClient, models
 
 from app.core.config import get_settings
 from app.db.models.document import Document, DocumentChunk
@@ -17,40 +17,46 @@ class VectorSearchHit:
     payload: dict[str, Any]
 
 
-def ensure_qdrant_collection() -> None:
+def get_qdrant_client(timeout: int = 10) -> QdrantClient:
+    return QdrantClient(url=get_settings().qdrant_url, timeout=timeout)
+
+
+def ensure_qdrant_collection(client: QdrantClient | None = None) -> None:
+    client = client or get_qdrant_client()
     settings = get_settings()
-    status, _body = qdrant_request("GET", f"/collections/{settings.qdrant_collection}", allow_404=True)
-    if status == 200:
-        ensure_payload_indexes()
-        return
+    collection_name = settings.qdrant_collection
 
-    payload = {
-        "vectors": {
-            "size": settings.embedding_dimension,
-            "distance": "Cosine",
-        }
-    }
-    qdrant_request("PUT", f"/collections/{settings.qdrant_collection}", payload)
-    ensure_payload_indexes()
+    if not client.collection_exists(collection_name):
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(
+                size=settings.embedding_dimension,
+                distance=models.Distance.COSINE,
+            ),
+        )
+
+    ensure_payload_indexes(client)
 
 
-def ensure_payload_indexes() -> None:
-    settings = get_settings()
+def ensure_payload_indexes(client: QdrantClient | None = None) -> None:
+    client = client or get_qdrant_client()
+    collection_name = get_settings().qdrant_collection
     field_schemas = {
-        "user_id": "keyword",
-        "knowledge_base_id": "keyword",
-        "document_id": "keyword",
-        "file_name": "keyword",
-        "security_level": "integer",
+        "user_id": models.PayloadSchemaType.KEYWORD,
+        "knowledge_base_id": models.PayloadSchemaType.KEYWORD,
+        "document_id": models.PayloadSchemaType.KEYWORD,
+        "file_name": models.PayloadSchemaType.KEYWORD,
+        "security_level": models.PayloadSchemaType.INTEGER,
     }
     for field_name, field_schema in field_schemas.items():
         try:
-            qdrant_request(
-                "PUT",
-                f"/collections/{settings.qdrant_collection}/index?wait=true",
-                {"field_name": field_name, "field_schema": field_schema},
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=field_schema,
+                wait=True,
             )
-        except RuntimeError:
+        except Exception:
             continue
 
 
@@ -58,22 +64,22 @@ def upsert_document_chunks(document: Document, chunks: list[DocumentChunk]) -> N
     if not chunks:
         return
 
-    ensure_qdrant_collection()
+    client = get_qdrant_client()
+    ensure_qdrant_collection(client)
     provider = get_embedding_provider()
-    vectors = provider.embed_texts([chunk.content for chunk in chunks])
+    vectors = provider.embed_texts([embedding_text(document, chunk) for chunk in chunks])
     points = [
-        {
-            "id": chunk.qdrant_point_id,
-            "vector": vector,
-            "payload": chunk_payload(document, chunk),
-        }
+        models.PointStruct(
+            id=chunk.qdrant_point_id,
+            vector=vector,
+            payload=chunk_payload(document, chunk),
+        )
         for chunk, vector in zip(chunks, vectors, strict=True)
     ]
-    settings = get_settings()
-    qdrant_request(
-        "PUT",
-        f"/collections/{settings.qdrant_collection}/points?wait=true",
-        {"points": points},
+    client.upsert(
+        collection_name=get_settings().qdrant_collection,
+        points=points,
+        wait=True,
     )
 
 
@@ -84,92 +90,71 @@ def search_knowledge_base_chunks(
     limit: int,
     max_security_level: int,
 ) -> list[VectorSearchHit]:
-    ensure_qdrant_collection()
+    client = get_qdrant_client()
+    ensure_qdrant_collection(client)
     provider = get_embedding_provider()
-    settings = get_settings()
-    payload = {
-        "vector": provider.embed_text(query),
-        "filter": {
-            "must": [
-                {
-                    "key": "user_id",
-                    "match": {"value": owner_id},
-                },
-                {
-                    "key": "knowledge_base_id",
-                    "match": {"value": kb_id},
-                }
-            ],
-            "should": [
-                {
-                    "key": "security_level",
-                    "range": {"lte": max_security_level},
-                },
-                {
-                    "is_empty": {"key": "security_level"},
-                },
-            ],
-        },
-        "limit": limit,
-        "with_payload": True,
-        "with_vector": False,
-    }
-    _status, body = qdrant_request(
-        "POST",
-        f"/collections/{settings.qdrant_collection}/points/search",
-        payload,
+    result = client.query_points(
+        collection_name=get_settings().qdrant_collection,
+        query=provider.embed_text(query),
+        query_filter=search_filter(owner_id, kb_id, max_security_level),
+        limit=limit,
+        with_payload=True,
+        with_vectors=False,
     )
     return [
         VectorSearchHit(
-            point_id=str(item["id"]),
-            score=float(item.get("score", 0)),
-            payload=item.get("payload") or {},
+            point_id=str(point.id),
+            score=float(point.score or 0),
+            payload=dict(point.payload or {}),
         )
-        for item in body.get("result", [])
+        for point in result.points
     ]
 
 
 def delete_document_vectors(document_id: str) -> None:
-    settings = get_settings()
-    status, _body = qdrant_request("GET", f"/collections/{settings.qdrant_collection}", allow_404=True)
-    if status == 404:
-        return
-
-    qdrant_request(
-        "POST",
-        f"/collections/{settings.qdrant_collection}/points/delete?wait=true",
-        {
-            "filter": {
-                "must": [
-                    {
-                        "key": "document_id",
-                        "match": {"value": document_id},
-                    }
-                ]
-            }
-        },
-    )
+    delete_vectors_by_filter(match_filter("document_id", document_id))
 
 
 def delete_knowledge_base_vectors(kb_id: str) -> None:
-    settings = get_settings()
-    status, _body = qdrant_request("GET", f"/collections/{settings.qdrant_collection}", allow_404=True)
-    if status == 404:
-        return
+    delete_vectors_by_filter(match_filter("knowledge_base_id", kb_id))
 
-    qdrant_request(
-        "POST",
-        f"/collections/{settings.qdrant_collection}/points/delete?wait=true",
-        {
-            "filter": {
-                "must": [
-                    {
-                        "key": "knowledge_base_id",
-                        "match": {"value": kb_id},
-                    }
-                ]
-            }
-        },
+
+def delete_vectors_by_filter(points_filter: models.Filter) -> None:
+    client = get_qdrant_client()
+    collection_name = get_settings().qdrant_collection
+    if not client.collection_exists(collection_name):
+        return
+    client.delete(
+        collection_name=collection_name,
+        points_selector=points_filter,
+        wait=True,
+    )
+
+
+def search_filter(owner_id: str, kb_id: str, max_security_level: int) -> models.Filter:
+    return models.Filter(
+        must=[
+            field_match("user_id", owner_id),
+            field_match("knowledge_base_id", kb_id),
+        ],
+        should=[
+            models.FieldCondition(
+                key="security_level",
+                range=models.Range(lte=max_security_level),
+            ),
+            models.IsEmptyCondition(is_empty=models.PayloadField(key="security_level")),
+        ],
+    )
+
+
+def match_filter(field_name: str, value: str) -> models.Filter:
+    return models.Filter(must=[field_match(field_name, value)])
+
+
+def field_match(field_name: str, value: str) -> models.FieldCondition:
+    return models.FieldCondition(
+        key=field_name,
+        match=models.MatchValue(value=value),
     )
 
 
@@ -191,26 +176,12 @@ def chunk_payload(document: Document, chunk: DocumentChunk) -> dict[str, Any]:
     }
 
 
-def qdrant_request(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-    allow_404: bool = False,
-    timeout: int = 10,
-) -> tuple[int, dict[str, Any]]:
-    settings = get_settings()
-    url = f"{settings.qdrant_url.rstrip('/')}{path}"
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"} if payload is not None else {}
-    req = request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with request.urlopen(req, timeout=timeout) as response:
-            response_body = response.read().decode("utf-8")
-            return response.status, json.loads(response_body) if response_body else {}
-    except error.HTTPError as exc:
-        if allow_404 and exc.code == 404:
-            return 404, {}
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Qdrant request failed: {method} {parse.urlsplit(url).path} {exc.code} {body}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"Qdrant is not reachable: {exc.reason}") from exc
+def embedding_text(document: Document, chunk: DocumentChunk) -> str:
+    metadata_lines = [
+        ("file_name", document.file_name),
+        ("title_path", chunk.title_path),
+        ("section_name", chunk.section_name),
+    ]
+    lines = [f"{key}: {value}" for key, value in metadata_lines if value]
+    lines.append(f"content: {chunk.content}")
+    return "\n".join(lines)

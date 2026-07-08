@@ -60,13 +60,14 @@ def route_intent(db: Session, state: AgentGraphState) -> AgentGraphState:
 
 def normalize_intent(intent: str, text: str) -> str:
     normalized_intent = normalize_raw_intent(intent)
+    is_enterprise_question = bool(ENTERPRISE_RE.search(text))
     if normalized_intent == "writing" and WRITING_RE.search(text):
         return "writing"
     if normalized_intent == "summary" and SUMMARY_RE.search(text):
         return "summary"
-    if is_memory_recall_query(text):
+    if is_memory_recall_query(text) and not is_enterprise_question:
         return "memory"
-    if normalized_intent == "memory" and not ENTERPRISE_RE.search(text):
+    if normalized_intent == "memory" and not is_enterprise_question:
         return "memory"
     if normalized_intent == "chat" and CHAT_RE.search(text):
         return "chat"

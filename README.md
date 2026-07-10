@@ -96,7 +96,6 @@ EMBEDDING_API_KEY=your-real-key
 
 如果更换 Embedding 模型，必须同步修改 `EMBEDDING_DIMENSION`。已有 Qdrant collection 的向量维度不会自动迁移，模型或维度变更后应重建相关 collection 与索引。
 
-本地 `.env` 已被 `.gitignore` 忽略，不要把真实密钥提交到 GitHub。
 
 ### 2. 启动开发环境
 

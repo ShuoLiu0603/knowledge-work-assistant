@@ -202,15 +202,7 @@ The gate covers backend tests, Python compileall, the Alembic migration chain, T
 - `demo`: demo documents and RAG evaluation data
 - `scripts`: quality gate, migration verification, smoke, and evaluation tools
 
-## Documentation
 
-- [Agent and Memory Deep Dive](docs/agent_memory_deep_dive.md)
-- [Production Deployment](docs/production_deployment.md)
-- [API Reference](docs/api.md)
-- [RAG Pipeline](docs/rag_pipeline.md)
-- [Architecture Diagrams](docs/architecture_diagrams.md)
-- [Evaluation](docs/evaluation.md)
-- [Manual Acceptance Checklist](docs/manual_acceptance_checklist.md)
 
 ## Current Boundaries
 

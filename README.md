@@ -145,7 +145,6 @@ docker compose -f infra/docker-compose.prod.yml --env-file .env up --build -d
 所有可调运行参数均集中在：
 
 - [开发模板](.env.example)
-- [生产模板](.env.production.example)
 - 后端定义：[config.py](apps/backend/app/core/config.py)
 
 | 参数组 | 示例 |

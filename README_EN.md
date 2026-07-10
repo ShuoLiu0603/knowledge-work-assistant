@@ -189,20 +189,6 @@ python scripts/check_project.py --with-smoke
 
 The gate covers backend tests, Python compileall, the Alembic migration chain, TypeScript/Vite build, and development/production Compose validation.
 
-## Repository Layout
-
-- `apps/backend/app/agents`: fixed graph, Supervisor, and intent handlers
-- `apps/backend/app/memory`: policy, recall, editor, commands, events, and indexes
-- `apps/backend/app/rag`: loading, splitting, embeddings, retrieval, and answering
-- `apps/backend/app/services`: business orchestration, transactions, and authorization
-- `apps/backend/app/workers`: document, memory, summary, cleanup, and retention jobs
-- `apps/frontend/src`: pages, components, API client, and SSE parser
-- `infra`: development and production Docker Compose
-- `docs`: architecture, API, deployment, evaluation, and design documents
-- `demo`: demo documents and RAG evaluation data
-- `scripts`: quality gate, migration verification, smoke, and evaluation tools
-
-
 
 ## Current Boundaries
 

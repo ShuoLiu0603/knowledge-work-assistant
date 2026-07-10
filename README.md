@@ -189,54 +189,6 @@ alembic upgrade head
 
 开发模式允许 `AUTO_CREATE_TABLES=true` 方便本地运行；生产必须使用 `AUTO_CREATE_TABLES=false` 和 Alembic。
 
-## 测试与质量门禁
-
-```bash
-python scripts/check_project.py
-```
-
-质量门禁执行后端测试、Python compileall、Alembic 完整迁移链、TypeScript/Vite 构建以及开发和生产 Compose 配置验证。
-
-运行中的完整栈可以追加端到端冒烟：
-
-```bash
-python scripts/check_project.py --with-smoke
-```
-
-RAG 离线评估说明见 [docs/evaluation.md](docs/evaluation.md)。
-
-## 项目目录
-
-```text
-apps/backend/app/
-  agents/       固定 Agent 图、Supervisor 与各意图节点
-  memory/       记忆策略、召回、编辑、命令、事件和索引
-  rag/          文档解析、切分、Embedding、Hybrid Retrieval、回答
-  services/     业务编排、事务和权限边界
-  workers/      文档、记忆、摘要、清理和保留任务
-  api/          FastAPI 路由与依赖
-  db/           SQLAlchemy 模型和运行时 schema
-
-apps/frontend/src/
-  pages/        对话、知识库、记忆、登录和管理页面
-  components/   布局与基础 UI
-  lib/api/      API client、SSE parser 和类型
-
-infra/          开发与生产 Docker Compose
-docs/           架构、API、部署、评估和模块设计文档
-demo/           演示文档与 RAG 评估数据
-scripts/        质量门禁、迁移验证、冒烟和评估脚本
-```
-
-## 关键文档
-
-- [Agent 与记忆模块深度设计](docs/agent_memory_deep_dive.md)
-- [生产部署](docs/production_deployment.md)
-- [API 参考](docs/api.md)
-- [RAG Pipeline](docs/rag_pipeline.md)
-- [架构图](docs/architecture_diagrams.md)
-- [评估方法](docs/evaluation.md)
-- [手工验收清单](docs/manual_acceptance_checklist.md)
 
 ## 当前边界
 

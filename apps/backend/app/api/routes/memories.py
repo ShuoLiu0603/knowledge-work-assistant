@@ -14,6 +14,7 @@ from app.schemas.memory import (
     UserMemoryRead,
     UserMemoryRecallMetricsRead,
     UserMemoryRecallLogRead,
+    UserMemoryReconcileRead,
     UserMemoryUpdate,
     UserMemoryUpdateJobRead,
 )
@@ -26,6 +27,7 @@ from app.services.memory_service import (
     list_user_memory_update_jobs,
     list_user_memories,
     purge_user_memory,
+    reconcile_user_memories,
     reject_user_memory,
     restore_user_memory,
     retry_user_memory_update_job,
@@ -57,6 +59,11 @@ def create_item(
         payload.content.strip(),
         category=payload.category or "general",
         kind=payload.kind,
+        canonical_key=payload.canonical_key,
+        memory_layer=payload.memory_layer,
+        profile_slot=payload.profile_slot,
+        pinned=payload.pinned,
+        allow_sensitive=payload.confirm_sensitive,
     )
     return to_memory_read(memory)
 
@@ -85,13 +92,31 @@ def get_recall_metrics(
     return UserMemoryRecallMetricsRead(**get_user_memory_recall_metrics(db, current_user.id))
 
 
+@router.post("/reconcile", response_model=UserMemoryReconcileRead)
+def reconcile_items(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    apply: Annotated[bool, Query()] = False,
+    llm_review: Annotated[bool, Query()] = False,
+) -> UserMemoryReconcileRead:
+    return UserMemoryReconcileRead(**reconcile_user_memories(db, current_user.id, apply=apply, llm_review=llm_review))
+
+
 @router.get("/update-jobs", response_model=list[UserMemoryUpdateJobRead])
 def list_update_jobs(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
     status: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[UserMemoryUpdateJobRead]:
-    jobs = list_user_memory_update_jobs(db, current_user.id, status=status)
+    jobs = list_user_memory_update_jobs(
+        db,
+        current_user.id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
     return [to_memory_update_job_read(job) for job in jobs]
 
 
@@ -116,10 +141,16 @@ def update_item(
         db,
         current_user.id,
         memory_id,
+        expected_revision=payload.expected_revision,
         content=payload.content.strip() if payload.content is not None else None,
         status=payload.status,
         category=payload.category,
         kind=payload.kind,
+        canonical_key=payload.canonical_key,
+        memory_layer=payload.memory_layer,
+        profile_slot=payload.profile_slot,
+        pinned=payload.pinned,
+        allow_sensitive=payload.confirm_sensitive,
     )
     return to_memory_read(memory)
 
@@ -181,6 +212,14 @@ def to_memory_read(memory: UserMemory) -> UserMemoryRead:
         status=memory.status,
         kind=memory.kind,
         category=memory.category,
+        canonical_key=memory.canonical_key,
+        memory_layer=memory.memory_layer,
+        profile_slot=memory.profile_slot,
+        scope_type=memory.scope_type,
+        scope_id=memory.scope_id,
+        pinned=memory.pinned,
+        revision=memory.revision,
+        expires_at=memory.expires_at,
         source_text=memory.source_text,
         source_conversation_id=memory.source_conversation_id,
         source_message_id=memory.source_message_id,
@@ -210,6 +249,8 @@ def to_memory_update_job_read(job: UserMemoryUpdateJob) -> UserMemoryUpdateJobRe
         attempts=job.attempts,
         actions=job.actions,
         error_message=job.error_message,
+        lease_expires_at=job.lease_expires_at,
+        dispatched_at=job.dispatched_at,
         created_at=job.created_at,
         updated_at=job.updated_at,
     )

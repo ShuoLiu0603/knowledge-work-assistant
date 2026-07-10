@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 
 from app.db.models.conversation import Conversation, Message
+from app.db.models.external_cleanup_job import ExternalCleanupJob
 from app.db.models.llm_call_log import LlmCallLog
 from app.db.models.retrieval_log import RetrievalLog
 from app.schemas.feedback import FeedbackCreate
 from app.schemas.knowledge_base import KnowledgeBaseCreate
+from app.api.routes.admin import router as admin_router
 from app.services.admin_service import get_admin_metrics
 from app.services.feedback_service import create_feedback
 from app.services.knowledge_base_service import create_knowledge_base
@@ -14,6 +16,15 @@ from helpers import create_user, isolated_session
 
 
 class FeedbackAndAdminMetricTests(unittest.TestCase):
+    def test_admin_metrics_and_audit_routes_require_admin_dependency(self) -> None:
+        route_dependencies = {
+            route.path: [dependency.call.__name__ for dependency in route.dependant.dependencies]
+            for route in admin_router.routes
+        }
+
+        self.assertIn("require_admin", route_dependencies["/admin/metrics"])
+        self.assertIn("require_admin", route_dependencies["/admin/audit-logs"])
+
     def test_feedback_upsert_and_metrics(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "metrics@example.com", "Metrics")
@@ -91,6 +102,9 @@ class FeedbackAndAdminMetricTests(unittest.TestCase):
             self.assertEqual(metrics.feedback_count, 1)
             self.assertEqual(metrics.negative_feedback_count, 1)
             self.assertEqual(metrics.positive_feedback_rate, 0.0)
+            self.assertEqual(metrics.external_cleanup_job_count, 0)
+            self.assertEqual(metrics.failed_external_cleanup_job_count, 0)
+            self.assertEqual(metrics.queued_external_cleanup_job_count, 0)
 
     def test_metrics_are_scoped_for_users_and_global_for_admins(self) -> None:
         with isolated_session() as session:
@@ -133,6 +147,24 @@ class FeedbackAndAdminMetricTests(unittest.TestCase):
                     ),
                 ]
             )
+            session.add_all(
+                [
+                    ExternalCleanupJob(
+                        actor_user_id=user_a.id,
+                        resource_type="document",
+                        resource_id="doc-a",
+                        status="failed",
+                        object_keys=["objects/doc-a.md"],
+                    ),
+                    ExternalCleanupJob(
+                        actor_user_id=user_b.id,
+                        resource_type="document",
+                        resource_id="doc-b",
+                        status="queued",
+                        object_keys=["objects/doc-b.md"],
+                    ),
+                ]
+            )
             session.commit()
 
             metrics_a = get_admin_metrics(session, user_a)
@@ -142,11 +174,17 @@ class FeedbackAndAdminMetricTests(unittest.TestCase):
             self.assertEqual(metrics_a.conversation_count, 1)
             self.assertEqual(metrics_a.llm_call_count, 1)
             self.assertEqual(metrics_a.total_tokens, 3)
+            self.assertEqual(metrics_a.external_cleanup_job_count, 1)
+            self.assertEqual(metrics_a.failed_external_cleanup_job_count, 1)
+            self.assertEqual(metrics_a.queued_external_cleanup_job_count, 0)
 
             self.assertEqual(metrics_admin.scope, "global")
             self.assertEqual(metrics_admin.conversation_count, 2)
             self.assertEqual(metrics_admin.llm_call_count, 2)
             self.assertEqual(metrics_admin.total_tokens, 12)
+            self.assertEqual(metrics_admin.external_cleanup_job_count, 2)
+            self.assertEqual(metrics_admin.failed_external_cleanup_job_count, 1)
+            self.assertEqual(metrics_admin.queued_external_cleanup_job_count, 1)
 
 
 if __name__ == "__main__":

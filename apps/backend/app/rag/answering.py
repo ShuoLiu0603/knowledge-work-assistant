@@ -21,7 +21,7 @@ def select_answer_context_chunks(chunks: list[RetrievedChunk]) -> list[Retrieved
     selected: list[RetrievedChunk] = []
     used_chars = 0
     for chunk in chunks:
-        snippet = compact_snippet(chunk.content, max_chars=700)
+        snippet = compact_snippet(chunk.content, max_chars=settings.context_compression_chunk_chars)
         if used_chars + len(snippet) > settings.answer_context_max_chars:
             break
         used_chars += len(snippet)

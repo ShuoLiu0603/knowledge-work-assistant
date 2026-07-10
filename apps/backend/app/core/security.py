@@ -13,7 +13,7 @@ import jwt
 from app.core.config import get_settings
 
 PASSWORD_ALGORITHM = "bcrypt"
-BCRYPT_ROUNDS = 12
+BCRYPT_ROUNDS = get_settings().bcrypt_rounds
 LEGACY_PASSWORD_ALGORITHM = "pbkdf2_sha256"
 
 

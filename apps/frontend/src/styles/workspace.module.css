@@ -1,0 +1,293 @@
+.splitPage {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(300px, 400px) minmax(0, 1fr);
+  min-height: 0;
+  background: var(--color-bg);
+}
+
+.sidePanel {
+  overflow-y: auto;
+  padding: clamp(18px, 2.4vw, 28px);
+  border-right: 1px solid var(--color-border);
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.mainPanel {
+  min-width: 0;
+  overflow-y: auto;
+  padding: clamp(18px, 2.4vw, 28px);
+}
+
+.page {
+  flex: 1;
+  overflow-y: auto;
+  width: 100%;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: clamp(18px, 2.4vw, 32px);
+}
+
+.narrowPage {
+  max-width: 980px;
+}
+
+.pageHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+
+.title {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 22px;
+  font-weight: 780;
+  line-height: 1.25;
+}
+
+.sectionTitle {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 18px;
+  font-weight: 760;
+}
+
+.subtitle {
+  margin: 5px 0 0;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.formStack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.controlRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cardList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-xs);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+
+.card:hover {
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.empty {
+  margin: 0;
+  padding: 42px 24px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-muted);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+.error {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(180, 35, 24, 0.18);
+  border-radius: var(--radius-md);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.uploadBox {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 18px;
+  border: 1.5px dashed var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.uploadBox:hover {
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+}
+
+.uploadBox:focus-visible {
+  border-color: var(--color-primary);
+  box-shadow: var(--focus-ring);
+}
+
+.uploadBoxBusy {
+  cursor: wait;
+  opacity: 0.75;
+}
+
+.uploadTitle {
+  display: block;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 760;
+}
+
+.uploadHint {
+  margin: 4px 0 0;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.uploadControl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: default;
+}
+
+.uploadControl select {
+  min-height: 32px;
+  padding: 5px 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.fileInput {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.statsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.statCard {
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.statLabel {
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.statValue {
+  margin-top: 4px;
+  color: var(--color-text);
+  font-size: 26px;
+  font-weight: 780;
+  line-height: 1;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 22px;
+  padding: 5px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  overflow-x: auto;
+}
+
+.tab {
+  min-height: 36px;
+  padding: 8px 14px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  background: var(--color-surface-muted);
+  color: var(--color-text);
+}
+
+.tabActive {
+  border-color: rgba(15, 118, 110, 0.18);
+  background: var(--color-primary-soft);
+  color: var(--color-primary-strong);
+}
+
+@media (max-width: 860px) {
+  .splitPage {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidePanel {
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .pageHeader,
+  .toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .uploadBox {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .uploadControl {
+    justify-content: space-between;
+  }
+}

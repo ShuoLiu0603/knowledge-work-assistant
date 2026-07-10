@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.models.conversation import Conversation, Message
+from app.db.models.external_cleanup_job import ExternalCleanupJob
 from app.db.models.feedback import Feedback
 from app.db.models.llm_call_log import LlmCallLog
 from app.db.models.retrieval_log import RetrievalLog
@@ -25,6 +26,7 @@ def get_admin_metrics(db: Session, current_user: User) -> AdminMetricsRead:
     retrieval_logs = list_retrieval_logs_for_metrics(db, scoped_user_id)
     llm_rows = list_llm_logs_for_metrics(db, scoped_user_id)
     feedback_rows = list_feedbacks_for_metrics(db, scoped_user_id)
+    cleanup_rows = list_external_cleanup_jobs_for_metrics(db, scoped_user_id)
 
     llm_call_count = len(llm_rows)
     total_tokens = sum(row.total_tokens for row in llm_rows)
@@ -48,6 +50,9 @@ def get_admin_metrics(db: Session, current_user: User) -> AdminMetricsRead:
         negative_feedback_count=negative_feedback_count,
         positive_feedback_rate=safe_ratio(positive_feedback_count, len(feedback_rows)),
         average_selected_chunks=average(selected_counts),
+        external_cleanup_job_count=len(cleanup_rows),
+        failed_external_cleanup_job_count=sum(1 for row in cleanup_rows if row.status == "failed"),
+        queued_external_cleanup_job_count=sum(1 for row in cleanup_rows if row.status == "queued"),
         recent_llm_errors=[
             {
                 "id": row.id,
@@ -202,6 +207,13 @@ def list_feedbacks_for_metrics(db: Session, user_id: str | None) -> list[Feedbac
     if user_id is not None:
         query = query.where(Feedback.user_id == user_id)
     return list(db.scalars(query.order_by(Feedback.created_at.desc())).all())
+
+
+def list_external_cleanup_jobs_for_metrics(db: Session, user_id: str | None) -> list[ExternalCleanupJob]:
+    query = select(ExternalCleanupJob)
+    if user_id is not None:
+        query = query.where(ExternalCleanupJob.actor_user_id == user_id)
+    return list(db.scalars(query.order_by(ExternalCleanupJob.updated_at.desc())).all())
 
 
 def average(values: list[int | float]) -> float | None:

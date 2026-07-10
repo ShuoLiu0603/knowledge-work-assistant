@@ -13,10 +13,10 @@ from app.core.security_levels import DEFAULT_SECURITY_LEVEL, validate_security_l
 from app.db.models.document import Document, DocumentChunk
 from app.db.models.knowledge_base import KnowledgeBase
 from app.db.models.user import User
-from app.rag.vector_store import delete_document_vectors
 from app.schemas.document import DocumentChunkRead, DocumentRead, DocumentUploadResponse
 from app.services.knowledge_base_service import ensure_kb_access, require_user
 from app.services.audit_service import record_audit_event
+from app.services.cleanup_service import create_external_cleanup_job, run_external_cleanup_job, to_cleanup_metadata
 from app.storage.minio_client import remove_object, upload_bytes
 from app.workers.document_tasks import process_document
 
@@ -222,9 +222,21 @@ def delete_document(db: Session, user_id: str, document_id: str) -> None:
     file_name = document.file_name
     security_level = document.security_level
 
-    cleanup_document_resources(db, user_id, document_id, object_key, security_level)
+    cleanup_job = create_external_cleanup_job(
+        db,
+        actor_user_id=user_id,
+        resource_type="document",
+        resource_id=document_id,
+        object_keys=[object_key],
+        metadata={
+            "knowledge_base_id": knowledge_base_id,
+            "file_name": file_name,
+            "security_level": security_level,
+        },
+    )
     db.delete(document)
     db.commit()
+    cleanup_job = run_external_cleanup_job(db, cleanup_job.id)
     record_audit_event(
         db,
         actor_user_id=user_id,
@@ -235,36 +247,9 @@ def delete_document(db: Session, user_id: str, document_id: str) -> None:
         metadata={
             "knowledge_base_id": knowledge_base_id,
             "file_name": file_name,
+            **to_cleanup_metadata(cleanup_job),
         },
     )
-
-
-def cleanup_document_resources(
-    db: Session,
-    user_id: str,
-    document_id: str,
-    object_key: str,
-    security_level: int,
-) -> None:
-    try:
-        delete_document_vectors(document_id)
-        remove_object(object_key)
-    except Exception as exc:
-        record_audit_event(
-            db,
-            actor_user_id=user_id,
-            action="document.delete_cleanup",
-            resource_type="document",
-            resource_id=document_id,
-            outcome="failed",
-            security_level=security_level,
-            detail=str(exc),
-            metadata={"object_key": object_key},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Document cleanup failed; delete was not committed",
-        ) from exc
 
 
 def mark_document_failed(db: Session, document_id: str, error_message: str) -> None:

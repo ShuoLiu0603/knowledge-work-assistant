@@ -9,11 +9,13 @@ from sqlalchemy import select
 
 from app.db.models.audit_log import AuditLog
 from app.db.models.document import Document
+from app.db.models.external_cleanup_job import ExternalCleanupJob
 from app.schemas.department import DepartmentCreate
 from app.schemas.knowledge_base import KnowledgeBaseCreate
 from app.services.department_service import create_department
 from app.services.document_service import create_uploaded_document, delete_document, list_documents, sanitize_file_name
 from app.services.knowledge_base_service import create_knowledge_base
+from app.services.cleanup_service import run_external_cleanup_job
 from helpers import create_user, isolated_session
 
 
@@ -250,8 +252,8 @@ class DocumentServiceTests(unittest.TestCase):
             document_id = document.id
 
             with (
-                patch("app.services.document_service.remove_object") as remove_object,
-                patch("app.services.document_service.delete_document_vectors") as delete_vectors,
+                patch("app.services.cleanup_service.remove_object") as remove_object,
+                patch("app.services.cleanup_service.delete_document_vectors") as delete_vectors,
             ):
                 delete_document(session, user.id, document_id)
 
@@ -264,8 +266,9 @@ class DocumentServiceTests(unittest.TestCase):
             self.assertEqual(audit_log.security_level, 5)
             self.assertEqual(audit_log.extra_metadata["knowledge_base_id"], kb.id)
             self.assertEqual(audit_log.extra_metadata["file_name"], "delete-me.md")
+            self.assertEqual(audit_log.extra_metadata["cleanup_status"], "completed")
 
-    def test_delete_document_keeps_database_row_when_cleanup_fails(self) -> None:
+    def test_delete_document_records_retryable_cleanup_job_when_cleanup_fails(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "delete-cleanup@example.com", "Delete Cleanup")
             kb = create_knowledge_base(
@@ -289,18 +292,35 @@ class DocumentServiceTests(unittest.TestCase):
             document_id = document.id
 
             with (
-                patch("app.services.document_service.delete_document_vectors", side_effect=RuntimeError("qdrant offline")),
-                patch("app.services.document_service.remove_object") as remove_object,
-                self.assertRaises(HTTPException) as error,
+                patch("app.services.cleanup_service.delete_document_vectors", side_effect=RuntimeError("qdrant offline")),
+                patch("app.services.cleanup_service.remove_object") as remove_object,
             ):
                 delete_document(session, user.id, document_id)
 
-            self.assertEqual(error.exception.status_code, 503)
-            self.assertIsNotNone(session.get(Document, document_id))
+            self.assertIsNone(session.get(Document, document_id))
             remove_object.assert_not_called()
-            audit_log = session.scalar(select(AuditLog).where(AuditLog.action == "document.delete_cleanup"))
-            self.assertIsNotNone(audit_log)
-            self.assertEqual(audit_log.outcome, "failed")
+            cleanup_job = session.scalar(select(ExternalCleanupJob).where(ExternalCleanupJob.resource_id == document_id))
+            self.assertIsNotNone(cleanup_job)
+            self.assertEqual(cleanup_job.status, "failed")
+            self.assertEqual(cleanup_job.attempts, 1)
+            self.assertIn("qdrant offline", cleanup_job.error_message)
+            cleanup_audit = session.scalar(select(AuditLog).where(AuditLog.action == "document.external_cleanup"))
+            self.assertIsNotNone(cleanup_audit)
+            self.assertEqual(cleanup_audit.outcome, "failed")
+            delete_audit = session.scalar(select(AuditLog).where(AuditLog.action == "document.delete"))
+            self.assertEqual(delete_audit.extra_metadata["cleanup_status"], "failed")
+            self.assertEqual(delete_audit.extra_metadata["cleanup_job_id"], cleanup_job.id)
+
+            with (
+                patch("app.services.cleanup_service.delete_document_vectors") as delete_vectors,
+                patch("app.services.cleanup_service.remove_object") as retry_remove_object,
+            ):
+                retried = run_external_cleanup_job(session, cleanup_job.id)
+
+            self.assertEqual(retried.status, "completed")
+            self.assertEqual(retried.attempts, 2)
+            delete_vectors.assert_called_once_with(document_id)
+            retry_remove_object.assert_called_once_with("objects/cleanup.md")
 
     def test_non_admin_cannot_upload_to_public_knowledge_base(self) -> None:
         with isolated_session() as session:

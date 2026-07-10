@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 from collections.abc import Callable
 
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.rag.answering import compact_snippet, generate_grounded_answer
+from app.rag.answering import compact_snippet, generate_grounded_answer, select_answer_context_chunks
 from app.rag.advanced_retrieval import retrieve_advanced_chunks
 from app.rag.retrieval import RetrievedChunk
 from app.schemas.qa import AskKnowledgeBaseRequest, AskKnowledgeBaseResponse, CitationRead
@@ -24,6 +25,16 @@ class RagAnswer:
     llm_log_id: str | None = None
 
 
+@dataclass(frozen=True)
+class RagEvidence:
+    question: str
+    chunks: list[RetrievedChunk]
+    citations: list[CitationRead]
+    retrieval_log_id: str
+    retrieval_log: object
+    searched_knowledge_base_ids: list[str]
+
+
 def ask_knowledge_base(
     db: Session,
     user_id: str,
@@ -32,6 +43,11 @@ def ask_knowledge_base(
 ) -> AskKnowledgeBaseResponse:
     ensure_kb_access(db, user_id, kb_id, required_role="viewer")
     question = payload.question.strip()
+    if (payload.search_scope or "single").strip().lower() != "single" or payload.department_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Direct knowledge-base ask only supports single knowledge-base scope",
+        )
     memory_context = build_memory_context_for_question(db, user_id, question)
     rag_answer = build_rag_answer(
         db,
@@ -41,8 +57,8 @@ def ask_knowledge_base(
         top_k=payload.top_k,
         memory_context=memory_context,
         agent_name="direct_ask",
-        search_scope=payload.search_scope,
-        department_id=payload.department_id,
+        search_scope="single",
+        department_id=None,
     )
     return AskKnowledgeBaseResponse(
         question=question,
@@ -66,6 +82,51 @@ def build_rag_answer(
     search_scope: str = "single",
     department_id: str | None = None,
 ) -> RagAnswer:
+    evidence = retrieve_rag_evidence(
+        db,
+        user_id,
+        kb_id,
+        question,
+        top_k=top_k,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        search_scope=search_scope,
+        department_id=department_id,
+    )
+    generated = generate_grounded_answer(
+        question,
+        evidence.chunks,
+        memory_context=memory_context,
+        on_token=on_token,
+    )
+    llm_log = create_llm_call_log(
+        db,
+        generated.completion,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        agent_name=agent_name,
+    )
+    return RagAnswer(
+        question=question,
+        answer=generated.answer,
+        citations=[to_citation(chunk) for chunk in generated.used_chunks],
+        retrieval_log_id=evidence.retrieval_log_id,
+        retrieval_log=evidence.retrieval_log,
+        llm_log_id=llm_log.id,
+    )
+
+
+def retrieve_rag_evidence(
+    db: Session,
+    user_id: str,
+    kb_id: str | None,
+    question: str,
+    top_k: int | None = None,
+    conversation_id: str | None = None,
+    message_id: str | None = None,
+    search_scope: str = "single",
+    department_id: str | None = None,
+) -> RagEvidence:
     scope = resolve_search_scope(db, user_id, kb_id, scope_type=search_scope, department_id=department_id)
     retrieval = retrieve_advanced_chunks(
         db,
@@ -85,19 +146,7 @@ def build_rag_answer(
         message_id=message_id,
     )
     retrieval_log = to_retrieval_log_read(log)
-    generated = generate_grounded_answer(
-        question,
-        retrieval.selected_chunks,
-        memory_context=memory_context,
-        on_token=on_token,
-    )
-    llm_log = create_llm_call_log(
-        db,
-        generated.completion,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        agent_name=agent_name,
-    )
+    evidence_chunks = select_answer_context_chunks(retrieval.selected_chunks)
     record_audit_event(
         db,
         actor_user_id=user_id,
@@ -117,13 +166,13 @@ def build_rag_answer(
             "max_returned_security_level": max((chunk.security_level for chunk in retrieval.selected_chunks), default=None),
         },
     )
-    return RagAnswer(
+    return RagEvidence(
         question=question,
-        answer=generated.answer,
-        citations=[to_citation(chunk) for chunk in generated.used_chunks],
+        chunks=evidence_chunks,
+        citations=[to_citation(chunk) for chunk in evidence_chunks],
         retrieval_log_id=log.id,
         retrieval_log=retrieval_log,
-        llm_log_id=llm_log.id,
+        searched_knowledge_base_ids=scope.knowledge_base_ids,
     )
 
 

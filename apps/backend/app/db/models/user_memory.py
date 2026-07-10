@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -11,6 +11,42 @@ from app.db.base import Base
 
 class UserMemory(Base):
     __tablename__ = "user_memories"
+    __table_args__ = (
+        Index(
+            "uq_user_memories_active_profile_singleton",
+            "user_id",
+            "scope_type",
+            "scope_id",
+            "profile_slot",
+            unique=True,
+            sqlite_where=text(
+                "status = 'active' AND memory_layer = 'profile' "
+                "AND profile_slot IN ("
+                "'response_detail', 'language', 'format', 'name', 'company', "
+                "'team', 'current_role', 'current_project', 'current_stack', "
+                "'backend_framework', 'frontend_framework'"
+                ")"
+            ),
+            postgresql_where=text(
+                "status = 'active' AND memory_layer = 'profile' "
+                "AND profile_slot IN ("
+                "'response_detail', 'language', 'format', 'name', 'company', "
+                "'team', 'current_role', 'current_project', 'current_stack', "
+                "'backend_framework', 'frontend_framework'"
+                ")"
+            ),
+        ),
+        Index(
+            "uq_user_memories_active_canonical_key",
+            "user_id",
+            "scope_type",
+            "scope_id",
+            "canonical_key",
+            unique=True,
+            sqlite_where=text("status = 'active' AND canonical_key <> ''"),
+            postgresql_where=text("status = 'active' AND canonical_key <> ''"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
@@ -20,6 +56,14 @@ class UserMemory(Base):
     status: Mapped[str] = mapped_column(String(30), index=True, nullable=False, default="active")
     kind: Mapped[str] = mapped_column(String(40), nullable=False, default="preference")
     category: Mapped[str] = mapped_column(String(80), index=True, nullable=False, default="general")
+    canonical_key: Mapped[str] = mapped_column(String(160), index=True, nullable=False, default="")
+    memory_layer: Mapped[str] = mapped_column(String(30), index=True, nullable=False, default="semantic")
+    profile_slot: Mapped[str] = mapped_column(String(80), index=True, nullable=False, default="")
+    scope_type: Mapped[str] = mapped_column(String(30), index=True, nullable=False, default="user")
+    scope_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False, default="")
+    pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     source_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     source_conversation_id: Mapped[str | None] = mapped_column(
         String(36),
@@ -105,6 +149,26 @@ class UserMemoryRecallLog(Base):
 
 class UserMemoryUpdateJob(Base):
     __tablename__ = "user_memory_update_jobs"
+    __table_args__ = (
+        Index(
+            "ix_user_memory_update_jobs_status_lease_expires_at",
+            "status",
+            "lease_expires_at",
+        ),
+        Index(
+            "ix_user_memory_update_jobs_status_dispatched_at",
+            "status",
+            "dispatched_at",
+        ),
+        Index(
+            "uq_user_memory_update_jobs_user_message_id",
+            "user_id",
+            "message_id",
+            unique=True,
+            sqlite_where=text("message_id IS NOT NULL"),
+            postgresql_where=text("message_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
@@ -124,6 +188,9 @@ class UserMemoryUpdateJob(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     actions: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    lease_token: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

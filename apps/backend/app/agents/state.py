@@ -2,8 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from threading import Event
+from time import monotonic
 
 from app.schemas.qa import CitationRead
+
+
+class AgentRunCancelled(RuntimeError):
+    pass
+
+
+class AgentRunTimeout(RuntimeError):
+    pass
 
 
 @dataclass
@@ -23,14 +33,29 @@ class AgentGraphState:
     llm_log_id: str | None = None
     llm_log_ids: list[str] = field(default_factory=list)
     short_term_memory: list[dict] = field(default_factory=list)
+    profile_memories: list[dict] = field(default_factory=list)
     long_term_memories: list[dict] = field(default_factory=list)
     conversation_summary: str | None = None
     memory_context: str = ""
     memory_actions: list[dict] = field(default_factory=list)
+    defer_memory_update: bool = False
+    memory_enabled: bool | None = None
     token_callback: Callable[[str], None] | None = None
+    cancel_event: Event | None = field(default=None, repr=False)
+    deadline_monotonic: float | None = field(default=None, repr=False)
+    searched_knowledge_base_ids: list[str] = field(default_factory=list)
     trace: list[dict] = field(default_factory=list)
     status: str = "running"
     error_message: str | None = None
+
+
+def ensure_agent_run_active(state: AgentGraphState) -> None:
+    if state.cancel_event is not None and state.cancel_event.is_set():
+        raise AgentRunCancelled("Agent run cancelled")
+    if state.deadline_monotonic is not None and monotonic() >= state.deadline_monotonic:
+        if state.cancel_event is not None:
+            state.cancel_event.set()
+        raise AgentRunTimeout("Agent run timed out")
 
 
 def add_trace(

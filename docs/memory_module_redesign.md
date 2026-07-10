@@ -84,6 +84,7 @@ Critical fixes already applied:
 - Long-term memory recall now writes explainable logs with recall mode, threshold, candidates, selected ids, and routes.
 - Long-term memory vector search is optional and best-effort. PostgreSQL remains the source of truth; Qdrant is only an acceleration index.
 - Vector recall uses the same similarity threshold as SQL/Python semantic recall, and low-score vector hits are logged as rejected candidates instead of being injected into the prompt.
+- Long-term recall no longer loads every active memory before ranking. Profile memories are loaded as a small sticky set; vector hits are resolved by id; semantic fallback uses a bounded recent candidate set while recall logs still record the total active memory count.
 - Full-memory recall phrases are guaranteed to route as memory requests even if the LLM classifier says `rag`.
 - Manual blank updates fail with a stable HTTP 400 instead of an implementation error.
 - `MEMORY_UPDATE_MODE` supports `sync`, `async`, and `disabled`. Async mode first writes a durable `user_memory_update_jobs` row, then dispatches Celery by job id so user-facing latency is not coupled to memory review and broker outages do not erase work.
@@ -91,9 +92,13 @@ Critical fixes already applied:
 - Conversation streaming now passes the explicit user `message_id` into the agent state so memory provenance does not depend on a best-effort latest-message lookup.
 - Pending memories have explicit approve/reject service and API paths, with dedicated append-only `approve` and `reject` events.
 - Users can request a temporary/no-memory turn with phrases such as "without memory", "不要使用记忆", or "临时模式"; that turn skips recall and durable memory updates.
+- Automatic memory writes do not rely only on the LLM-provided `sensitivity` field. A deterministic policy guard blocks obvious secrets, tokens, credentials, contact details, and private identifiers before active or pending memories can be created from chat.
+- Automatic multi-operation memory edits now run as a single unit of work. If a later operation fails, earlier memory writes from the same review are rolled back instead of leaving the update job partially applied.
 - Memory context is formatted under `MEMORY_CONTEXT_MAX_TOKENS` plus `MEMORY_CONTEXT_MAX_CHARS`, splitting budget across long-term memory, conversation summary, and recent dialogue. Within the long-term memory section, sticky preferences and higher-confidence or higher-importance memories are kept ahead of generic memories.
 - Users can export memory governance data, restore soft-deleted memories, and permanently purge a single memory plus its vector point. Purge keeps a detached audit snapshot but removes the durable memory row.
+- User-driven memory governance actions (`create`, `update`, `approve`, `reject`, `restore`, `delete`, and `purge`) are also mirrored into the global `AuditLog` without storing memory content, source text, or content hashes.
 - Recall quality is measurable from logs: mode distribution, route distribution, fallback count, vector count, empty-result rate, below-threshold candidates, average selected count, and top recalled memories.
+- Memory reconcile can inspect the optional Qdrant memory index for missing, stale, or unexpected vector points; dry-run reports drift and apply mode repairs it with `vector_sync` / `vector_delete` audit events.
 
 ## Optional Enhancements
 

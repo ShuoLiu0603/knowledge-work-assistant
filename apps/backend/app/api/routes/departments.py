@@ -23,7 +23,7 @@ def list_items(
 @router.post("", response_model=DepartmentRead, status_code=status.HTTP_201_CREATED)
 def create_item(
     payload: DepartmentCreate,
-    _admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
 ) -> DepartmentRead:
-    return create_department(db, payload)
+    return create_department(db, payload, actor_user_id=admin_user.id)

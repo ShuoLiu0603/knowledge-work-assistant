@@ -1,0 +1,103 @@
+.wrap {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.newButton {
+  margin-bottom: 12px;
+}
+
+.list {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+}
+
+.item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), background var(--transition-fast);
+}
+
+.item:hover {
+  border-color: var(--color-border);
+  box-shadow: var(--shadow-xs);
+}
+
+.itemActive {
+  border-color: rgba(15, 118, 110, 0.35);
+  background: var(--color-primary-soft);
+  box-shadow: inset 3px 0 0 var(--color-primary);
+}
+
+.selectButton,
+.deleteButton {
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+}
+
+.selectButton {
+  min-width: 0;
+  padding: 11px 12px 11px 14px;
+  color: var(--color-text);
+  text-align: left;
+}
+
+.title {
+  overflow: hidden;
+  margin-bottom: 3px;
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deleteButton {
+  display: grid;
+  place-items: center;
+  border-left: 1px solid var(--color-border);
+  color: var(--color-danger);
+  font-size: 15px;
+  line-height: 1;
+  transition: background var(--transition-fast);
+}
+
+.deleteButton:hover:not(:disabled) {
+  background: var(--color-danger-soft);
+}
+
+.selectButton:disabled,
+.deleteButton:disabled {
+  color: var(--color-text-muted);
+}
+
+.empty {
+  margin: 4px 0 0;
+  padding: 14px 12px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-muted);
+  color: var(--color-text-muted);
+  font-size: 13px;
+  text-align: center;
+}

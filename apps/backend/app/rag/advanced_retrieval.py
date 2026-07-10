@@ -17,12 +17,15 @@ from app.rag.retrieval import RetrievedChunk, retrieve_dense_chunks
 TERM_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？.!?])\s+|\n+")
 
-MAX_ROUTE_QUERIES = 4
-ORIGINAL_QUERY_WEIGHT = 1.2
-REWRITE_QUERY_WEIGHT = 1.1
-SUB_QUERY_WEIGHT = 1.0
-DENSE_PREFILTER_MULTIPLIER = 4
-BM25_PREFILTER_TERMS = 12
+_SETTINGS = get_settings()
+MAX_ROUTE_QUERIES = _SETTINGS.retrieval_max_route_queries
+ORIGINAL_QUERY_WEIGHT = _SETTINGS.retrieval_original_query_weight
+REWRITE_QUERY_WEIGHT = _SETTINGS.retrieval_rewrite_query_weight
+SUB_QUERY_WEIGHT = _SETTINGS.retrieval_subquery_weight
+DENSE_PREFILTER_MULTIPLIER = _SETTINGS.retrieval_dense_prefilter_multiplier
+BM25_PREFILTER_TERMS = _SETTINGS.retrieval_bm25_prefilter_terms
+MAX_MATCHED_TERMS = _SETTINGS.retrieval_max_matched_terms
+CONTEXT_COMPRESSION_FALLBACK_SENTENCES = _SETTINGS.context_compression_fallback_sentences
 
 
 @dataclass(frozen=True)
@@ -425,7 +428,7 @@ def compress_context(content: str, terms: list[str], max_chars: int) -> str:
         for sentence in sentences
         if any(term.lower() in sentence.lower() for term in terms)
     ]
-    compressed = " ".join(matched or sentences[:2])
+    compressed = " ".join(matched or sentences[:CONTEXT_COMPRESSION_FALLBACK_SENTENCES])
     if len(compressed) > max_chars:
         return compact_snippet(compressed, max_chars=max_chars)
     return compressed
@@ -510,7 +513,7 @@ def keyword_search_text(chunk: DocumentChunk, document: Document) -> str:
 
 
 def searchable_terms(text: str) -> list[str]:
-    return dedupe_preserve_order(text_terms(text))[:32]
+    return dedupe_preserve_order(text_terms(text))[:MAX_MATCHED_TERMS]
 
 
 def text_terms(text: str) -> list[str]:

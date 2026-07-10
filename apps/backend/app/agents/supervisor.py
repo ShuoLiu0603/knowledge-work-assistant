@@ -1,34 +1,35 @@
 from __future__ import annotations
 
-import re
-
 from sqlalchemy.orm import Session
 
-from app.agents.state import AgentGraphState, add_trace
-from app.llm.provider import get_llm_provider
+from app.agents.state import AgentGraphState, add_trace, ensure_agent_run_active
+from app.llm.provider import get_llm_provider, normalize_intent_label
+from app.memory.policy import is_full_memory_recall_query
 from app.services.llm_log_service import create_llm_call_log
-from app.services.memory_service import is_memory_recall_query
 
-SUMMARY_RE = re.compile(r"(总结|概括|摘要|归纳|summary|summarize|tl;dr|tldr)", re.IGNORECASE)
-WRITING_RE = re.compile(
-    r"(写|撰写|起草|拟一份|生成一份|帮我.*(邮件|通知|报告|方案|文案|函)|"
-    r"draft|write|compose|email|proposal|report)",
-    re.IGNORECASE,
-)
-CHAT_RE = re.compile(r"^(你好|您好|嗨|hello|hi|hey|谢谢|感谢|thanks|thank you)[。！!.\s]*$", re.IGNORECASE)
-ENTERPRISE_RE = re.compile(
-    r"(知识库|文档|制度|政策|流程|规范|标准|报销|审批|合同|发票|权限|依据|根据|"
-    r"policy|procedure|document|knowledge base|reimbursement|invoice|contract|approval)",
-    re.IGNORECASE,
-)
+
+def normalize_intent(raw_intent: str, _text: str = "") -> str:
+    return normalize_intent_label(raw_intent)
 
 
 def route_intent(db: Session, state: AgentGraphState) -> AgentGraphState:
+    if is_full_memory_recall_query(state.input):
+        state.intent = "memory"
+        add_trace(
+            state,
+            node="supervisor",
+            action="route_full_memory_recall",
+            input_data={"input": state.input},
+            output_data={"intent": state.intent, "deterministic": True},
+        )
+        return state
+
     provider = get_llm_provider()
     raw_intent = "rag"
     llm_log_id = None
     if hasattr(provider, "classify_intent_with_metadata"):
         classification = provider.classify_intent_with_metadata(state.input)
+        ensure_agent_run_active(state)
         raw_intent = classification.intent
         llm_log = create_llm_call_log(
             db,
@@ -41,47 +42,18 @@ def route_intent(db: Session, state: AgentGraphState) -> AgentGraphState:
         state.llm_log_ids.append(llm_log.id)
     else:
         raw_intent = provider.classify_intent(state.input)
-    intent = normalize_intent(raw_intent, state.input)
-    state.intent = intent
+        ensure_agent_run_active(state)
+    state.intent = normalize_intent(raw_intent, state.input)
     add_trace(
         state,
         node="supervisor",
         action="route_intent_with_llm_provider",
         input_data={"input": state.input},
         output_data={
-            "intent": intent,
+            "intent": state.intent,
             "raw_intent": raw_intent,
             "provider": provider.provider_name,
             "llm_log_id": llm_log_id,
         },
     )
     return state
-
-
-def normalize_intent(intent: str, text: str) -> str:
-    normalized_intent = normalize_raw_intent(intent)
-    is_enterprise_question = bool(ENTERPRISE_RE.search(text))
-    if normalized_intent == "writing" and WRITING_RE.search(text):
-        return "writing"
-    if normalized_intent == "summary" and SUMMARY_RE.search(text):
-        return "summary"
-    if is_memory_recall_query(text) and not is_enterprise_question:
-        return "memory"
-    if normalized_intent == "memory" and not is_enterprise_question:
-        return "memory"
-    if normalized_intent == "chat" and CHAT_RE.search(text):
-        return "chat"
-    return "rag"
-
-
-def normalize_raw_intent(intent: str) -> str:
-    normalized = intent.strip().lower()
-    if "summary" in normalized:
-        return "summary"
-    if "writing" in normalized:
-        return "writing"
-    if "memory" in normalized:
-        return "memory"
-    if "chat" in normalized:
-        return "chat"
-    return "rag"

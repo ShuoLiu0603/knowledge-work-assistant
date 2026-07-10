@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.agents.state import AgentGraphState, add_trace
 from app.core.config import get_settings
 from app.db.models.conversation import Conversation
-from app.memory.jobs import create_memory_update_job, dispatch_memory_update_job
+from app.memory.jobs import (
+    claim_memory_update_job_dispatch,
+    create_memory_update_job,
+    dispatch_memory_update_job,
+    record_memory_update_job_dispatch_failure,
+)
+from app.memory import policy as memory_policy
 from app.services.memory_service import (
     build_memory_context_for_question,
+    filter_memory_history_messages,
+    format_memory_context,
+    get_conversation_memory_context_messages,
     get_recent_db_messages,
     get_short_term_memory,
     process_user_memory,
@@ -17,22 +27,19 @@ from app.services.memory_service import (
 )
 
 ALLOWED_MEMORY_UPDATE_MODES = {"sync", "async", "disabled"}
+PROFILE_MEMORY_LIMIT = get_settings().memory_profile_limit
+SEMANTIC_MEMORY_LIMIT = get_settings().memory_semantic_limit
 
 
 def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
-    if should_skip_memory_for_turn(state.input):
+    if state.memory_enabled is None:
+        state.memory_enabled = not should_skip_memory_for_turn(state.input)
+    if not state.memory_enabled:
         state.conversation_summary = None
         state.short_term_memory = []
+        state.profile_memories = []
         state.long_term_memories = []
-        state.memory_context = build_memory_context_for_question(
-            db,
-            state.user_id,
-            state.input,
-            conversation_id=state.conversation_id,
-            preloaded_short_memory=[],
-            preloaded_long_memories=[],
-            conversation_summary=None,
-        )
+        state.memory_context = format_memory_context([], [], None, profile_memories=[])
         add_trace(
             state,
             node="memory_agent",
@@ -43,29 +50,39 @@ def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
         return state
 
     conversation = db.get(Conversation, state.conversation_id) if state.conversation_id else None
+    if conversation is not None and conversation.user_id != state.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     state.conversation_summary = conversation.summary if conversation else None
-    state.short_term_memory = get_short_term_memory(state.user_id, state.conversation_id)
-    if not state.short_term_memory:
-        state.short_term_memory = get_recent_db_messages(db, state.conversation_id)
+    cached_short_memory = get_short_term_memory(state.user_id, state.conversation_id)
+    if conversation is not None:
+        state.short_term_memory, history_filter = get_conversation_memory_context_messages(
+            db,
+            conversation,
+            current_input=state.input,
+            current_message_id=state.message_id,
+            fallback_messages=cached_short_memory,
+        )
+    else:
+        state.short_term_memory = cached_short_memory or get_recent_db_messages(db, state.conversation_id)
+        state.short_term_memory, history_filter = filter_memory_history(
+            state.short_term_memory,
+            current_input=state.input,
+            current_message_id=state.message_id,
+        )
 
     memories = retrieve_relevant_memories(
         db,
         state.user_id,
         state.input,
+        limit=PROFILE_MEMORY_LIMIT + SEMANTIC_MEMORY_LIMIT,
         conversation_id=state.conversation_id,
         message_id=state.message_id,
+        include_profile=True,
     )
-    state.long_term_memories = [
-        {
-            "id": memory.id,
-            "content": memory.content,
-            "category": memory.category,
-            "kind": memory.kind,
-            "status": memory.status,
-            "metadata": memory.extra_metadata or {},
-        }
-        for memory in memories
-    ]
+    profiles = [memory for memory in memories if memory_policy.is_profile_memory(memory)]
+    semantic_memories = [memory for memory in memories if not memory_policy.is_profile_memory(memory)]
+    state.profile_memories = [memory_to_dict(memory) for memory in profiles]
+    state.long_term_memories = [memory_to_dict(memory) for memory in semantic_memories]
     state.memory_context = build_memory_context_for_question(
         db,
         state.user_id,
@@ -73,6 +90,7 @@ def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
         conversation_id=state.conversation_id,
         preloaded_short_memory=state.short_term_memory,
         preloaded_long_memories=state.long_term_memories,
+        preloaded_profile_memories=state.profile_memories,
         conversation_summary=state.conversation_summary,
     )
     add_trace(
@@ -82,16 +100,68 @@ def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
         input_data={"conversation_id": state.conversation_id},
         output_data={
             "short_term_memory_count": len(state.short_term_memory),
+            "profile_memory_count": len(state.profile_memories),
             "long_term_memory_count": len(state.long_term_memories),
             "has_conversation_summary": bool(state.conversation_summary),
             "memory_context_chars": len(state.memory_context),
+            **history_filter,
         },
     )
     return state
 
 
+def filter_memory_history(
+    messages: list[dict],
+    *,
+    current_input: str,
+    current_message_id: str | None = None,
+) -> tuple[list[dict], dict]:
+    return filter_memory_history_messages(
+        messages,
+        current_input=current_input,
+        current_message_id=current_message_id,
+    )
+
+
+def memory_to_dict(memory) -> dict:
+    return {
+        "id": memory.id,
+        "content": memory.content,
+        "category": memory.category,
+        "kind": memory.kind,
+        "status": memory.status,
+        "memory_layer": memory.memory_layer,
+        "canonical_key": memory.canonical_key,
+        "profile_slot": memory.profile_slot,
+        "scope_type": memory.scope_type,
+        "scope_id": memory.scope_id,
+        "pinned": memory.pinned,
+        "revision": memory.revision,
+        "metadata": memory.extra_metadata or {},
+    }
+
+
 def update_user_memories(db: Session, state: AgentGraphState) -> AgentGraphState:
-    if should_skip_memory_for_turn(state.input):
+    if state.defer_memory_update:
+        state.memory_actions = [
+            {
+                "action": "deferred",
+                "memory_id": None,
+                "content": "",
+                "reason": "memory update deferred until the conversation turn is committed",
+            }
+        ]
+        add_trace(
+            state,
+            node="memory_agent",
+            action="defer_user_memories",
+            input_data={"conversation_id": state.conversation_id},
+            output_data={"reason": "awaiting committed assistant message"},
+        )
+        return state
+    if state.memory_enabled is None:
+        state.memory_enabled = not should_skip_memory_for_turn(state.input)
+    if not state.memory_enabled:
         state.memory_actions = [
             {
                 "action": "ignore",
@@ -138,6 +208,7 @@ def update_user_memories(db: Session, state: AgentGraphState) -> AgentGraphState
             conversation_id=state.conversation_id,
             assistant_text=state.answer,
             message_id=state.message_id,
+            respect_no_memory_marker=False,
         )
         state.memory_actions = [to_memory_action_dict(action) for action in actions]
     except Exception as exc:
@@ -199,9 +270,15 @@ def enqueue_user_memory_update(db: Session, state: AgentGraphState) -> AgentGrap
     job_id = job.id
     dispatch_error = ""
     try:
-        enqueue_memory_update(job_id)
+        if claim_memory_update_job_dispatch(db, job_id):
+            enqueue_memory_update(job_id)
     except Exception as exc:
         dispatch_error = str(exc)
+        try:
+            record_memory_update_job_dispatch_failure(db, job_id, exc)
+        except Exception as persistence_exc:
+            db.rollback()
+            dispatch_error = f"{dispatch_error}; failed to persist dispatch error: {persistence_exc}"
 
     state.memory_actions = [
         {

@@ -20,47 +20,15 @@ class IntentOutput(BaseModel):
     @classmethod
     def normalize_intent(cls, value: object) -> str:
         text = str(value or "").strip().lower()
-        if "summary" in text:
+        if any(marker in text for marker in ("summary", "summarize", "recap", "总结", "摘要", "概括", "归纳")):
             return "summary"
-        if "writing" in text:
+        if any(marker in text for marker in ("writing", "write", "draft", "compose", "写作", "撰写", "起草")):
             return "writing"
-        if "memory_answer" in text or "memory" in text:
+        if any(marker in text for marker in ("memory_answer", "memory", "记忆")):
             return "memory"
-        if "chat" in text or "small" in text:
+        if any(marker in text for marker in ("chat", "small", "聊天", "闲聊", "寒暄", "问候")):
             return "chat"
         return "rag"
-
-
-class MemoryCandidateOutput(BaseModel):
-    content: str = Field(default="", max_length=2000)
-    kind: str = "preference"
-    category: str = Field(default="general", max_length=80)
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    sensitivity: str = "low"
-
-    @field_validator("content", "category", mode="before")
-    @classmethod
-    def clean_text(cls, value: object) -> str:
-        return normalize_whitespace(str(value or ""))
-
-    @field_validator("kind", mode="before")
-    @classmethod
-    def normalize_kind(cls, value: object) -> str:
-        return normalize_allowed(value, MEMORY_KINDS, "preference")
-
-    @field_validator("sensitivity", mode="before")
-    @classmethod
-    def normalize_sensitivity(cls, value: object) -> str:
-        return normalize_allowed(value, SENSITIVITY_LEVELS, "low")
-
-
-class MemoryCandidatesOutput(BaseModel):
-    candidates: list[MemoryCandidateOutput] = Field(default_factory=list)
-
-    @field_validator("candidates", mode="before")
-    @classmethod
-    def limit_candidates(cls, value: object) -> list:
-        return value[:5] if isinstance(value, list) else []
 
 
 class MemoryOperationOutput(BaseModel):
@@ -69,18 +37,18 @@ class MemoryOperationOutput(BaseModel):
     target_memory_id: str | None = None
     kind: str = "preference"
     category: str = Field(default="general", max_length=80)
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    canonical_key: str = Field(default="", max_length=160)
     importance: str = "low"
-    sensitivity: str = "low"
+    sensitivity: str = "high"
     evidence: str = Field(default="", max_length=1000)
     reason: str = Field(default="", max_length=1000)
 
     @field_validator("action", mode="before")
     @classmethod
     def normalize_action(cls, value: object) -> str:
-        return normalize_allowed(value, MEMORY_ACTIONS, "ignore")
+        return normalize_memory_action(value)
 
-    @field_validator("content", "target_memory_id", "category", "evidence", "reason", mode="before")
+    @field_validator("content", "target_memory_id", "category", "canonical_key", "evidence", "reason", mode="before")
     @classmethod
     def clean_text(cls, value: object) -> str:
         return normalize_whitespace(str(value or ""))
@@ -98,7 +66,7 @@ class MemoryOperationOutput(BaseModel):
     @field_validator("sensitivity", mode="before")
     @classmethod
     def normalize_sensitivity(cls, value: object) -> str:
-        return normalize_allowed(value, SENSITIVITY_LEVELS, "low")
+        return normalize_allowed(value, SENSITIVITY_LEVELS, "high")
 
 
 class MemoryOperationsOutput(BaseModel):
@@ -107,6 +75,8 @@ class MemoryOperationsOutput(BaseModel):
     @field_validator("operations", mode="before")
     @classmethod
     def limit_operations(cls, value: object) -> list:
+        if isinstance(value, dict):
+            return [value]
         return value[:5] if isinstance(value, list) else []
 
 
@@ -126,6 +96,32 @@ def parse_json_value(raw: str) -> Any:
 def normalize_allowed(value: object, allowed: set[str], fallback: str) -> str:
     normalized = str(value or "").strip().lower()
     return normalized if normalized in allowed else fallback
+
+
+def normalize_memory_action(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return "ignore"
+    aliases = {
+        "add": "create",
+        "save": "create",
+        "remember": "create",
+        "insert": "create",
+        "modify": "update",
+        "edit": "update",
+        "merge": "update",
+        "replace": "supersede",
+        "overwrite": "supersede",
+        "contradict": "supersede",
+        "review": "pending",
+        "needs_review": "pending",
+        "uncertain": "pending",
+        "skip": "ignore",
+        "none": "ignore",
+        "noop": "ignore",
+        "no_op": "ignore",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def normalize_whitespace(text: str) -> str:

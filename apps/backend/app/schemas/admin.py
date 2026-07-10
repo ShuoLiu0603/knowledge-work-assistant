@@ -20,6 +20,9 @@ class AdminMetricsRead(BaseModel):
     negative_feedback_count: int
     positive_feedback_rate: float | None
     average_selected_chunks: float | None
+    external_cleanup_job_count: int
+    failed_external_cleanup_job_count: int
+    queued_external_cleanup_job_count: int
     recent_llm_errors: list[dict]
 
 
@@ -53,3 +56,26 @@ class AuditLogRead(BaseModel):
     detail: str | None
     metadata: dict
     created_at: datetime
+
+
+class ExternalCleanupJobRead(BaseModel):
+    id: str
+    actor_user_id: str | None
+    resource_type: str
+    resource_id: str
+    action: str
+    status: str
+    attempts: int
+    object_keys: list
+    error_message: str
+    metadata: dict
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class RetentionRunRead(BaseModel):
+    generated_at: datetime
+    dry_run: bool
+    deleted_counts: dict[str, int]
+    cutoffs: dict[str, datetime | None]

@@ -40,12 +40,28 @@ def main() -> int:
         steps.append(("frontend build", ["npm", "run", "build"], None, ROOT / "apps" / "frontend"))
 
     if not args.skip_compose:
-        steps.append(
-            (
-                "docker compose config",
-                ["docker", "compose", "-f", "infra/docker-compose.yml", "--env-file", ".env.example", "config", "--quiet"],
-                None,
-            )
+        steps.extend(
+            [
+                (
+                    "docker compose config",
+                    ["docker", "compose", "-f", "infra/docker-compose.yml", "--env-file", ".env.example", "config", "--quiet"],
+                    None,
+                ),
+                (
+                    "production docker compose config",
+                    [
+                        "docker",
+                        "compose",
+                        "-f",
+                        "infra/docker-compose.prod.yml",
+                        "--env-file",
+                        ".env.production.example",
+                        "config",
+                        "--quiet",
+                    ],
+                    None,
+                ),
+            ]
         )
 
     if args.with_smoke:

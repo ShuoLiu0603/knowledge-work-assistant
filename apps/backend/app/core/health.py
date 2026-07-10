@@ -41,7 +41,12 @@ def check_database() -> HealthCheck:
 def check_redis() -> HealthCheck:
     client = None
     try:
-        client = redis.Redis.from_url(get_settings().redis_url, socket_connect_timeout=3, socket_timeout=3)
+        settings = get_settings()
+        client = redis.Redis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+        )
         client.ping()
         return ok()
     except Exception as exc:
@@ -53,7 +58,7 @@ def check_redis() -> HealthCheck:
 
 def check_qdrant() -> HealthCheck:
     try:
-        get_qdrant_client(timeout=3).get_collections()
+        get_qdrant_client(timeout=get_settings().healthcheck_timeout_seconds).get_collections()
         return ok()
     except Exception as exc:
         return failed(exc)
@@ -65,7 +70,10 @@ def check_minio() -> HealthCheck:
     endpoint = settings.minio_endpoint
     base_url = endpoint if endpoint.startswith(("http://", "https://")) else f"{scheme}://{endpoint}"
     try:
-        request.urlopen(f"{base_url.rstrip('/')}/minio/health/live", timeout=3).close()
+        request.urlopen(
+            f"{base_url.rstrip('/')}/minio/health/live",
+            timeout=settings.healthcheck_timeout_seconds,
+        ).close()
         return ok()
     except Exception as exc:
         return failed(exc)
@@ -75,7 +83,7 @@ def check_worker() -> HealthCheck:
     try:
         from app.workers.celery_app import celery_app
 
-        responses = celery_app.control.inspect(timeout=3).ping() or {}
+        responses = celery_app.control.inspect(timeout=get_settings().healthcheck_timeout_seconds).ping() or {}
         if not responses:
             raise RuntimeError("No Celery workers responded")
         return ok()

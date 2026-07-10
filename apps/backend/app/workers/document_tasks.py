@@ -9,11 +9,11 @@ from app.rag.loaders import load_documents
 from app.rag.splitters import split_documents
 from app.rag.vector_store import delete_document_vectors, upsert_document_chunks
 from app.storage.minio_client import download_bytes
-from app.workers.celery_app import celery_app
+from app.workers.celery_app import RELIABLE_TASK_OPTIONS, celery_app, task_can_retry, task_retry_countdown
 
 
-@celery_app.task(name="process_document")
-def process_document(document_id: str) -> dict[str, int | str]:
+@celery_app.task(bind=True, name="process_document", **RELIABLE_TASK_OPTIONS)
+def process_document(self, document_id: str) -> dict[str, int | str]:
     init_db()
     settings = get_settings()
 
@@ -92,6 +92,8 @@ def process_document(document_id: str) -> dict[str, int | str]:
                 delete_document_vectors(document.id)
             except Exception:
                 pass
+            if task_can_retry(self):
+                raise self.retry(exc=exc, countdown=task_retry_countdown(self.request.retries))
             return {"document_id": document.id, "status": document.status, "chunk_count": 0}
 
 

@@ -5,14 +5,13 @@ from sqlalchemy.orm import Session
 from app.agents.state import AgentGraphState, add_trace
 from app.llm.provider import get_llm_provider
 from app.services.llm_log_service import create_llm_call_log
-from app.services.memory_service import is_memory_recall_query
 from app.services.qa_service import build_rag_answer
 
 
 def answer_with_rag(db: Session, state: AgentGraphState) -> AgentGraphState:
     if state.intent == "chat":
         return answer_from_chat(db, state)
-    if state.intent == "memory" or is_memory_recall_query(state.input):
+    if state.intent == "memory":
         return answer_from_memory(db, state)
 
     rag_answer = build_rag_answer(

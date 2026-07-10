@@ -120,7 +120,13 @@ class AnsweringMemoryContextTests(unittest.TestCase):
 
         with (
             patch("app.rag.answering.get_llm_provider", return_value=provider),
-            patch("app.rag.answering.get_settings", return_value=SimpleNamespace(answer_context_max_chars=100)),
+            patch(
+                "app.rag.answering.get_settings",
+                return_value=SimpleNamespace(
+                    answer_context_max_chars=100,
+                    context_compression_chunk_chars=700,
+                ),
+            ),
         ):
             result = generate_grounded_answer("What is covered?", chunks)
 

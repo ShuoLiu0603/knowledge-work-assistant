@@ -147,8 +147,10 @@ class ConversationStreamingTests(unittest.TestCase):
 
             with (
                 patch("app.services.conversation_service.run_agent", side_effect=fake_run_agent),
-                patch("app.services.conversation_service.should_update_conversation_summary", return_value=True),
-                patch("app.services.conversation_service.update_conversation_summary", side_effect=RuntimeError("summary offline")),
+                patch(
+                    "app.services.conversation_service.ensure_summary_dispatcher_started",
+                    side_effect=RuntimeError("summary dispatcher offline"),
+                ),
             ):
                 body = "".join(
                     stream_message_response(

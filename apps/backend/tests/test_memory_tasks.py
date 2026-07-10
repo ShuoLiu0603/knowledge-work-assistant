@@ -1,16 +1,52 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from fastapi import HTTPException
+from sqlalchemy import func, select
+
+from app.db.models.conversation import Conversation, Message
 from app.db.models.user_memory import UserMemoryUpdateJob
+from app.memory.jobs import create_memory_update_job
 from app.memory.types import MemoryAction
 from app.services import memory_service
-from app.workers.memory_tasks import process_memory_update_job
+from app.workers.memory_tasks import process_memory_update_job, reconcile_user_memory_task
 from helpers import create_user, isolated_session
 
 
 class MemoryTaskTests(unittest.TestCase):
+    def test_memory_update_job_is_idempotent_for_the_same_user_message(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "memory-job-idempotent@example.com", "Memory Job Idempotent")
+            conversation = Conversation(user_id=user.id, title="Idempotent", search_scope="accessible")
+            session.add(conversation)
+            session.commit()
+            message = Message(conversation_id=conversation.id, role="user", content="remember this")
+            session.add(message)
+            session.commit()
+
+            first = create_memory_update_job(
+                session,
+                user_id=user.id,
+                text=message.content,
+                conversation_id=conversation.id,
+                message_id=message.id,
+                assistant_text="ack",
+            )
+            second = create_memory_update_job(
+                session,
+                user_id=user.id,
+                text=message.content,
+                conversation_id=conversation.id,
+                message_id=message.id,
+                assistant_text="ack",
+            )
+
+            self.assertEqual(first.id, second.id)
+            self.assertEqual(session.scalar(select(func.count(UserMemoryUpdateJob.id))), 1)
+
     def test_process_memory_update_job_marks_job_completed(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "memory-task@example.com", "Memory Task")
@@ -24,6 +60,7 @@ class MemoryTaskTests(unittest.TestCase):
             session.refresh(job)
 
             with (
+                patch("app.workers.memory_tasks.init_db"),
                 patch("app.workers.memory_tasks.SessionLocal", return_value=session),
                 patch(
                     "app.workers.memory_tasks.process_user_memory",
@@ -52,6 +89,7 @@ class MemoryTaskTests(unittest.TestCase):
             session.refresh(job)
 
             with (
+                patch("app.workers.memory_tasks.init_db"),
                 patch("app.workers.memory_tasks.SessionLocal", return_value=session),
                 patch("app.workers.memory_tasks.process_user_memory", side_effect=RuntimeError("llm unavailable")),
             ):
@@ -62,6 +100,41 @@ class MemoryTaskTests(unittest.TestCase):
             self.assertEqual(updated.status, "failed")
             self.assertEqual(updated.attempts, 1)
             self.assertIn("llm unavailable", updated.error_message)
+
+    def test_process_memory_update_job_respects_persisted_memory_off_flag(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "memory-task-off@example.com", "Memory Task Off")
+            conversation = Conversation(user_id=user.id, title="Memory off", search_scope="accessible")
+            session.add(conversation)
+            session.commit()
+            message = Message(
+                conversation_id=conversation.id,
+                role="user",
+                content="ordinary private request",
+                memory_enabled=False,
+            )
+            session.add(message)
+            session.commit()
+            job = UserMemoryUpdateJob(
+                user_id=user.id,
+                conversation_id=conversation.id,
+                message_id=message.id,
+                user_message=message.content,
+                status="queued",
+            )
+            session.add(job)
+            session.commit()
+
+            with (
+                patch("app.workers.memory_tasks.init_db"),
+                patch("app.workers.memory_tasks.SessionLocal", return_value=session),
+                patch("app.workers.memory_tasks.process_user_memory") as process_user_memory,
+            ):
+                result = process_memory_update_job(job.id)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["actions"][0]["reason"], "source message disabled memory")
+            process_user_memory.assert_not_called()
 
     def test_user_can_list_and_retry_memory_update_jobs(self) -> None:
         with isolated_session() as session:
@@ -104,6 +177,74 @@ class MemoryTaskTests(unittest.TestCase):
 
             self.assertEqual(retried.status, "queued")
             self.assertIn("broker down", retried.error_message)
+
+    def test_retry_rejects_an_already_dispatched_queued_job(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "memory-task-dispatched@example.com", "Memory Task Dispatched")
+            job = UserMemoryUpdateJob(
+                user_id=user.id,
+                user_message="already waiting in broker",
+                status="queued",
+                dispatched_at=datetime.now(timezone.utc),
+            )
+            session.add(job)
+            session.commit()
+
+            with self.assertRaises(HTTPException) as raised:
+                memory_service.retry_user_memory_update_job(session, user.id, job.id)
+
+            self.assertEqual(raised.exception.status_code, 409)
+
+    def test_retry_rejects_an_older_job_when_a_newer_job_exists(self) -> None:
+        now = datetime.now(timezone.utc)
+        with isolated_session() as session:
+            user = create_user(session, "memory-task-stale-retry@example.com", "Memory Task Stale Retry")
+            older = UserMemoryUpdateJob(
+                user_id=user.id,
+                user_message="old preference",
+                status="failed",
+                created_at=now,
+                updated_at=now,
+            )
+            newer = UserMemoryUpdateJob(
+                user_id=user.id,
+                user_message="new preference",
+                status="completed",
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=1),
+            )
+            session.add_all([older, newer])
+            session.commit()
+
+            with self.assertRaises(HTTPException) as raised:
+                memory_service.retry_user_memory_update_job(session, user.id, older.id)
+
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertIn("newer user job", raised.exception.detail)
+
+    def test_reconcile_user_memory_task_returns_report(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "memory-task-reconcile@example.com", "Memory Task Reconcile")
+
+            with (
+                patch("app.workers.memory_tasks.init_db"),
+                patch("app.workers.memory_tasks.SessionLocal", return_value=session),
+                patch(
+                    "app.workers.memory_tasks.reconcile_user_memories",
+                    return_value={
+                        "user_id": user.id,
+                        "apply": False,
+                        "scanned_count": 0,
+                        "applied_count": 0,
+                        "findings": [],
+                    },
+                ) as reconcile,
+            ):
+                result = reconcile_user_memory_task(user.id, apply=False)
+
+            self.assertEqual(result["user_id"], user.id)
+            self.assertEqual(result["findings"], [])
+            reconcile.assert_called_once_with(session, user.id, apply=False, llm_review=False)
 
 
 if __name__ == "__main__":

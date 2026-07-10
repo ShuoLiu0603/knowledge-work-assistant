@@ -3,33 +3,36 @@ from __future__ import annotations
 import unittest
 
 from app.agents.supervisor import normalize_intent
+from app.llm.structured_outputs import IntentOutput
 
 
 class SupervisorIntentTests(unittest.TestCase):
-    def test_greeting_misclassified_as_writing_is_downgraded_to_rag(self) -> None:
-        self.assertEqual(normalize_intent("writing", "你好"), "rag")
+    def test_preserves_valid_llm_intent_labels(self) -> None:
+        for label in ("rag", "memory", "chat", "summary", "writing"):
+            with self.subTest(label=label):
+                self.assertEqual(normalize_intent(label, "任意用户输入"), label)
 
-    def test_explicit_writing_request_stays_writing(self) -> None:
-        self.assertEqual(normalize_intent("writing", "帮我写一封会议通知"), "writing")
+    def test_text_does_not_override_llm_intent(self) -> None:
+        self.assertEqual(normalize_intent("rag", "你好"), "rag")
+        self.assertEqual(normalize_intent("rag", "帮我写一封会议通知"), "rag")
+        self.assertEqual(normalize_intent("memory", "报销政策是什么？"), "memory")
+        self.assertEqual(normalize_intent("chat", "报销政策是什么？"), "chat")
 
-    def test_explicit_summary_request_stays_summary(self) -> None:
-        self.assertEqual(normalize_intent("summary", "请总结这份制度"), "summary")
+    def test_normalizes_common_non_enum_llm_outputs(self) -> None:
+        self.assertEqual(normalize_intent("intent: summary", "请总结这份制度"), "summary")
+        self.assertEqual(normalize_intent("写作", "帮我写一封会议通知"), "writing")
+        self.assertEqual(normalize_intent("聊天", "你好"), "chat")
+        self.assertEqual(normalize_intent("记忆", "你记得我什么？"), "memory")
 
-    def test_greeting_can_route_to_chat(self) -> None:
-        self.assertEqual(normalize_intent("chat", "你好"), "chat")
+    def test_invalid_llm_output_falls_back_to_rag(self) -> None:
+        self.assertEqual(normalize_intent("", "你好"), "rag")
+        self.assertEqual(normalize_intent("unknown", "帮我写一封会议通知"), "rag")
 
-    def test_memory_recall_routes_to_memory(self) -> None:
-        self.assertEqual(normalize_intent("memory", "你记得我什么？"), "memory")
-
-    def test_full_memory_recall_routes_to_memory_even_if_llm_says_rag(self) -> None:
-        self.assertEqual(normalize_intent("rag", "\u4f60\u90fd\u8bb0\u5f97\u6211\u4ec0\u4e48\uff1f"), "memory")
-
-    def test_enterprise_question_overrides_memory_label(self) -> None:
-        self.assertEqual(normalize_intent("memory", "我的报销政策是什么？"), "rag")
-
-    def test_enterprise_memory_wording_still_routes_to_rag(self) -> None:
-        self.assertEqual(normalize_intent("rag", "你记得报销政策吗？"), "rag")
-        self.assertEqual(normalize_intent("memory", "你记得报销政策吗？"), "rag")
+    def test_structured_intent_output_accepts_chinese_labels(self) -> None:
+        self.assertEqual(IntentOutput.model_validate({"intent": "总结"}).intent, "summary")
+        self.assertEqual(IntentOutput.model_validate({"intent": "写作"}).intent, "writing")
+        self.assertEqual(IntentOutput.model_validate({"intent": "聊天"}).intent, "chat")
+        self.assertEqual(IntentOutput.model_validate({"intent": "记忆"}).intent, "memory")
 
 
 if __name__ == "__main__":

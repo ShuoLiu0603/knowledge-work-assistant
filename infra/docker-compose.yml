@@ -85,7 +85,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).read()\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/ready', timeout=3).read()\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -111,10 +111,27 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "celery", "-A", "app.workers.celery_app.celery_app", "inspect", "ping"]
+      test: ["CMD-SHELL", "celery --broker=$${REDIS_URL} inspect ping --destination celery@$${HOSTNAME} --timeout=5 | grep -q pong"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 5
+
+  beat:
+    build:
+      context: ../apps/backend
+    container_name: rag-beat
+    env_file:
+      - ../.env
+    environment:
+      PYTHONPATH: /app
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "--loglevel=info", "--schedule=/tmp/celerybeat-schedule", "--uid=nobody"]
+    volumes:
+      - ../apps/backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   frontend:
     build:

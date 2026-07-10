@@ -19,8 +19,18 @@ def list_items(
     knowledge_base_id: Annotated[str | None, Query()] = None,
     conversation_id: Annotated[str | None, Query()] = None,
     message_id: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[AgentRunRead]:
-    return list_agent_runs(db, current_user.id, knowledge_base_id, conversation_id, message_id)
+    return list_agent_runs(
+        db,
+        current_user.id,
+        knowledge_base_id,
+        conversation_id,
+        message_id,
+        limit,
+        offset,
+    )
 
 
 @router.post("", response_model=AgentRunRead, status_code=status.HTTP_201_CREATED)

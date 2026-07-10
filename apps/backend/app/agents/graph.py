@@ -5,11 +5,18 @@ from dataclasses import fields
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.agents.memory_agent import load_memory_context, update_user_memories
 from app.agents.rag_agent import answer_with_rag
-from app.agents.state import AgentGraphState, add_trace
+from app.agents.state import (
+    AgentGraphState,
+    AgentRunCancelled,
+    AgentRunTimeout,
+    add_trace,
+    ensure_agent_run_active,
+)
 from app.agents.summary_agent import summarize_with_rag
 from app.agents.supervisor import route_intent
 from app.agents.tools import ensure_viewer_access
@@ -26,11 +33,12 @@ AgentNode = Callable[[Session, AgentGraphState], AgentGraphState]
 
 def run_agent_graph(db: Session, state: AgentGraphState) -> AgentGraphState:
     started_at = datetime.now(timezone.utc)
-    if state.knowledge_base_id:
-        ensure_viewer_access(db, state.user_id, state.knowledge_base_id)
     requested_backend = normalize_backend(get_settings().agent_graph_backend)
     actual_backend = requested_backend
     try:
+        ensure_agent_run_active(state)
+        if state.knowledge_base_id:
+            ensure_viewer_access(db, state.user_id, state.knowledge_base_id)
         if requested_backend == "langgraph":
             returned_state = _run_langgraph_nodes(db, state)
             if returned_state is not state:
@@ -38,8 +46,33 @@ def run_agent_graph(db: Session, state: AgentGraphState) -> AgentGraphState:
         else:
             actual_backend = "sequential"
             _run_sequential_nodes(db, state)
+        ensure_agent_run_active(state)
         if state.status == "running":
             state.status = "completed"
+    except AgentRunCancelled as exc:
+        state.status = "cancelled"
+        state.error_message = str(exc)
+        add_trace(
+            state,
+            node="graph",
+            action="cancel_run",
+            input_data={"intent": state.intent},
+            output_data={"error_message": state.error_message},
+        )
+        raise
+    except AgentRunTimeout as exc:
+        state.status = "failed"
+        state.error_message = str(exc)
+        add_trace(
+            state,
+            node="graph",
+            action="timeout_run",
+            input_data={"intent": state.intent},
+            output_data={"error_message": state.error_message},
+        )
+        raise
+    except HTTPException:
+        raise
     except Exception as exc:
         state.status = "failed"
         state.error_message = str(exc)
@@ -77,10 +110,10 @@ def normalize_backend(value: str | None) -> str:
 
 
 def _run_sequential_nodes(db: Session, state: AgentGraphState) -> AgentGraphState:
-    load_memory_context(db, state)
-    route_intent(db, state)
-    _run_intent_node(db, state)
-    update_user_memories(db, state)
+    run_node(db, state, load_memory_context)
+    run_node(db, state, route_intent)
+    run_node(db, state, _run_intent_node)
+    run_node(db, state, update_user_memories)
     return state
 
 
@@ -124,9 +157,17 @@ def build_agent_graph(db: Session, state_graph_cls, end_node):
 
 def langgraph_node(db: Session, handler: AgentNode) -> Callable[[AgentGraphPayload], AgentGraphPayload]:
     def run(payload: AgentGraphPayload) -> AgentGraphPayload:
-        return {"state": handler(db, payload["state"])}
+        state = payload["state"]
+        return {"state": run_node(db, state, handler)}
 
     return run
+
+
+def run_node(db: Session, state: AgentGraphState, handler: AgentNode) -> AgentGraphState:
+    ensure_agent_run_active(state)
+    result = handler(db, state)
+    ensure_agent_run_active(result)
+    return result
 
 
 def _route_after_supervisor(payload: dict[str, Any]) -> str:

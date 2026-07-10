@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from qdrant_client import QdrantClient, models
-
 from app.core.config import get_settings
 from app.db.models.document import Document, DocumentChunk
 from app.rag.embeddings import get_embedding_provider
@@ -17,11 +15,15 @@ class VectorSearchHit:
     payload: dict[str, Any]
 
 
-def get_qdrant_client(timeout: int = 10) -> QdrantClient:
-    return QdrantClient(url=get_settings().qdrant_url, timeout=timeout)
+def get_qdrant_client(timeout: int | None = None) -> Any:
+    from qdrant_client import QdrantClient
+
+    settings = get_settings()
+    return QdrantClient(url=settings.qdrant_url, timeout=timeout or settings.qdrant_timeout_seconds)
 
 
-def ensure_qdrant_collection(client: QdrantClient | None = None) -> None:
+def ensure_qdrant_collection(client: Any | None = None) -> None:
+    models = qdrant_models()
     client = client or get_qdrant_client()
     settings = get_settings()
     collection_name = settings.qdrant_collection
@@ -38,7 +40,8 @@ def ensure_qdrant_collection(client: QdrantClient | None = None) -> None:
     ensure_payload_indexes(client)
 
 
-def ensure_payload_indexes(client: QdrantClient | None = None) -> None:
+def ensure_payload_indexes(client: Any | None = None) -> None:
+    models = qdrant_models()
     client = client or get_qdrant_client()
     collection_name = get_settings().qdrant_collection
     field_schemas = {
@@ -68,6 +71,7 @@ def upsert_document_chunks(document: Document, chunks: list[DocumentChunk]) -> N
     ensure_qdrant_collection(client)
     provider = get_embedding_provider()
     vectors = provider.embed_texts([embedding_text(document, chunk) for chunk in chunks])
+    models = qdrant_models()
     points = [
         models.PointStruct(
             id=chunk.qdrant_point_id,
@@ -93,6 +97,7 @@ def search_knowledge_base_chunks(
     client = get_qdrant_client()
     ensure_qdrant_collection(client)
     provider = get_embedding_provider()
+    models = qdrant_models()
     result = client.query_points(
         collection_name=get_settings().qdrant_collection,
         query=provider.embed_text(query),
@@ -119,7 +124,7 @@ def delete_knowledge_base_vectors(kb_id: str) -> None:
     delete_vectors_by_filter(match_filter("knowledge_base_id", kb_id))
 
 
-def delete_vectors_by_filter(points_filter: models.Filter) -> None:
+def delete_vectors_by_filter(points_filter: Any) -> None:
     client = get_qdrant_client()
     collection_name = get_settings().qdrant_collection
     if not client.collection_exists(collection_name):
@@ -131,7 +136,8 @@ def delete_vectors_by_filter(points_filter: models.Filter) -> None:
     )
 
 
-def search_filter(owner_id: str, kb_id: str, max_security_level: int) -> models.Filter:
+def search_filter(owner_id: str, kb_id: str, max_security_level: int) -> Any:
+    models = qdrant_models()
     return models.Filter(
         must=[
             field_match("user_id", owner_id),
@@ -147,14 +153,76 @@ def search_filter(owner_id: str, kb_id: str, max_security_level: int) -> models.
     )
 
 
-def match_filter(field_name: str, value: str) -> models.Filter:
+def match_filter(field_name: str, value: str) -> Any:
+    models = qdrant_models()
     return models.Filter(must=[field_match(field_name, value)])
 
 
-def field_match(field_name: str, value: str) -> models.FieldCondition:
+def field_match(field_name: str, value: str) -> Any:
+    models = qdrant_models()
     return models.FieldCondition(
         key=field_name,
         match=models.MatchValue(value=value),
+    )
+
+
+def qdrant_models() -> Any:
+    try:
+        from qdrant_client import models
+    except ModuleNotFoundError:
+        return fallback_qdrant_models()
+
+    return models
+
+
+class FallbackQdrantModel:
+    def __init__(self, **kwargs: Any) -> None:
+        self._values = kwargs
+
+    def model_dump(self, exclude_none: bool = False) -> dict[str, Any]:
+        return {
+            key: dump_fallback_value(value, exclude_none=exclude_none)
+            for key, value in self._values.items()
+            if not (exclude_none and value is None)
+        }
+
+
+class FallbackRange(FallbackQdrantModel):
+    def __init__(self, lte: int | float | None = None) -> None:
+        super().__init__(lte=float(lte) if lte is not None else None)
+
+
+def dump_fallback_value(value: Any, *, exclude_none: bool) -> Any:
+    if isinstance(value, FallbackQdrantModel):
+        return value.model_dump(exclude_none=exclude_none)
+    if isinstance(value, list):
+        return [dump_fallback_value(item, exclude_none=exclude_none) for item in value]
+    return value
+
+
+def fallback_qdrant_models() -> Any:
+    class PayloadSchemaType:
+        KEYWORD = "keyword"
+        INTEGER = "integer"
+
+    class Distance:
+        COSINE = "Cosine"
+
+    return type(
+        "FallbackQdrantModels",
+        (),
+        {
+            "Distance": Distance,
+            "PayloadSchemaType": PayloadSchemaType,
+            "VectorParams": FallbackQdrantModel,
+            "PointStruct": FallbackQdrantModel,
+            "Filter": FallbackQdrantModel,
+            "FieldCondition": FallbackQdrantModel,
+            "MatchValue": FallbackQdrantModel,
+            "Range": FallbackRange,
+            "IsEmptyCondition": FallbackQdrantModel,
+            "PayloadField": FallbackQdrantModel,
+        },
     )
 
 

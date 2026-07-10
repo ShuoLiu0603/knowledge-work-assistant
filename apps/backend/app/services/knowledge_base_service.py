@@ -8,11 +8,10 @@ from app.core.security_levels import MAX_SECURITY_LEVEL
 from app.db.models.document import Document
 from app.db.models.knowledge_base import KnowledgeBase, KnowledgeBaseMember
 from app.db.models.user import User
-from app.rag.vector_store import delete_knowledge_base_vectors
 from app.schemas.knowledge_base import KnowledgeBaseCreate, KnowledgeBaseRead, KnowledgeBaseUpdate
 from app.services.audit_service import record_audit_event
+from app.services.cleanup_service import create_external_cleanup_job, run_external_cleanup_job, to_cleanup_metadata
 from app.services.department_service import require_department
-from app.storage.minio_client import remove_object
 
 ROLE_RANK = {
     "viewer": 1,
@@ -35,6 +34,18 @@ class KnowledgeBaseSearchScope:
 def create_knowledge_base(db: Session, user_id: str, payload: KnowledgeBaseCreate) -> KnowledgeBaseRead:
     user = require_user(db, user_id)
     if payload.visibility == "public" and not user.is_admin:
+        record_audit_event(
+            db,
+            actor_user_id=user_id,
+            action="knowledge_base.create",
+            resource_type="knowledge_base",
+            outcome="denied",
+            detail="Only admins can create public knowledge bases",
+            metadata={
+                "name": payload.name,
+                "visibility": payload.visibility,
+            },
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can create public knowledge bases")
     department_id = resolve_department_id_for_write(db, user, payload.visibility, payload.department_id)
 
@@ -56,6 +67,18 @@ def create_knowledge_base(db: Session, user_id: str, payload: KnowledgeBaseCreat
     db.add(member)
     db.commit()
     db.refresh(knowledge_base)
+    record_audit_event(
+        db,
+        actor_user_id=user_id,
+        action="knowledge_base.create",
+        resource_type="knowledge_base",
+        resource_id=knowledge_base.id,
+        metadata={
+            "name": knowledge_base.name,
+            "visibility": knowledge_base.visibility,
+            "department_id": knowledge_base.department_id,
+        },
+    )
     return to_read_model(knowledge_base, "owner")
 
 
@@ -122,44 +145,117 @@ def update_knowledge_base(
     user = require_user(db, user_id)
     knowledge_base, role = ensure_kb_access(db, user_id, kb_id, required_role="editor")
     update_data = payload.model_dump(exclude_unset=True)
+    previous_values = {
+        "name": knowledge_base.name,
+        "description": knowledge_base.description,
+        "visibility": knowledge_base.visibility,
+        "department_id": knowledge_base.department_id,
+    }
+    next_name = update_data.get("name", knowledge_base.name)
+    next_description = update_data.get("description", knowledge_base.description)
+    next_visibility = update_data.get("visibility", knowledge_base.visibility)
+    next_department_id = knowledge_base.department_id
 
-    if "name" in update_data:
-        knowledge_base.name = update_data["name"]
-    if "description" in update_data:
-        knowledge_base.description = update_data["description"]
     if "visibility" in update_data:
-        next_visibility = update_data["visibility"]
         if next_visibility == "public" and not user.is_admin:
+            record_audit_event(
+                db,
+                actor_user_id=user_id,
+                action="knowledge_base.update",
+                resource_type="knowledge_base",
+                resource_id=knowledge_base.id,
+                outcome="denied",
+                detail="Only admins can publish knowledge bases",
+                metadata={
+                    "requested_visibility": next_visibility,
+                    "previous_visibility": knowledge_base.visibility,
+                },
+            )
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can publish knowledge bases")
         if knowledge_base.visibility == "public" and next_visibility != "public" and knowledge_base.owner_id != user_id:
+            record_audit_event(
+                db,
+                actor_user_id=user_id,
+                action="knowledge_base.update",
+                resource_type="knowledge_base",
+                resource_id=knowledge_base.id,
+                outcome="denied",
+                detail="Only the owner can make a public knowledge base private",
+                metadata={
+                    "requested_visibility": next_visibility,
+                    "previous_visibility": knowledge_base.visibility,
+                },
+            )
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the owner can make a public knowledge base private")
-        knowledge_base.department_id = resolve_department_id_for_write(
+        next_department_id = resolve_department_id_for_write(
             db,
             user,
             next_visibility,
             update_data.get("department_id", knowledge_base.department_id),
         )
-        knowledge_base.visibility = next_visibility
     elif "department_id" in update_data:
-        knowledge_base.department_id = resolve_department_id_for_write(
+        next_department_id = resolve_department_id_for_write(
             db,
             user,
             knowledge_base.visibility,
             update_data["department_id"],
         )
 
+    knowledge_base.name = next_name
+    knowledge_base.description = next_description
+    knowledge_base.visibility = next_visibility
+    knowledge_base.department_id = next_department_id
     db.add(knowledge_base)
     db.commit()
     db.refresh(knowledge_base)
+    record_audit_event(
+        db,
+        actor_user_id=user_id,
+        action="knowledge_base.update",
+        resource_type="knowledge_base",
+        resource_id=knowledge_base.id,
+        metadata={
+            "previous": previous_values,
+            "current": {
+                "name": knowledge_base.name,
+                "description": knowledge_base.description,
+                "visibility": knowledge_base.visibility,
+                "department_id": knowledge_base.department_id,
+            },
+            "updated_fields": sorted(update_data),
+        },
+    )
     return to_read_model(knowledge_base, effective_role(user, knowledge_base, role))
 
 
 def delete_knowledge_base(db: Session, user_id: str, kb_id: str) -> None:
     knowledge_base, _role = ensure_kb_access(db, user_id, kb_id, required_role="owner")
     object_keys = list_knowledge_base_object_keys(db, kb_id)
-    cleanup_knowledge_base_resources(db, user_id, kb_id, object_keys)
+    audit_metadata = {
+        "name": knowledge_base.name,
+        "visibility": knowledge_base.visibility,
+        "department_id": knowledge_base.department_id,
+        "object_count": len(object_keys),
+    }
+    cleanup_job = create_external_cleanup_job(
+        db,
+        actor_user_id=user_id,
+        resource_type="knowledge_base",
+        resource_id=kb_id,
+        object_keys=object_keys,
+        metadata=audit_metadata,
+    )
     db.delete(knowledge_base)
     db.commit()
+    cleanup_job = run_external_cleanup_job(db, cleanup_job.id)
+    record_audit_event(
+        db,
+        actor_user_id=user_id,
+        action="knowledge_base.delete",
+        resource_type="knowledge_base",
+        resource_id=kb_id,
+        metadata={**audit_metadata, **to_cleanup_metadata(cleanup_job)},
+    )
 
 
 def list_knowledge_base_object_keys(db: Session, kb_id: str) -> list[str]:
@@ -168,33 +264,6 @@ def list_knowledge_base_object_keys(db: Session, kb_id: str) -> list[str]:
         for object_key in db.scalars(select(Document.object_key).where(Document.knowledge_base_id == kb_id)).all()
         if object_key
     ]
-
-
-def cleanup_knowledge_base_resources(
-    db: Session,
-    user_id: str,
-    kb_id: str,
-    object_keys: list[str],
-) -> None:
-    try:
-        delete_knowledge_base_vectors(kb_id)
-        for object_key in object_keys:
-            remove_object(object_key)
-    except Exception as exc:
-        record_audit_event(
-            db,
-            actor_user_id=user_id,
-            action="knowledge_base.delete_cleanup",
-            resource_type="knowledge_base",
-            resource_id=kb_id,
-            outcome="failed",
-            detail=str(exc),
-            metadata={"object_count": len(object_keys)},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Knowledge base cleanup failed; delete was not committed",
-        ) from exc
 
 
 def ensure_kb_access(

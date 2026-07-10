@@ -91,6 +91,10 @@ class SecurityLevelTests(unittest.TestCase):
 
         with (
             patch("app.rag.vector_store.ensure_qdrant_collection"),
+            patch(
+                "app.rag.vector_store.get_settings",
+                return_value=SimpleNamespace(qdrant_collection="knowledge_chunks"),
+            ),
             patch("app.rag.vector_store.get_embedding_provider", return_value=FakeEmbeddingProvider()),
             patch("app.rag.vector_store.get_qdrant_client", return_value=FakeQdrantClient()),
         ):

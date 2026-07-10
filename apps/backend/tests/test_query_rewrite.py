@@ -35,6 +35,16 @@ class QueryRewriteTests(unittest.TestCase):
 
         self.assertEqual(output.rewritten_query, "RAG answer flow")
 
+    def test_pydantic_output_accepts_string_sub_questions(self) -> None:
+        output = QueryRewriteOutput.model_validate(
+            {
+                "rewritten_query": "RAG answer flow",
+                "sub_questions": "retrieval flow; memory flow\ncitations",
+            }
+        )
+
+        self.assertEqual(output.sub_questions, ["retrieval flow", "memory flow", "citations"])
+
     def test_rewrite_query_uses_langchain_structured_output_first(self) -> None:
         output = QueryRewriteOutput(
             rewritten_query="RAG retrieval plan",

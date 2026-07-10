@@ -66,20 +66,70 @@ def list_retrieval_logs(
     if message_id:
         query = query.where(RetrievalLog.message_id == message_id)
 
-    logs = db.scalars(query.order_by(RetrievalLog.created_at.desc())).all()
+    logs = db.scalars(query.order_by(RetrievalLog.created_at.desc(), RetrievalLog.id.desc())).all()
+    visible_logs = []
     for log in logs:
-        if log.knowledge_base_id:
-            ensure_kb_access(db, user_id, log.knowledge_base_id, required_role="viewer")
-    return [to_retrieval_log_read(log) for log in logs]
+        try:
+            ensure_retrieval_log_access(db, user_id, log)
+        except HTTPException as exc:
+            if exc.status_code in {status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND}:
+                continue
+            raise
+        visible_logs.append(log)
+    return [to_retrieval_log_read(log) for log in visible_logs]
 
 
 def get_retrieval_log(db: Session, user_id: str, log_id: str) -> RetrievalLogRead:
     log = db.get(RetrievalLog, log_id)
     if log is None or log.user_id != user_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Retrieval log not found")
-    if log.knowledge_base_id:
-        ensure_kb_access(db, user_id, log.knowledge_base_id, required_role="viewer")
+    ensure_retrieval_log_access(db, user_id, log)
     return to_retrieval_log_read(log)
+
+
+def ensure_retrieval_log_access(db: Session, user_id: str, log: RetrievalLog) -> None:
+    if log.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Retrieval log not found")
+    for knowledge_base_id in retrieval_log_provenance_ids(log):
+        ensure_kb_access(db, user_id, knowledge_base_id, required_role="viewer")
+
+
+def retrieval_log_provenance_ids(log: RetrievalLog) -> list[str]:
+    knowledge_base_ids = normalized_knowledge_base_ids(log.searched_knowledge_base_ids)
+    if log.knowledge_base_id:
+        knowledge_base_ids.append(log.knowledge_base_id)
+    declared_knowledge_base_ids = list(dict.fromkeys(knowledge_base_ids))
+    can_attribute_legacy_rows = len(declared_knowledge_base_ids) == 1
+
+    has_unattributed_retrieval_data = False
+    for value in (log.candidates, log.selected_chunks):
+        if not isinstance(value, list):
+            if value:
+                has_unattributed_retrieval_data = True
+            continue
+        for row in value:
+            if not isinstance(row, dict):
+                if row:
+                    has_unattributed_retrieval_data = True
+                continue
+            knowledge_base_id = row.get("knowledge_base_id")
+            if isinstance(knowledge_base_id, str) and knowledge_base_id:
+                knowledge_base_ids.append(knowledge_base_id)
+            elif row and not can_attribute_legacy_rows:
+                has_unattributed_retrieval_data = True
+
+    if has_unattributed_retrieval_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Retrieval log provenance is unavailable",
+        )
+    return list(dict.fromkeys(knowledge_base_ids))
+
+
+def normalized_knowledge_base_ids(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
 
 
 def to_retrieval_log_read(log: RetrievalLog) -> RetrievalLogRead:

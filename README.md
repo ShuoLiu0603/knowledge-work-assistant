@@ -1,8 +1,104 @@
-# Agentic RAG 企业知识库助手
+# Agentic RAG 企业知识库与长期记忆助手
 
-这是一个面向企业制度文档的 Agentic RAG 项目，已经具备本地工程闭环：用户鉴权、用户检索等级、公开/私人知识库、文档密级、文档上传与异步处理、单向量库安全过滤、Hybrid Retrieval、引用溯源、SSE 流式对话、Agent trace、短期/长期记忆，以及轻量 RAG 评估脚本。
+[English](README_EN.md) | 简体中文
 
-## 本地启动
+这是一个面向企业知识管理场景的全栈 Agentic RAG 项目。系统把用户与权限、文档异步入库、Hybrid Retrieval、可追溯引用、受控 Agent 编排、短期/长期记忆、异步可靠性和治理审计组合成一条可运行的工程链路。
+
+本项目不是让 LLM 自由调用任意工具的开放式 Agent。Agent 只在固定图中完成记忆加载、意图识别、知识库检索、回答/总结/写作以及回答后的记忆更新，权限判断和持久化事务始终由后端控制。
+
+## 核心能力
+
+| 模块 | 能力 |
+|---|---|
+| 企业知识库 | 公开/私人知识库、成员角色、部门范围、L1-L5 文档密级 |
+| 文档处理 | PDF、DOCX、TXT、Markdown、CSV，MinIO 原文存储，Celery 异步解析、切分和向量化 |
+| RAG | Query Rewrite、子问题拆分、Dense + BM25、加权 RRF、上下文压缩、引用与 RetrievalLog |
+| Agent | `rag / memory / chat / summary / writing` 五类意图，LangGraph 或顺序执行后端 |
+| 记忆 | Redis 短期记忆、会话增量摘要、PostgreSQL 长期记忆、可选 Qdrant 记忆索引 |
+| 记忆治理 | pending 审批、OCC revision、soft delete、restore、purge、export、reconcile、召回日志 |
+| 可靠性 | durable memory jobs、幂等键、租约 fencing、指数退避、Celery Beat 恢复、外部清理任务 |
+| 可观测性 | Agent trace、LLM 调用日志、检索候选与引用、记忆事件、召回指标、审计日志 |
+| 前端 | 对话、知识库、文档、记忆管理和管理员控制台 |
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    U[Browser] --> FE[React + Vite]
+    FE --> API[FastAPI]
+    API --> PG[(PostgreSQL)]
+    API --> REDIS[(Redis)]
+    API --> QD[(Qdrant)]
+    API --> MINIO[(MinIO)]
+    API --> LLM[OpenAI-compatible LLM]
+    API --> EMB[OpenAI-compatible Embedding]
+    REDIS --> WORKER[Celery Worker]
+    BEAT[Celery Beat] --> REDIS
+    WORKER --> PG
+    WORKER --> QD
+    WORKER --> MINIO
+```
+
+一次对话的主链路：
+
+```text
+提交 user Message
+-> 加载会话摘要、最近消息与长期记忆
+-> Supervisor 识别意图
+-> RAG / Memory Answer / Chat / Summary / Writing
+-> 保存 RetrievalLog、LLM logs 和 AgentRun
+-> 保存 assistant Message 并补齐日志关联
+-> 执行或投递长期记忆更新
+-> 投递会话摘要更新
+-> SSE done
+```
+
+完整状态、时序、失败语义和数据模型见 [Agent 与记忆模块深度设计文档](docs/agent_memory_deep_dive.md)。
+
+## 技术栈
+
+**后端**
+
+- Python 3.12
+- FastAPI、SQLAlchemy 2、Alembic、Pydantic Settings
+- LangGraph、LangChain OpenAI-compatible adapters
+- Celery、Redis
+- PostgreSQL、Qdrant、MinIO
+
+**前端**
+
+- React 18、TypeScript、Vite
+- React Router、React Markdown
+- Nginx 生产静态服务与 `/api` 反向代理
+
+## 快速启动
+
+### 1. 准备环境变量
+
+PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Bash：
+
+```bash
+cp .env.example .env
+```
+
+至少替换以下值：
+
+```dotenv
+LLM_API_KEY=your-real-key
+EMBEDDING_API_KEY=your-real-key
+```
+
+如果更换 Embedding 模型，必须同步修改 `EMBEDDING_DIMENSION`。已有 Qdrant collection 的向量维度不会自动迁移，模型或维度变更后应重建相关 collection 与索引。
+
+本地 `.env` 已被 `.gitignore` 忽略，不要把真实密钥提交到 GitHub。
+
+### 2. 启动开发环境
 
 ```bash
 docker compose -f infra/docker-compose.yml --env-file .env up --build
@@ -10,23 +106,17 @@ docker compose -f infra/docker-compose.yml --env-file .env up --build
 
 常用地址：
 
-- 前端：http://localhost:5173
-- 管理员控制台：http://localhost:5173/admin
-- 记忆管理页：http://localhost:5173/memories
-- 后端健康检查：http://localhost:8000/api/health
-- 后端依赖就绪检查：http://localhost:8000/api/ready
-- 当前用户：http://localhost:8000/api/me
-- 知识库接口：http://localhost:8000/api/knowledge-bases
-- 文档接口：http://localhost:8000/api/knowledge-bases/{kb_id}/documents
-- 流式消息接口：http://localhost:8000/api/conversations/{conversation_id}/messages/stream
-- Agent 运行接口：http://localhost:8000/api/agent-runs
-- 长期记忆接口：http://localhost:8000/api/memories
-- LLM 调用日志：http://localhost:8000/api/llm-logs
-- 用户反馈接口：http://localhost:8000/api/feedbacks
-- 指标聚合接口：http://localhost:8000/api/admin/metrics
-- 检索日志接口：http://localhost:8000/api/retrieval-logs
-- Qdrant：http://localhost:6333
-- MinIO 控制台：http://localhost:9001
+| 服务 | 地址 |
+|---|---|
+| Web 应用 | http://localhost:5173 |
+| 管理员控制台 | http://localhost:5173/admin |
+| 记忆管理 | http://localhost:5173/memories |
+| 后端健康检查 | http://localhost:8000/api/health |
+| 后端依赖就绪检查 | http://localhost:8000/api/ready |
+| Qdrant | http://localhost:6333 |
+| MinIO Console | http://localhost:9001 |
+
+第一个注册用户会成为初始管理员。该行为用于单实例 bootstrap；正式部署后应立即建立明确的管理员治理流程。
 
 停止服务：
 
@@ -34,184 +124,125 @@ docker compose -f infra/docker-compose.yml --env-file .env up --build
 docker compose -f infra/docker-compose.yml down
 ```
 
-## 数据库迁移
+## 生产部署
 
-开发环境仍会在应用启动时执行轻量 `create_all` 和运行时补列，方便本地演示。正式环境建议关闭自动建表并使用 Alembic：
-
-```text
-AUTO_CREATE_TABLES=false
+```powershell
+Copy-Item .env.production.example .env
 ```
 
-生产环境关闭自动建表后，需要先执行迁移：
+必须替换 PostgreSQL、MinIO、JWT、LLM、Embedding 和 CORS 相关占位符。生产模式会拒绝默认密钥、SQLite、通配 CORS、`AUTO_CREATE_TABLES=true` 和占位凭证。
+
+```bash
+docker compose -f infra/docker-compose.prod.yml --env-file .env config --quiet
+docker compose -f infra/docker-compose.prod.yml --env-file .env up --build -d
+```
+
+生产 Compose 会先执行 Alembic migration，然后启动 backend、worker、唯一一个 Beat 调度器和 Nginx 前端。Vite 的 `VITE_API_BASE_URL` 在镜像构建阶段注入，默认使用 Nginx 代理的 `/api`。
+
+详细说明见 [生产部署文档](docs/production_deployment.md)。
+
+## 环境变量与超参数
+
+所有可调运行参数均集中在：
+
+- [开发模板](.env.example)
+- [生产模板](.env.production.example)
+- 后端定义：[config.py](apps/backend/app/core/config.py)
+
+| 参数组 | 示例 |
+|---|---|
+| 模型 | `LLM_MODEL`、各任务 temperature、timeout |
+| Embedding | model、dimension、batch、timeout |
+| Agent | stream concurrency、queue、deadline、conversation lease |
+| Retrieval | Top-K、路线数、路线权重、RRF、BM25/Dense 预取 |
+| Memory | TTL、召回阈值、上下文预算、编辑与候选上限 |
+| Summary | token/message trigger、delta size、summary cap、lease |
+| Worker | retries、backoff、visibility timeout、lease、恢复批量 |
+| Storage | DB pool、Redis/Qdrant timeout、MinIO |
+| Retention | AgentRun、LLM、Retrieval、Memory log/job 保留天数 |
+
+以下内容有意不放入 `.env`：权限等级、状态机枚举、敏感信息正则、唯一记忆槽、数据库字段长度、Prompt、Qdrant payload 字段和 Redis Lua。这些属于安全规则或数据契约，修改它们通常需要代码审查和数据库迁移。
+
+环境变量在进程启动时读取，修改后需要重启 backend、worker 和 Beat。
+
+## 记忆控制
+
+请求级 `memory_mode` 与部署级 `MEMORY_UPDATE_MODE` 是两套独立开关：
+
+| 配置 | 含义 |
+|---|---|
+| `memory_mode=normal` | 本轮读取记忆，并允许短期记忆、摘要和长期更新 |
+| `memory_mode=off` | 本轮不读取、不缓存、不摘要、不写长期记忆 |
+| `memory_mode=auto` | 兼容旧客户端，根据“不要使用记忆”等文本标记决定 |
+| `MEMORY_UPDATE_MODE=sync` | assistant 提交后在当前请求内更新长期记忆 |
+| `MEMORY_UPDATE_MODE=async` | 创建 durable job，由 Celery 更新长期记忆 |
+| `MEMORY_UPDATE_MODE=disabled` | 仍可读取记忆，但关闭长期记忆自动写入 |
+
+记忆不会作为企业知识库事实证据。RAG、Summary 和 Writing 只能用经过权限校验的知识库检索结果支撑事实；记忆只影响风格、偏好和对话连续性。
+
+## 数据库迁移
 
 ```bash
 cd apps/backend
 alembic upgrade head
 ```
 
-迁移脚本位于 `apps/backend/alembic/versions`。
+开发模式允许 `AUTO_CREATE_TABLES=true` 方便本地运行；生产必须使用 `AUTO_CREATE_TABLES=false` 和 Alembic。
 
-当 `APP_ENV=production` 时，后端会拒绝使用开发级配置启动，包括默认 JWT 密钥、SQLite、`AUTO_CREATE_TABLES=true` 和通配 CORS。
-生产 JWT 密钥至少需要 32 字节；用户密码使用 bcrypt 哈希，旧版 PBKDF2 哈希仍可验证以兼容已有本地演示数据。
-
-## LLM Provider
-
-系统只支持真实 LLM 回答。Agent 路由、记忆抽取、摘要、写作和基于检索上下文的答案生成都会调用兼容 OpenAI Chat Completions 的服务：
-
-```text
-LLM_PROVIDER=openai_compatible
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_API_KEY=你的密钥
-LLM_MODEL=gpt-4o-mini
-```
-
-如果 LLM 缺少配置、依赖缺失或调用失败，系统会直接报错，不再降级到本地规则回答。
-
-Embedding 同样只支持真实向量服务，需要配置兼容 OpenAI Embeddings 的服务：
-
-```text
-EMBEDDING_PROVIDER=openai_compatible
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_API_KEY=你的密钥
-EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIMENSION=384
-```
-
-检索链路使用原始问题和必要拆出的 sub-queries，同时走 Dense 向量召回和 BM25 词项召回；不同路线的候选通过 RRF 融合，不再启用 metadata route 或 reranker。
-
-## 企业检索安全模型
-
-系统使用单一 Qdrant collection 存储所有文档向量，通过 payload filter 和数据库过滤共同控制可见范围：
-
-- 用户拥有 `security_level`，范围为 `L1` 到 `L5`。
-- 第一个注册用户会自动成为 `L5` 管理员，用于本地部署 bootstrap；后续用户默认为普通 `L1`。
-- 管理员可以创建和管理公开知识库；普通用户可以创建和管理自己的私人知识库。
-- 公开知识库文档上传和删除仅限管理员，上传时可设置文档密级；私人知识库创建后默认仅 owner 可见，文档不需要选择密级，库内内容对有成员权限的用户全部可读。
-- Dense 和 BM25 两路检索在公开知识库中都会过滤 `security_level <= current_user.security_level`；私人知识库只按成员权限隔离。
-- 管理员可在 `/admin` 的“用户等级”区域调整用户等级。
-- 会话支持删除；聊天流式输出使用后端 SSE 和 provider token callback，不再只做前端假打字效果。
-- 关键操作写入审计日志，包括用户等级调整、文档上传、RAG 检索和会话删除；管理端可查看最近审计记录。
-- 当 RAG 没有命中当前用户可访问内容时，仍会调用 LLM，并由提示词约束它说明知识库依据不足、不得用通用知识编造答案。
-
-## Agent 编排
-
-默认使用 LangGraph 组装 `Memory -> Supervisor -> RAG/Memory/Chat/Summary/Writing -> Memory` 单图：
-
-```text
-AGENT_GRAPH_BACKEND=langgraph
-```
-
-如果本地环境没有安装 LangGraph，`AGENT_GRAPH_BACKEND=langgraph` 会直接失败。需要显式使用顺序执行调试时，可配置：
-
-```text
-AGENT_GRAPH_BACKEND=sequential
-```
-
-## 演示路径
-
-1. 启动服务并打开 `http://localhost:5173`。
-2. 注册第一个用户；该用户会自动成为管理员。
-3. 进入“知识库”页面，管理员可创建公开知识库：`企业制度演示知识库`；普通用户也可创建私人知识库。
-4. 在知识库详情页上传 [company_policy_demo.md](demo/company_policy_demo.md)；公开知识库选择合适文档密级，私人知识库直接上传即可。
-5. 等待文档状态变为 `indexed`，确认 `chunk_count > 0`。
-6. 进入“问答”页，提问：`住宿报销上限是多少？`
-7. 查看答案、引用面板、检索解释、Agent trace。
-8. 输入 `I prefer concise answers`，再输入一次确认记忆触发 `touch`。
-9. 输入 `I prefer detailed answers`，确认旧偏好变为 `superseded`。
-10. 在回答下点击点赞/点踩，进入“管理员控制台”查看反馈率、Token、Fallback 和最近 LLM 错误。
-11. 运行 RAG 评估脚本。
-
-## 后端测试
-
-一键质量门禁：
+## 测试与质量门禁
 
 ```bash
 python scripts/check_project.py
 ```
 
-该命令会运行后端单测、Python 编译检查、前端构建和 Docker Compose 配置校验。
-其中也包含 Alembic 迁移验证，确保 `AUTO_CREATE_TABLES=false` 时迁移后的表结构覆盖当前模型。
-如果本地服务已经启动，可以追加端到端冒烟：
+质量门禁执行后端测试、Python compileall、Alembic 完整迁移链、TypeScript/Vite 构建以及开发和生产 Compose 配置验证。
+
+运行中的完整栈可以追加端到端冒烟：
 
 ```bash
 python scripts/check_project.py --with-smoke
 ```
 
-容器内运行：
+RAG 离线评估说明见 [docs/evaluation.md](docs/evaluation.md)。
 
-```bash
-docker exec rag-backend python -m unittest discover -s tests
+## 项目目录
+
+```text
+apps/backend/app/
+  agents/       固定 Agent 图、Supervisor 与各意图节点
+  memory/       记忆策略、召回、编辑、命令、事件和索引
+  rag/          文档解析、切分、Embedding、Hybrid Retrieval、回答
+  services/     业务编排、事务和权限边界
+  workers/      文档、记忆、摘要、清理和保留任务
+  api/          FastAPI 路由与依赖
+  db/           SQLAlchemy 模型和运行时 schema
+
+apps/frontend/src/
+  pages/        对话、知识库、记忆、登录和管理页面
+  components/   布局与基础 UI
+  lib/api/      API client、SSE parser 和类型
+
+infra/          开发与生产 Docker Compose
+docs/           架构、API、部署、评估和模块设计文档
+demo/           演示文档与 RAG 评估数据
+scripts/        质量门禁、迁移验证、冒烟和评估脚本
 ```
 
-本地运行：
+## 关键文档
 
-```bash
-$env:PYTHONPATH="apps/backend"
-python -m unittest discover -s apps/backend/tests
-```
-
-测试覆盖重点：
-
-- 密码哈希、JWT、refresh token 轮换和撤销。
-- 知识库 owner/viewer 权限边界。
-- 首个注册用户自动成为管理员，普通用户不能上传或删除文档。
-- Memory action：`create`、`touch`、`merge`、`supersede`、`pending`、`ignore`。
-- RAG 评估指标：Recall@K、MRR、citation_hit_rate。
-
-## RAG 评估
-
-全栈冒烟验收会自动注册临时用户、创建知识库、上传 demo 文档、等待入库并执行一次带引用问答：
-
-```bash
-python scripts/smoke_demo.py
-```
-
-先完成演示文档上传，并拿到知识库 id，然后运行：
-
-```bash
-python scripts/run_eval.py ^
-  --base-url http://localhost:8000/api ^
-  --email demo@example.com ^
-  --password Password123! ^
-  --kb-id <knowledge_base_id> ^
-  --dataset demo/rag_eval_questions.json ^
-  --top-k 5 ^
-  --output .run/rag_eval_report.json
-```
-
-PowerShell 单行示例：
-
-```powershell
-python scripts/run_eval.py --base-url http://localhost:8000/api --email demo@example.com --password Password123! --kb-id "<knowledge_base_id>" --dataset demo/rag_eval_questions.json --top-k 5
-```
-
-输出指标：
-
-- `Recall@K`：前 K 个引用是否命中预期来源。
-- `MRR`：第一个正确引用的排序质量。
-- `citation_hit_rate`：引用是否命中预期来源。
-- `answer_keyword_hit_rate`：答案是否包含预期关键词，只作为弱信号。
-
-## 文档索引
-
-- [完整技术 Pipeline 文档](docs/technical_pipeline_guide.md)
-- [手工验收清单](docs/manual_acceptance_checklist.md)
+- [Agent 与记忆模块深度设计](docs/agent_memory_deep_dive.md)
+- [生产部署](docs/production_deployment.md)
 - [API 参考](docs/api.md)
-- [架构图说明](docs/architecture_diagrams.md)
-- [RAG Pipeline 说明](docs/rag_pipeline.md)
-- [Prompt 说明](docs/prompts.md)
-- [RAG 评估说明](docs/evaluation.md)
-- [Agent 编排说明](docs/agent_orchestration.md)
-- [简历项目描述](docs/resume_project.md)
-- [面试备战指南](docs/interview_prep_guide.md)
-- [演示数据说明](demo/README.md)
-- [早期架构校准](docs/architecture.md)
+- [RAG Pipeline](docs/rag_pipeline.md)
+- [架构图](docs/architecture_diagrams.md)
+- [评估方法](docs/evaluation.md)
+- [手工验收清单](docs/manual_acceptance_checklist.md)
 
-## 阶段 11 完成标准
+## 当前边界
 
-- 后端关键测试可以运行并通过。
-- 手工验收清单覆盖启动、鉴权、入库、问答、Agent、记忆和评估。
-- RAG 评估脚本能对 demo 问题输出 Recall@K、MRR 和 citation_hit_rate。
-- README 能指导新用户从启动到演示。
-- 架构、RAG、Agent 和简历文档能支撑项目展示与面试讲解。
-- 没有新增业务功能，没有重写项目结构。
+- 当前没有真实 cross-encoder reranker，`reranker_enabled` 始终为 false。
+- Qdrant 长期记忆索引默认关闭，PostgreSQL 始终是权威数据源。
+- `summary` 和 `writing` 是基于知识库证据的任务，不是任意粘贴文本处理器。
+- Agent stream concurrency 是每个 Uvicorn 进程的限制，不是跨实例全局配额。
+- citations 表示提供给模型的证据集合，不等于逐句事实核验结果。
+- 公网生产仍建议增加边缘限流、集中 metrics/tracing、真实基础设施集成测试和更安全的 refresh token Cookie 方案。

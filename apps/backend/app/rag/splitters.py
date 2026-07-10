@@ -6,7 +6,9 @@ import tiktoken
 from langchain_core.documents import Document
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
 
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+from app.core.config import get_settings
+
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", get_settings().transformers_verbosity)
 
 CHUNK_SEPARATORS = [
     "\n\n",
@@ -31,9 +33,12 @@ TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
 
 def split_documents(
     documents: list[Document],
-    chunk_size: int = 800,
-    chunk_overlap: int = 120,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
 ) -> list[Document]:
+    settings = get_settings()
+    chunk_size = settings.default_chunk_size if chunk_size is None else chunk_size
+    chunk_overlap = settings.default_chunk_overlap if chunk_overlap is None else chunk_overlap
     chunks = build_text_splitter(chunk_size, chunk_overlap).split_documents(documents)
     return [with_token_count(chunk) for chunk in chunks if chunk.page_content.strip()]
 

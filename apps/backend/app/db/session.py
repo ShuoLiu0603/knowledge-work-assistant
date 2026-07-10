@@ -13,8 +13,19 @@ connect_args = (
     if settings.database_url.startswith("sqlite")
     else {}
 )
+engine_options = {
+    "connect_args": connect_args,
+    "pool_pre_ping": settings.database_pool_pre_ping,
+}
+if not settings.database_url.startswith("sqlite"):
+    engine_options.update(
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout=settings.database_pool_timeout_seconds,
+        pool_recycle=settings.database_pool_recycle_seconds,
+    )
 
-engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+engine = create_engine(settings.database_url, **engine_options)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 

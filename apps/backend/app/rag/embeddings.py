@@ -60,7 +60,7 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             api_key=self.api_key,
             base_url=self.base_url,
             dimensions=self.dimension,
-            timeout=30,
+            timeout=get_settings().embedding_timeout_seconds,
             chunk_size=self.batch_size,
             tiktoken_enabled=False,
             check_embedding_ctx_length=False,

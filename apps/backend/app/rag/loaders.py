@@ -8,7 +8,9 @@ from tempfile import TemporaryDirectory
 
 from langchain_core.documents import Document
 
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+from app.core.config import get_settings
+
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", get_settings().transformers_verbosity)
 
 SUPPORTED_EXTENSIONS = {"pdf", "docx", "txt", "md", "csv"}
 MARKDOWN_HEADERS = [

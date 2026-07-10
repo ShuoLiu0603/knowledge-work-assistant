@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -31,6 +32,7 @@ class MessageRead(BaseModel):
     role: str
     content: str
     status: str
+    memory_enabled: bool
     citations: list[CitationRead]
     agent_trace: list
     token_usage: dict
@@ -41,3 +43,4 @@ class MessageRead(BaseModel):
 class StreamMessageRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
     top_k: int | None = Field(default=None, ge=1, le=10)
+    memory_mode: Literal["auto", "normal", "off"] = "auto"

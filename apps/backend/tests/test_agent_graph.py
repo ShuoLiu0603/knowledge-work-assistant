@@ -29,7 +29,12 @@ class FakeSummaryLlmProvider(FakeAgentLlmProvider):
     def classify_intent(self, text: str) -> str:
         return "summary"
 
-    def summarize_with_metadata(self, text: str) -> LlmCompletion:
+    def summarize_with_metadata(
+        self,
+        text: str,
+        request_text: str = "",
+        style_context: str = "",
+    ) -> LlmCompletion:
         return LlmCompletion(
             content="最终摘要",
             provider="openai_compatible",
@@ -191,20 +196,20 @@ class AgentGraphTests(unittest.TestCase):
                 patch("app.agents.supervisor.get_llm_provider", return_value=FakeSummaryLlmProvider()),
                 patch("app.services.memory_service.get_llm_provider", return_value=FakeAgentLlmProvider()),
                 patch("app.agents.summary_agent.get_llm_provider", return_value=FakeSummaryLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
+                patch(
+                    "app.agents.summary_agent.retrieve_rag_evidence",
+                    return_value=SimpleNamespace(
+                        chunks=[],
+                        citations=[],
+                        retrieval_log_id="retrieval-log-id",
+                        searched_knowledge_base_ids=[kb.id],
+                    ),
+                ),
+                patch("app.agents.summary_agent.format_answer_context", return_value="RAG evidence"),
             ):
-                build_rag_answer.side_effect = lambda *args, **kwargs: (
-                    kwargs["on_token"]("中间RAG答案") if kwargs.get("on_token") else None
-                ) or SimpleNamespace(
-                    answer="中间RAG答案",
-                    citations=[],
-                    retrieval_log_id="retrieval-log-id",
-                    llm_log_id="rag-llm-log-id",
-                )
-
                 run_agent_graph(session, state)
 
-            self.assertEqual(tokens, [])
+            self.assertEqual(tokens, ["最终摘要"])
             self.assertEqual(state.answer, "最终摘要")
             self.assertEqual(state.intent, "summary")
 
@@ -347,6 +352,7 @@ class AgentGraphTests(unittest.TestCase):
             job = session.scalar(select(UserMemoryUpdateJob).where(UserMemoryUpdateJob.user_id == user.id))
             self.assertIsNotNone(job)
             self.assertEqual(job.status, "queued")
+            self.assertEqual(job.error_message, "worker dispatch failed: broker down")
 
     def test_disabled_memory_update_is_explicit_in_trace(self) -> None:
         with isolated_session() as session:

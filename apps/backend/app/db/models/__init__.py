@@ -3,6 +3,7 @@ from app.db.models.audit_log import AuditLog
 from app.db.models.conversation import Conversation, Message
 from app.db.models.department import Department
 from app.db.models.document import Document, DocumentChunk
+from app.db.models.external_cleanup_job import ExternalCleanupJob
 from app.db.models.feedback import Feedback
 from app.db.models.knowledge_base import KnowledgeBase, KnowledgeBaseMember
 from app.db.models.llm_call_log import LlmCallLog
@@ -18,6 +19,7 @@ __all__ = [
     "Department",
     "Document",
     "DocumentChunk",
+    "ExternalCleanupJob",
     "Feedback",
     "KnowledgeBase",
     "KnowledgeBaseMember",

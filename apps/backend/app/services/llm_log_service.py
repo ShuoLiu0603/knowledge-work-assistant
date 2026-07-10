@@ -15,6 +15,7 @@ def create_llm_call_log(
     user_id: str | None = None,
     conversation_id: str | None = None,
     agent_name: str | None = None,
+    autocommit: bool = True,
 ) -> LlmCallLog:
     log = LlmCallLog(
         user_id=user_id,
@@ -31,8 +32,11 @@ def create_llm_call_log(
         error_message=completion.error_message,
     )
     db.add(log)
-    db.commit()
-    db.refresh(log)
+    if autocommit:
+        db.commit()
+        db.refresh(log)
+    else:
+        db.flush()
     return log
 
 
@@ -43,7 +47,7 @@ def list_llm_call_logs(
     agent_name: str | None = None,
     limit: int = 100,
 ) -> list[LlmCallLogRead]:
-    query = select(LlmCallLog).where((LlmCallLog.user_id == user_id) | (LlmCallLog.user_id.is_(None)))
+    query = select(LlmCallLog).where(LlmCallLog.user_id == user_id)
     if conversation_id:
         query = query.where(LlmCallLog.conversation_id == conversation_id)
     if agent_name:
@@ -54,7 +58,7 @@ def list_llm_call_logs(
 
 def get_llm_call_log(db: Session, user_id: str, log_id: str) -> LlmCallLogRead:
     log = db.get(LlmCallLog, log_id)
-    if log is None or (log.user_id is not None and log.user_id != user_id):
+    if log is None or log.user_id != user_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LLM call log not found")
     return to_llm_call_log_read(log)
 

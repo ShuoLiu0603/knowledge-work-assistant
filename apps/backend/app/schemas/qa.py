@@ -18,9 +18,9 @@ class CitationRead(BaseModel):
     chunk_index: int
     score: float
     content_preview: str
-    title_path: str | None
-    page_number: int | None
-    section_name: str | None
+    title_path: str | None = None
+    page_number: int | None = None
+    section_name: str | None = None
     security_level: int = 1
     rrf_score: float | None = None
     retrieval_routes: list[str] = Field(default_factory=list)

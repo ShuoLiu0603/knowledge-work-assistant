@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from qdrant_client import QdrantClient, models
-
 from app.core.config import get_settings
 from app.db.models.user_memory import UserMemory
 
@@ -16,8 +14,11 @@ class MemoryVectorHit:
     payload: dict[str, Any]
 
 
-def get_qdrant_client(timeout: int = 10) -> QdrantClient:
-    return QdrantClient(url=get_settings().qdrant_url, timeout=timeout)
+def get_qdrant_client(timeout: int | None = None) -> Any:
+    from qdrant_client import QdrantClient
+
+    settings = get_settings()
+    return QdrantClient(url=settings.qdrant_url, timeout=timeout or settings.qdrant_timeout_seconds)
 
 
 def memory_collection_name() -> str:
@@ -28,9 +29,10 @@ def is_memory_vector_index_enabled() -> bool:
     return bool(get_settings().memory_vector_index_enabled)
 
 
-def ensure_memory_collection(client: QdrantClient | None = None) -> None:
+def ensure_memory_collection(client: Any | None = None) -> None:
     if not is_memory_vector_index_enabled():
         return
+    models = qdrant_models()
     client = client or get_qdrant_client()
     settings = get_settings()
     collection_name = memory_collection_name()
@@ -47,15 +49,21 @@ def ensure_memory_collection(client: QdrantClient | None = None) -> None:
     ensure_memory_payload_indexes(client)
 
 
-def ensure_memory_payload_indexes(client: QdrantClient | None = None) -> None:
+def ensure_memory_payload_indexes(client: Any | None = None) -> None:
     if not is_memory_vector_index_enabled():
         return
+    models = qdrant_models()
     client = client or get_qdrant_client()
     field_schemas = {
         "user_id": models.PayloadSchemaType.KEYWORD,
         "status": models.PayloadSchemaType.KEYWORD,
         "kind": models.PayloadSchemaType.KEYWORD,
         "category": models.PayloadSchemaType.KEYWORD,
+        "canonical_key": models.PayloadSchemaType.KEYWORD,
+        "memory_layer": models.PayloadSchemaType.KEYWORD,
+        "profile_slot": models.PayloadSchemaType.KEYWORD,
+        "scope_type": models.PayloadSchemaType.KEYWORD,
+        "scope_id": models.PayloadSchemaType.KEYWORD,
     }
     for field_name, field_schema in field_schemas.items():
         try:
@@ -72,13 +80,12 @@ def ensure_memory_payload_indexes(client: QdrantClient | None = None) -> None:
 def sync_memory_vector(memory: UserMemory) -> None:
     if not is_memory_vector_index_enabled():
         return
-    if memory.status == "deleted":
+    if not should_index_memory(memory):
         delete_memory_vector(memory.id)
-        return
-    if not memory.embedding:
         return
     client = get_qdrant_client()
     ensure_memory_collection(client)
+    models = qdrant_models()
     client.upsert(
         collection_name=memory_collection_name(),
         points=[
@@ -92,16 +99,18 @@ def sync_memory_vector(memory: UserMemory) -> None:
     )
 
 
-def try_sync_memory_vector(memory: UserMemory) -> None:
+def try_sync_memory_vector(memory: UserMemory) -> bool:
     try:
         sync_memory_vector(memory)
     except Exception:
-        return
+        return False
+    return True
 
 
 def delete_memory_vector(memory_id: str) -> None:
     if not is_memory_vector_index_enabled():
         return
+    models = qdrant_models()
     client = get_qdrant_client()
     collection_name = memory_collection_name()
     if not client.collection_exists(collection_name):
@@ -113,11 +122,32 @@ def delete_memory_vector(memory_id: str) -> None:
     )
 
 
-def try_delete_memory_vector(memory_id: str) -> None:
+def try_delete_memory_vector(memory_id: str) -> bool:
     try:
         delete_memory_vector(memory_id)
     except Exception:
-        return
+        return False
+    return True
+
+
+def should_index_memory(memory: UserMemory) -> bool:
+    return memory.status == "active" and bool(memory.embedding)
+
+
+def get_memory_vector_payloads(memory_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not is_memory_vector_index_enabled() or not memory_ids:
+        return {}
+    client = get_qdrant_client()
+    collection_name = memory_collection_name()
+    if not client.collection_exists(collection_name):
+        return {}
+    points = client.retrieve(
+        collection_name=collection_name,
+        ids=list(dict.fromkeys(memory_ids)),
+        with_payload=True,
+        with_vectors=False,
+    )
+    return {str(point.id): dict(point.payload or {}) for point in points}
 
 
 def search_active_memories(
@@ -130,6 +160,7 @@ def search_active_memories(
         return []
     client = get_qdrant_client()
     ensure_memory_collection(client)
+    models = qdrant_models()
     result = client.query_points(
         collection_name=memory_collection_name(),
         query=query_vector,
@@ -161,6 +192,14 @@ def memory_payload(memory: UserMemory) -> dict[str, Any]:
         "status": memory.status,
         "kind": memory.kind,
         "category": memory.category,
+        "canonical_key": memory.canonical_key,
+        "memory_layer": memory.memory_layer,
+        "profile_slot": memory.profile_slot,
+        "scope_type": memory.scope_type,
+        "scope_id": memory.scope_id,
+        "pinned": memory.pinned,
+        "revision": memory.revision,
+        "expires_at": memory.expires_at.isoformat() if memory.expires_at else None,
         "content_hash": memory.content_hash,
         "source_conversation_id": memory.source_conversation_id,
         "source_message_id": memory.source_message_id,
@@ -169,7 +208,14 @@ def memory_payload(memory: UserMemory) -> dict[str, Any]:
     }
 
 
-def field_match(field_name: str, value: str) -> models.FieldCondition:
+def qdrant_models() -> Any:
+    from qdrant_client import models
+
+    return models
+
+
+def field_match(field_name: str, value: str) -> Any:
+    models = qdrant_models()
     return models.FieldCondition(
         key=field_name,
         match=models.MatchValue(value=value),

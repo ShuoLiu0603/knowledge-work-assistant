@@ -1,0 +1,173 @@
+.workspace {
+  position: relative;
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(244px, 280px) minmax(0, 1fr) minmax(320px, 380px);
+  min-height: 0;
+  overflow: hidden;
+  background: var(--color-bg);
+}
+
+.leftRail,
+.rightRail {
+  min-height: 0;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.86);
+  overscroll-behavior: contain;
+}
+
+.leftRail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  overflow-y: auto;
+  border-right: 1px solid var(--color-border);
+}
+
+.rightRail {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid var(--color-border);
+}
+
+.center {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.58), rgba(245, 247, 251, 0.9)),
+    var(--color-bg);
+}
+
+.noticeStack {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+}
+
+.errorBanner {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(180, 35, 24, 0.18);
+  border-radius: var(--radius-md);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.targetBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--color-border);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.targetTitle {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.targetMeta {
+  display: block;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.tabBar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 8px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+.tab {
+  flex: 1 1 64px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.tab:hover {
+  background: var(--color-surface-muted);
+  color: var(--color-text);
+}
+
+.tabActive {
+  border-color: rgba(15, 118, 110, 0.18);
+  background: var(--color-primary-soft);
+  color: var(--color-primary-strong);
+}
+
+.rightBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px;
+}
+
+@media (max-width: 1120px) {
+  .workspace {
+    grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
+  }
+
+  .rightRail {
+    grid-column: 1 / -1;
+    height: 300px;
+    border-top: 1px solid var(--color-border);
+    border-left: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .workspace {
+    grid-template-rows: minmax(160px, 220px) minmax(260px, 1fr) minmax(220px, 300px);
+    grid-template-columns: 1fr;
+  }
+
+  .leftRail {
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .center {
+    min-height: 0;
+  }
+
+  .targetBar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .rightRail {
+    height: 100%;
+  }
+}

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.department import Department
 from app.schemas.department import DepartmentCreate, DepartmentRead
+from app.services.audit_service import record_audit_event
 
 
 def list_departments(db: Session) -> list[DepartmentRead]:
@@ -13,15 +14,32 @@ def list_departments(db: Session) -> list[DepartmentRead]:
     return [to_department_read(department) for department in departments]
 
 
-def create_department(db: Session, payload: DepartmentCreate) -> DepartmentRead:
+def create_department(db: Session, payload: DepartmentCreate, actor_user_id: str | None = None) -> DepartmentRead:
     existing = db.scalar(select(Department).where(Department.name == payload.name))
     if existing is not None:
+        record_audit_event(
+            db,
+            actor_user_id=actor_user_id,
+            action="department.create",
+            resource_type="department",
+            outcome="denied",
+            detail="Department name already exists",
+            metadata={"name": payload.name},
+        )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Department name already exists")
 
     department = Department(name=payload.name, description=payload.description)
     db.add(department)
     db.commit()
     db.refresh(department)
+    record_audit_event(
+        db,
+        actor_user_id=actor_user_id,
+        action="department.create",
+        resource_type="department",
+        resource_id=department.id,
+        metadata={"name": department.name},
+    )
     return to_department_read(department)
 
 

@@ -7,13 +7,24 @@ class UserMemoryCreate(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
     category: str | None = Field(default=None, max_length=80)
     kind: str = Field(default="preference", max_length=40)
+    canonical_key: str | None = Field(default=None, max_length=160)
+    memory_layer: str | None = Field(default=None, max_length=30)
+    profile_slot: str | None = Field(default=None, max_length=80)
+    pinned: bool | None = None
+    confirm_sensitive: bool = False
 
 
 class UserMemoryUpdate(BaseModel):
+    expected_revision: int | None = Field(default=None, ge=1)
     content: str | None = Field(default=None, min_length=1, max_length=2000)
     status: str | None = Field(default=None, max_length=30)
     category: str | None = Field(default=None, max_length=80)
     kind: str | None = Field(default=None, max_length=40)
+    canonical_key: str | None = Field(default=None, max_length=160)
+    memory_layer: str | None = Field(default=None, max_length=30)
+    profile_slot: str | None = Field(default=None, max_length=80)
+    pinned: bool | None = None
+    confirm_sensitive: bool = False
 
 
 class UserMemoryRead(BaseModel):
@@ -24,6 +35,14 @@ class UserMemoryRead(BaseModel):
     status: str
     kind: str
     category: str
+    canonical_key: str
+    memory_layer: str
+    profile_slot: str
+    scope_type: str
+    scope_id: str
+    pinned: bool
+    revision: int
+    expires_at: datetime | None
     source_text: str
     source_conversation_id: str | None
     source_message_id: str | None
@@ -51,6 +70,8 @@ class UserMemoryUpdateJobRead(BaseModel):
     attempts: int
     actions: list
     error_message: str
+    lease_expires_at: datetime | None
+    dispatched_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -103,6 +124,8 @@ class UserMemoryRecallMetricsRead(BaseModel):
     route_counts: dict[str, int]
     route_selected_counts: dict[str, int]
     category_counts: dict[str, int]
+    memory_layer_counts: dict[str, int]
+    profile_slot_counts: dict[str, int]
     empty_result_count: int
     empty_result_rate: float
     fallback_count: int
@@ -113,3 +136,22 @@ class UserMemoryRecallMetricsRead(BaseModel):
     average_top_score: float | None
     unique_selected_memory_count: int
     top_selected_memories: list[dict]
+
+
+class UserMemoryReconcileFindingRead(BaseModel):
+    finding_type: str
+    severity: str
+    memory_id: str
+    related_memory_id: str | None
+    proposed_action: str
+    reason: str
+    applied: bool
+    metadata: dict
+
+
+class UserMemoryReconcileRead(BaseModel):
+    user_id: str
+    apply: bool
+    scanned_count: int
+    applied_count: int
+    findings: list[UserMemoryReconcileFindingRead]

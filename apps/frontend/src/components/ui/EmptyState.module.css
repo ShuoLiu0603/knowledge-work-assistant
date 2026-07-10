@@ -1,0 +1,27 @@
+.wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  justify-content: center;
+  min-height: 180px;
+  padding: var(--space-2xl) var(--space-lg);
+  color: var(--color-text-muted);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-muted);
+}
+
+.title {
+  margin: 0 0 var(--space-sm);
+  font-size: 17px;
+  font-weight: 760;
+  color: var(--color-text);
+}
+
+.desc {
+  margin: 0 0 var(--space-md);
+  font-size: 14px;
+  line-height: 1.6;
+  max-width: 360px;
+}

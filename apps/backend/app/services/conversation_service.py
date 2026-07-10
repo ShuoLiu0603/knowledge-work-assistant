@@ -568,7 +568,7 @@ def run_agent_streaming(
 
 def acquire_agent_stream_slot() -> AgentStreamSlot | None:
     global _AGENT_STREAM_ACTIVE
-    limit = max(1, int(getattr(get_settings(), "agent_stream_max_concurrency", 8)))
+    limit = get_settings().agent_stream_max_concurrency
     slot = AgentStreamSlot()
     with _AGENT_STREAM_CAPACITY_GUARD:
         if _AGENT_STREAM_ACTIVE >= limit:

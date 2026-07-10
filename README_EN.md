@@ -84,8 +84,6 @@ EMBEDDING_API_KEY=your-real-key
 
 When changing the embedding model, update `EMBEDDING_DIMENSION` as well. Existing Qdrant collections are not migrated automatically when the vector dimension changes.
 
-The local `.env` is ignored by Git. Never commit real credentials to GitHub.
-
 Start the development stack:
 
 ```bash
@@ -132,7 +130,6 @@ See [Production Deployment](docs/production_deployment.md).
 All runtime tuning is defined in:
 
 - [Development template](.env.example)
-- [Production template](.env.production.example)
 - Backend schema: [config.py](apps/backend/app/core/config.py)
 
 | Group | Examples |

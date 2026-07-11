@@ -561,7 +561,7 @@ class WorkerReliabilityTests(unittest.TestCase):
             database_url="postgresql+psycopg://user:strong-db-password@postgres:5432/rag_app",
             auto_create_tables=False,
             jwt_secret_key="a-long-random-secret-value-for-prod",
-            backend_cors_origins="https://app.example.com",
+            backend_cors_origins="https://app.company.com",
             llm_api_key="test-llm-key",
             embedding_api_key="test-embedding-key",
             minio_access_key="prod-minio-access",

@@ -1,20 +1,84 @@
+# Secrets and local environment overrides
 .env
+.env.*
+!.env.example
+!.env.production.example
+.envrc
+.direnv/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python environments, caches, coverage, and build output
 .venv/
-.run/
+venv/
+env/
 __pycache__/
-*.egg-info/
 *.py[cod]
-*.db
-*.sqlite
-*.sqlite3
-
-node_modules/
-dist/
-.vite/
-*.tsbuildinfo
-
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+build/
+dist/
 
+# Node and frontend build output
+node_modules/
+apps/frontend/dist/
+.vite/
+*.tsbuildinfo
+coverage/
+
+# Local databases, logs, and runtime data
+*.db
+*.sqlite
+*.sqlite3
 *.log
+logs/
+uploads/
+/data/
+
+# IDE, OS, and local assistant state
+.idea/
+.vscode/
+.run/
+.agents/
+.codex/
+.cursor/
+.windsurf/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary repository checks and archives
+/.tmp*
+/tmp/
+/temp/
+*.tmp
+*.bak
+*.swp
+
+# Personal planning, learning, interview, and internal review material
+/plan/
+/enterprise_code_review_report.md
+/docs/architecture.md
+/docs/code_typing_order.md
+/docs/interview_prep_guide.md
+/docs/manual_acceptance_checklist.md
+/docs/memory_module_redesign.md
+/docs/project_understanding_guide.md
+/docs/resume_project.md
+/docs/technical_pipeline_guide.md
+/docs/学习笔记.md
+
+# Third-party reference documents: keep source links, not copied binaries
+/demo/public_rag_docs/*.pdf

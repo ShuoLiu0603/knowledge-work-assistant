@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "id": "travel_hotel_limit",
+      "question": "住宿报销上限是多少？",
+      "expected_sources": ["company_policy_demo.md"],
+      "expected_keywords": ["600", "450", "住宿"]
+    },
+    {
+      "id": "invoice_requirements",
+      "question": "报销发票需要包含哪些信息？",
+      "expected_sources": ["company_policy_demo.md"],
+      "expected_keywords": ["发票", "税号", "金额"]
+    },
+    {
+      "id": "agent_routing",
+      "question": "Supervisor Agent、RAG Agent 和 Memory Agent 分别负责什么？",
+      "expected_sources": ["company_policy_demo.md"],
+      "expected_keywords": ["Supervisor", "RAG", "Memory"]
+    }
+  ]
+}

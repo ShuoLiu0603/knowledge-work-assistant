@@ -45,7 +45,7 @@ def main() -> int:
                 (
                     "docker compose config",
                     ["docker", "compose", "-f", "infra/docker-compose.yml", "--env-file", ".env.example", "config", "--quiet"],
-                    None,
+                    {"APP_ENV_FILE": "../.env.example"},
                 ),
                 (
                     "production docker compose config",
@@ -59,7 +59,7 @@ def main() -> int:
                         "config",
                         "--quiet",
                     ],
-                    None,
+                    {"APP_ENV_FILE": "../.env.production.example"},
                 ),
             ]
         )

@@ -1,92 +1,119 @@
-# Agentic RAG Enterprise Knowledge and Long-Term Memory Assistant
+# Knowledge Work Assistant / Agentic RAG 企业知识工作助手
 
-English | [简体中文](README.md)
+[![CI](https://github.com/ShuoLiu0603/knowledge-work-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/ShuoLiu0603/knowledge-work-assistant/actions/workflows/ci.yml)
 
-This is a full-stack Agentic RAG project for enterprise knowledge management. It combines identity and access control, asynchronous document ingestion, hybrid retrieval, traceable citations, controlled Agent orchestration, short- and long-term memory, durable background jobs, and governance auditing.
+English | [Chinese](README.md)
 
-The Agent is deliberately constrained. It does not allow an LLM to select arbitrary tools. A fixed graph loads memory, classifies intent, retrieves authorized evidence, answers or drafts content, and updates memory after the response. Authorization and transaction boundaries always remain in backend code.
+Knowledge Work Assistant is an engineering reference implementation for enterprise knowledge workflows. It combines identity and authorization, asynchronous document ingestion, hybrid retrieval, constrained Agent orchestration, conversational memory, traceable citations, background-job recovery, and governance auditing in a runnable full-stack system.
 
-## Capabilities
+**Project status: engineering reference implementation, not turnkey production software.** The repository is intended for architecture study, prototyping, internal technical evaluation, and further development. APIs, data models, and deployment conventions may still change. Complete the security and operational hardening described below before using it with real business data.
 
-| Area | Capabilities |
+> [!WARNING]
+> Do not expose the development Compose stack or example credentials to the public internet. The development template contains local defaults, the first registered user becomes the bootstrap administrator, and the frontend currently stores access and refresh tokens in `localStorage`. A production deployment must replace every secret, restrict network access, enable TLS, and establish identity, token, monitoring, backup, and disaster-recovery controls.
+
+## Product Capabilities
+
+| Area | Current implementation |
 |---|---|
-| Enterprise knowledge | Public/private knowledge bases, membership roles, department scope, L1-L5 document classification |
-| Document ingestion | PDF, DOCX, TXT, Markdown, CSV, MinIO storage, Celery parsing, chunking, and embedding |
-| RAG | Query rewriting, sub-questions, Dense + BM25, weighted RRF, context compression, citations, RetrievalLog |
-| Agent | Five intents: `rag / memory / chat / summary / writing`; LangGraph or sequential backend |
-| Memory | Redis short-term history, incremental summaries, PostgreSQL long-term memory, optional Qdrant index |
-| Governance | Pending approval, revision OCC, soft delete, restore, purge, export, reconcile, recall logs |
-| Reliability | Durable jobs, idempotency keys, fenced leases, backoff, Celery Beat recovery, cleanup jobs |
-| Observability | Agent traces, LLM logs, retrieval candidates, memory events, recall metrics, audit logs |
-| Frontend | Chat, knowledge bases, documents, memory management, and administration |
+| Identity and authorization | Registration, login, access/refresh tokens, administrator role, department scope, knowledge-base membership, L1-L5 document classification |
+| Enterprise knowledge bases | Public/private knowledge bases, member management, PDF/DOCX/TXT/Markdown/CSV upload, document status, and chunk inspection |
+| Knowledge assistance | Query rewriting, sub-question decomposition, Dense + BM25 retrieval, weighted RRF, context compression, streaming answers, and citations |
+| Agent orchestration | Five intents: `rag`, `memory`, `chat`, `summary`, and `writing`; LangGraph or sequential execution backend |
+| Conversational memory | Redis short-term memory, incremental summaries, PostgreSQL long-term memory, and an optional Qdrant semantic index |
+| Memory governance | Automatic candidates, pending approval, revisions, soft delete, restore, purge, export, index reconciliation, and recall logs |
+| Administration and audit | Agent traces, LLM call logs, retrieval logs, feedback, memory events, audit logs, and administrative metrics |
+
+## Engineering Characteristics
+
+- A fixed Agent graph and deterministic backend routing constrain model behavior; the LLM cannot invoke arbitrary tools.
+- Authorization filters apply to both Dense and BM25 retrieval, while enterprise evidence remains separate from user memory.
+- PostgreSQL is authoritative for business data and long-term memory; Qdrant contains rebuildable vector indexes.
+- Celery durable jobs, idempotency keys, fenced leases, exponential backoff, and Beat recovery scans cover key asynchronous failure windows.
+- Memory writes use evidence constraints, sensitive-data detection, semantic deduplication, optimistic concurrency control, and event history.
+- SSE conversations preserve provenance across Agent runs, retrieval, LLM calls, and persisted messages.
+- A single quality gate verifies Alembic migrations, backend behavior, Python compilation, frontend builds, and Compose configuration.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    U[Browser] --> FE[React + Vite]
-    FE --> API[FastAPI]
-    API --> PG[(PostgreSQL)]
-    API --> REDIS[(Redis)]
-    API --> QD[(Qdrant)]
-    API --> MINIO[(MinIO)]
-    API --> LLM[OpenAI-compatible LLM]
-    API --> EMB[OpenAI-compatible Embedding]
-    REDIS --> WORKER[Celery Worker]
-    BEAT[Celery Beat] --> REDIS
-    WORKER --> PG
-    WORKER --> QD
-    WORKER --> MINIO
+    Browser[React + Vite] --> API[FastAPI API]
+    API --> Services[Service / Authorization]
+    Services --> Agent[Agent Graph]
+    Agent --> RAG[RAG Pipeline]
+    Agent --> Memory[Memory Pipeline]
+
+    Services --> PG[(PostgreSQL)]
+    Services --> Redis[(Redis)]
+    Services --> MinIO[(MinIO)]
+    RAG --> Qdrant[(Qdrant)]
+    Memory -. optional index .-> Qdrant
+    RAG --> LLM[OpenAI-compatible LLM]
+    RAG --> Embedding[OpenAI-compatible Embedding]
+
+    Redis --> Worker[Celery Worker]
+    Beat[Celery Beat] --> Redis
+    Worker --> PG
+    Worker --> MinIO
+    Worker --> Qdrant
 ```
 
-Main conversation path:
+The system has two primary data paths:
 
-```text
-commit user Message
--> load summary, recent messages, and long-term memory
--> classify intent
--> RAG / Memory Answer / Chat / Summary / Writing
--> persist RetrievalLog, LLM logs, and AgentRun
--> commit assistant Message and attach logs
--> execute or enqueue long-term memory update
--> enqueue incremental conversation summary
--> SSE done
-```
+1. **Document ingestion:** upload the source file to MinIO, persist document metadata, then let Celery parse, split, embed, and write data to PostgreSQL and Qdrant.
+2. **Conversation execution:** commit the user message, load authorized conversation and memory context, classify intent, execute retrieval or the selected Agent node, stream the response, and persist logs, messages, summaries, and memory update jobs.
 
-See [Agent and Memory Deep Dive](docs/agent_memory_deep_dive.md) for the complete state model, sequence, invariants, and failure semantics.
+See [Agent and Memory Deep Dive (Chinese)](docs/agent_memory_deep_dive.md) for the complete sequence, transaction boundaries, failure semantics, and data model.
 
-## Technology
+## Technology Stack
 
-**Backend:** Python 3.12, FastAPI, SQLAlchemy 2, Alembic, Pydantic Settings, LangGraph, LangChain, Celery, Redis, PostgreSQL, Qdrant, and MinIO.
+- Backend: Python 3.12, FastAPI, SQLAlchemy 2, Alembic, Pydantic Settings, LangGraph, LangChain, and Celery
+- Frontend: React 18, TypeScript, Vite, React Router, React Markdown, and Nginx
+- Infrastructure: PostgreSQL 16, Redis 7, Qdrant, MinIO, and Docker Compose
+- Model interfaces: OpenAI-compatible Chat Completions and Embeddings
 
-**Frontend:** React 18, TypeScript, Vite, React Router, React Markdown, and Nginx for production.
+## Prerequisites
+
+- Git
+- Docker Engine or Docker Desktop with Docker Compose v2
+- Access to an OpenAI-compatible LLM API
+- Access to an OpenAI-compatible Embedding API
+- Python 3.12, Node.js 22.12+, and npm when running the quality gate locally
+
+The LLM and Embedding services do not need to come from the same provider. The development template uses independent settings: `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` and `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL`.
 
 ## Quick Start
 
-Create the local environment file:
+### 1. Create the local configuration
+
+PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Or on Bash:
+Bash:
 
 ```bash
 cp .env.example .env
 ```
 
-At minimum, replace:
+At minimum, review and replace the model settings:
 
 ```dotenv
-LLM_API_KEY=your-real-key
-EMBEDDING_API_KEY=your-real-key
+LLM_BASE_URL=https://your-llm-service.example/v1
+LLM_API_KEY=replace-me
+LLM_MODEL=your-chat-model
+
+EMBEDDING_BASE_URL=https://your-embedding-service.example/v1
+EMBEDDING_API_KEY=replace-me
+EMBEDDING_MODEL=your-embedding-model
+EMBEDDING_DIMENSION=1024
 ```
 
-When changing the embedding model, update `EMBEDDING_DIMENSION` as well. Existing Qdrant collections are not migrated automatically when the vector dimension changes.
+`EMBEDDING_DIMENSION` must match the model output. Changing the model or dimension requires rebuilding the corresponding Qdrant collection; existing vectors are not migrated automatically.
 
-The local `.env` is ignored by Git. Never commit real credentials to GitHub.
-
-Start the development stack:
+### 2. Start the development stack
 
 ```bash
 docker compose -f infra/docker-compose.yml --env-file .env up --build
@@ -95,14 +122,12 @@ docker compose -f infra/docker-compose.yml --env-file .env up --build
 | Service | URL |
 |---|---|
 | Web application | http://localhost:5173 |
-| Admin console | http://localhost:5173/admin |
-| Memory management | http://localhost:5173/memories |
-| Backend liveness | http://localhost:8000/api/health |
-| Backend readiness | http://localhost:8000/api/ready |
+| Backend API | http://localhost:8000/api |
+| OpenAPI documentation | http://localhost:8000/docs |
+| Liveness | http://localhost:8000/api/health |
+| Readiness | http://localhost:8000/api/ready |
 | Qdrant | http://localhost:6333 |
 | MinIO Console | http://localhost:9001 |
-
-The first registered user becomes the bootstrap administrator. Establish an explicit administrator governance process for production.
 
 Stop the stack:
 
@@ -110,113 +135,112 @@ Stop the stack:
 docker compose -f infra/docker-compose.yml down
 ```
 
-## Production
+## First Demo
 
-```powershell
-Copy-Item .env.production.example .env
-```
+1. Open http://localhost:5173 and register a user. On an empty database, the first user becomes the bootstrap administrator.
+2. Create a private knowledge base, for example `Enterprise Policy Demo`.
+3. Upload [demo/company_policy_demo.md](demo/company_policy_demo.md) and wait until its status becomes `indexed`.
+4. Select that knowledge base in the conversation page and ask: `住宿报销上限是多少？` (`What is the accommodation reimbursement limit?`).
+5. Inspect the answer citations, retrieval log, Agent trace, and memory panel to verify evidence provenance.
 
-Replace every PostgreSQL, MinIO, JWT, LLM, embedding, and CORS placeholder. Production validation rejects default secrets, SQLite, wildcard CORS, `AUTO_CREATE_TABLES=true`, and placeholder credentials.
-
-```bash
-docker compose -f infra/docker-compose.prod.yml --env-file .env config --quiet
-docker compose -f infra/docker-compose.prod.yml --env-file .env up --build -d
-```
-
-The production stack runs Alembic before starting the backend, worker, exactly one Beat scheduler, and the Nginx frontend. `VITE_API_BASE_URL` is injected at image build time and defaults to the Nginx `/api` proxy.
-
-See [Production Deployment](docs/production_deployment.md).
-
-## Environment Variables and Hyperparameters
-
-All runtime tuning is defined in:
-
-- [Development template](.env.example)
-- [Production template](.env.production.example)
-- Backend schema: [config.py](apps/backend/app/core/config.py)
-
-| Group | Examples |
-|---|---|
-| Models | `LLM_MODEL`, per-task temperatures, timeouts |
-| Embeddings | model, dimension, batch size, timeout |
-| Agent | stream concurrency, queue size, deadline, conversation lease |
-| Retrieval | Top-K, route count, weights, RRF, BM25/Dense prefiltering |
-| Memory | TTL, recall thresholds, context budget, editor and candidate limits |
-| Summary | token/message triggers, delta size, summary cap, lease |
-| Worker | retries, backoff, visibility timeout, leases, recovery batch size |
-| Storage | database pool, Redis/Qdrant timeouts, MinIO |
-| Retention | AgentRun, LLM, retrieval, memory log, and job retention |
-
-Security rules and data contracts are intentionally not environment variables. This includes permission levels, state-machine labels, sensitive-data regular expressions, singleton memory slots, database field lengths, prompts, Qdrant payload fields, and Redis Lua scripts. Changing those requires code review and often a migration.
-
-Environment variables are read at process startup. Restart the backend, worker, and Beat after changing them.
-
-## Memory Controls
-
-Request-level `memory_mode` and deployment-level `MEMORY_UPDATE_MODE` are independent:
-
-| Setting | Meaning |
-|---|---|
-| `memory_mode=normal` | Read memory and allow cache, summary, and long-term update for this turn |
-| `memory_mode=off` | Do not read, cache, summarize, or update memory for this turn |
-| `memory_mode=auto` | Legacy compatibility using no-memory text markers |
-| `MEMORY_UPDATE_MODE=sync` | Update long-term memory after the assistant Message commits |
-| `MEMORY_UPDATE_MODE=async` | Persist a durable job and let Celery update long-term memory |
-| `MEMORY_UPDATE_MODE=disabled` | Memory can still be read, but automatic long-term writes are disabled |
-
-Memory is never enterprise evidence. RAG, Summary, and Writing may use only authorized knowledge-base retrieval results for factual claims. Memory can affect style, preferences, and conversational continuity.
-
-## Migrations and Quality Gate
+With the stack running, the automated smoke demo creates a temporary user and knowledge base, uploads the document, asks the question, validates citations, and removes the knowledge base by default:
 
 ```bash
-cd apps/backend
-alembic upgrade head
+python scripts/smoke_demo.py
 ```
 
-Development may use `AUTO_CREATE_TABLES=true`. Production must use `AUTO_CREATE_TABLES=false` and Alembic.
+## Configuration
 
-Run the complete quality gate:
+- [`.env.example`](.env.example): local development template with runnable defaults and parameter comments.
+- [`.env.production.example`](.env.production.example): production reference template with placeholders for sensitive settings.
+- [`config.py`](apps/backend/app/core/config.py): authoritative backend types, defaults, ranges, and cross-setting validation.
+
+Configuration groups cover the application and CORS, PostgreSQL pooling, Redis, Qdrant, MinIO, LLMs, Embeddings, Agent concurrency and deadlines, hybrid retrieval, context compression, short- and long-term memory, incremental summaries, Celery recovery, retention, document splitting, and authentication.
+
+Environment variables are loaded at process startup. Restart the backend, worker, and Beat after changing them. Never commit a local `.env` file or real credentials.
+
+The default Compose workflow assumes the configuration file is `.env` in the repository root. When using another `--env-file`, also set `APP_ENV_FILE` to that file's path relative to `infra/*.yml`; this keeps Compose interpolation and the backend/worker service environment on the same configuration source.
+
+## Local Testing
+
+Install backend and frontend dependencies:
+
+```bash
+python -m pip install -e apps/backend
+npm --prefix apps/frontend ci
+```
+
+Run the local core quality gate:
 
 ```bash
 python scripts/check_project.py
 ```
 
-With a running stack, include the end-to-end smoke test:
+The gate runs backend tests, Python `compileall`, full Alembic migration verification, the TypeScript/Vite build, and development/production Compose validation. GitHub Actions additionally builds the production frontend image, runs the Nginx parameter preflight, and executes `nginx -t`. Add the end-to-end smoke demo when the stack is running:
 
 ```bash
 python scripts/check_project.py --with-smoke
 ```
 
-The gate covers backend tests, Python compileall, the Alembic migration chain, TypeScript/Vite build, and development/production Compose validation.
+## Production Deployment Reference
+
+The production Compose file is a single-host deployment reference, not a complete platform distribution:
+
+```bash
+cp .env.production.example .env
+docker compose -f infra/docker-compose.prod.yml --env-file .env config --quiet
+docker compose -f infra/docker-compose.prod.yml --env-file .env up --build -d
+```
+
+Startup runs Alembic migrations before the backend, worker, single Beat scheduler, and Nginx frontend. See [Production Deployment](docs/production_deployment.md) for operational details.
+
+Complete at least the following hardening work before deployment:
+
+- Inject PostgreSQL, MinIO, JWT, LLM, and Embedding credentials from a secret manager and establish rotation procedures.
+- Put TLS, exact CORS, edge rate limiting, and a WAF in front of the application; do not expose database, Redis, Qdrant, or MinIO administration ports.
+- Publish only the frontend/Nginx entry point and keep the backend on the internal network so proxy limits and security policy cannot be bypassed.
+- Move refresh tokens to `Secure`, `HttpOnly` cookies with an appropriate `SameSite` policy, and evaluate SSO/OIDC, MFA, and administrator governance.
+- Add centralized logs, metrics, distributed tracing, alerts, audit retention, and sensitive-data redaction.
+- Define and test backup, restore, retention, and cross-region disaster-recovery procedures for PostgreSQL, MinIO, Qdrant, and Redis.
+- Pin and scan container images and dependencies; add SBOM generation, vulnerability scanning, malicious-file inspection, and supply-chain controls.
+- Run authorization, concurrency, queue recovery, load, fault-injection, and data-recovery tests against the target infrastructure.
 
 ## Repository Layout
 
-- `apps/backend/app/agents`: fixed graph, Supervisor, and intent handlers
-- `apps/backend/app/memory`: policy, recall, editor, commands, events, and indexes
-- `apps/backend/app/rag`: loading, splitting, embeddings, retrieval, and answering
-- `apps/backend/app/services`: business orchestration, transactions, and authorization
-- `apps/backend/app/workers`: document, memory, summary, cleanup, and retention jobs
-- `apps/frontend/src`: pages, components, API client, and SSE parser
-- `infra`: development and production Docker Compose
-- `docs`: architecture, API, deployment, evaluation, and design documents
-- `demo`: demo documents and RAG evaluation data
-- `scripts`: quality gate, migration verification, smoke, and evaluation tools
+```text
+apps/backend/app/   FastAPI, Agent, RAG, memory, services, data models, and workers
+apps/backend/tests/ Backend and regression tests
+apps/frontend/src/ React pages, components, API client, and SSE handling
+infra/              Development and production Docker Compose files
+docs/               Public architecture, module, API, evaluation, and deployment docs
+demo/               Demo documents and RAG evaluation data
+scripts/            Quality gate, migration verification, smoke demo, and evaluation tools
+```
 
-## Documentation
+## Public Documentation
 
-- [Agent and Memory Deep Dive](docs/agent_memory_deep_dive.md)
+- [Agent and Memory Deep Dive (Chinese)](docs/agent_memory_deep_dive.md)
+- [Agent Orchestration (Chinese)](docs/agent_orchestration.md)
+- [RAG Pipeline (Chinese)](docs/rag_pipeline.md)
+- [API Reference (Chinese)](docs/api.md)
+- [Architecture Diagrams (Chinese)](docs/architecture_diagrams.md)
+- [Prompt Design (Chinese)](docs/prompts.md)
+- [RAG Evaluation (Chinese)](docs/evaluation.md)
 - [Production Deployment](docs/production_deployment.md)
-- [API Reference](docs/api.md)
-- [RAG Pipeline](docs/rag_pipeline.md)
-- [Architecture Diagrams](docs/architecture_diagrams.md)
-- [Evaluation](docs/evaluation.md)
-- [Manual Acceptance Checklist](docs/manual_acceptance_checklist.md)
+- [Demo Data (Chinese)](demo/README.md)
 
-## Current Boundaries
+## Known Limitations
 
-- There is no active cross-encoder reranker; `reranker_enabled` is always false.
-- The long-term memory Qdrant index is optional and disabled by default. PostgreSQL remains authoritative.
-- `summary` and `writing` operate on retrieved knowledge-base evidence, not arbitrary pasted text.
-- Agent stream concurrency is enforced per Uvicorn process, not globally across replicas.
-- Citations represent evidence supplied to the model, not post-hoc sentence-level fact verification.
-- Public deployments should still add edge rate limiting, centralized metrics/tracing, real-infrastructure integration tests, and a safer HttpOnly refresh-token cookie design.
+- No cross-encoder reranker is currently active; retrieval fusion relies on Dense, BM25, and weighted RRF.
+- The code and development template disable the long-term memory Qdrant index by default, while the production template enables it; PostgreSQL remains authoritative in both cases.
+- Memory supports user preferences, style, and conversational continuity; it is never enterprise factual evidence.
+- `summary` and `writing` operate on authorized knowledge-base retrieval, not arbitrary pasted text.
+- Agent streaming concurrency is enforced per Uvicorn process, not as a global quota across replicas.
+- Citations identify the evidence supplied to the model; they are not sentence-level fact verification.
+- First-user administrator bootstrap is suitable only for single-instance initialization; production needs an explicit administrator lifecycle.
+- The frontend currently stores tokens in `localStorage`; public production deployments require a hardened token and browser-security design.
+- The production Compose stack targets a single-host reference scenario and does not provide multi-region high availability, autoscaling, or managed-cloud orchestration.
+
+## License
+
+This repository currently has no open-source license. Until an explicit `LICENSE` file is added, no permission to copy, modify, or redistribute the source code should be assumed. Select a license compatible with the dependencies and distribution goals before inviting external reuse.

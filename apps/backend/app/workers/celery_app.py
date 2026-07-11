@@ -1,9 +1,10 @@
 from celery import Celery
 from celery.schedules import crontab
 
-from app.core.config import get_settings
+from app.core.config import get_settings, validate_runtime_settings
 
 settings = get_settings()
+validate_runtime_settings(settings)
 RETRY_BACKOFF_MAX_SECONDS = settings.celery_task_retry_backoff_max_seconds
 RELIABLE_TASK_OPTIONS = {
     "acks_late": True,

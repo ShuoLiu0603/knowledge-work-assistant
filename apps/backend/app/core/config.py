@@ -1,10 +1,22 @@
+import re
 from functools import lru_cache
+from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 PRODUCTION_ENVS = {"prod", "production"}
+APP_ENV_ALIASES = {
+    "dev": "development",
+    "development": "development",
+    "test": "test",
+    "testing": "test",
+    "prod": "production",
+    "production": "production",
+}
 INSECURE_JWT_SECRETS = {"", "change-me", "dev-only-change-me", "dev-only-change-me-dev-secret-32-bytes"}
 INSECURE_PRODUCTION_VALUES = {
     "",
@@ -17,11 +29,14 @@ INSECURE_PRODUCTION_VALUES = {
 INSECURE_PRODUCTION_MARKERS = ("replace-with", "replace_me", "your-", "example")
 MIN_PRODUCTION_JWT_SECRET_LENGTH = 32
 ALLOWED_MEMORY_UPDATE_MODES = {"sync", "async", "disabled"}
+ALLOWED_AGENT_GRAPH_BACKENDS = {"langgraph", "sequential"}
+ALLOWED_MODEL_PROVIDERS = {"openai_compatible"}
+ALLOWED_JWT_ALGORITHMS = {"HS256"}
 
 
 class Settings(BaseSettings):
     app_env: str = "development"
-    app_name: str = "agentic-rag-platform"
+    app_name: str = "knowledge-work-assistant"
     api_prefix: str = "/api"
     backend_cors_origins: str = "http://localhost:5173,http://localhost:3000"
     database_url: str = "sqlite+pysqlite:///./local_auth.db"
@@ -160,6 +175,73 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @field_validator("app_env", mode="before")
+    @classmethod
+    def normalize_app_env(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in APP_ENV_ALIASES:
+                raise ValueError(f"APP_ENV must be one of {', '.join(sorted(APP_ENV_ALIASES))}")
+            return APP_ENV_ALIASES[normalized]
+        return value
+
+    @field_validator("agent_graph_backend", mode="before")
+    @classmethod
+    def validate_agent_graph_backend(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in ALLOWED_AGENT_GRAPH_BACKENDS:
+                raise ValueError("AGENT_GRAPH_BACKEND must be langgraph or sequential")
+            return normalized
+        return value
+
+    @field_validator("memory_update_mode", mode="before")
+    @classmethod
+    def validate_memory_update_mode(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in ALLOWED_MEMORY_UPDATE_MODES:
+                raise ValueError("MEMORY_UPDATE_MODE must be one of sync, async, disabled")
+            return normalized
+        return value
+
+    @field_validator("llm_provider", "embedding_provider", mode="before")
+    @classmethod
+    def validate_model_provider(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in ALLOWED_MODEL_PROVIDERS:
+                raise ValueError("Model provider must be openai_compatible")
+            return normalized
+        return value
+
+    @field_validator("jwt_algorithm", mode="before")
+    @classmethod
+    def validate_jwt_algorithm(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized not in ALLOWED_JWT_ALGORITHMS:
+                raise ValueError("JWT_ALGORITHM must be HS256")
+            return normalized
+        return value
+
+    @field_validator("api_prefix", mode="before")
+    @classmethod
+    def validate_api_prefix(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip()
+            path_segments = normalized.split("/")[1:]
+            if (
+                normalized == "/"
+                or re.fullmatch(r"/[A-Za-z0-9._~/-]+", normalized) is None
+                or normalized.endswith("/")
+                or "//" in normalized
+                or any(segment in {".", ".."} for segment in path_segments)
+            ):
+                raise ValueError("API_PREFIX must be a non-root path such as /api, without a trailing slash")
+            return normalized
+        return value
+
     @model_validator(mode="after")
     def validate_hyperparameters(self) -> "Settings":
         errors: list[str] = []
@@ -167,6 +249,8 @@ class Settings(BaseSettings):
             errors.append("DEFAULT_CHUNK_OVERLAP must be smaller than DEFAULT_CHUNK_SIZE")
         if self.conversation_summary_min_tokens > self.conversation_summary_trigger_tokens:
             errors.append("CONVERSATION_SUMMARY_MIN_TOKENS must not exceed CONVERSATION_SUMMARY_TRIGGER_TOKENS")
+        if self.conversation_summary_min_messages > self.conversation_summary_max_unprocessed:
+            errors.append("CONVERSATION_SUMMARY_MIN_MESSAGES must not exceed CONVERSATION_SUMMARY_MAX_UNPROCESSED")
         if self.memory_recall_threshold_min > self.memory_recall_threshold_max:
             errors.append("MEMORY_RECALL_THRESHOLD_MIN must not exceed MEMORY_RECALL_THRESHOLD_MAX")
         if not any(
@@ -181,6 +265,18 @@ class Settings(BaseSettings):
             errors.append("At least one MEMORY_CONTEXT_*_WEIGHT must be greater than zero")
         if self.celery_task_retry_backoff_max_seconds < self.celery_task_retry_backoff_seconds:
             errors.append("CELERY_TASK_RETRY_BACKOFF_MAX_SECONDS must cover the initial retry backoff")
+        for origin in self.cors_origins:
+            if origin == "*":
+                continue
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+            ):
+                errors.append(f"BACKEND_CORS_ORIGINS contains an invalid origin: {origin}")
         if errors:
             raise ValueError("; ".join(errors))
         return self
@@ -195,13 +291,13 @@ class Settings(BaseSettings):
 
     @property
     def cors_origin_regex(self) -> str | None:
-        if self.app_env.lower() in PRODUCTION_ENVS:
+        if self.app_env in PRODUCTION_ENVS:
             return None
         return r"^https?://(localhost|127\.0\.0\.1):\d+$"
 
 
 def validate_runtime_settings(settings: Settings) -> None:
-    if settings.app_env.lower() not in PRODUCTION_ENVS:
+    if settings.app_env not in PRODUCTION_ENVS:
         return
 
     errors: list[str] = []
@@ -211,12 +307,17 @@ def validate_runtime_settings(settings: Settings) -> None:
         errors.append(f"JWT_SECRET_KEY must be at least {MIN_PRODUCTION_JWT_SECRET_LENGTH} bytes in production")
     if settings.database_url.startswith("sqlite"):
         errors.append("DATABASE_URL must not use SQLite in production")
-    if is_placeholder_secret(settings.database_url):
+    elif has_insecure_database_credentials(settings.database_url):
         errors.append("DATABASE_URL must not contain placeholder or default credentials in production")
     if settings.auto_create_tables:
         errors.append("AUTO_CREATE_TABLES must be false in production")
     if "*" in settings.cors_origins:
         errors.append("BACKEND_CORS_ORIGINS must not allow '*' in production")
+    production_origins = [origin for origin in settings.cors_origins if origin != "*"]
+    if not production_origins or any(urlsplit(origin).scheme != "https" for origin in production_origins):
+        errors.append("BACKEND_CORS_ORIGINS must contain only HTTPS origins in production")
+    if any(is_placeholder_origin(origin) for origin in settings.cors_origins):
+        errors.append("BACKEND_CORS_ORIGINS must not contain placeholder origins in production")
     if settings.llm_provider != "openai_compatible":
         errors.append("LLM_PROVIDER must be openai_compatible in production")
     if not settings.llm_api_key.strip() or is_placeholder_secret(settings.llm_api_key):
@@ -256,6 +357,25 @@ def is_placeholder_secret(value: str) -> bool:
     if normalized in INSECURE_PRODUCTION_VALUES:
         return True
     return any(marker in normalized for marker in INSECURE_PRODUCTION_MARKERS)
+
+
+def has_insecure_database_credentials(value: str) -> bool:
+    try:
+        url = make_url(value)
+    except ArgumentError:
+        return True
+    return not url.username or not url.password or is_placeholder_secret(url.password)
+
+
+def is_placeholder_origin(value: str) -> bool:
+    hostname = (urlsplit(value).hostname or "").lower()
+    return (
+        hostname.startswith(("your-", "replace-"))
+        or hostname in {"localhost", "127.0.0.1", "::1", "example.com", "example.org", "example.net"}
+        or hostname.endswith(
+            (".localhost", ".example.com", ".example.org", ".example.net", ".test", ".invalid")
+        )
+    )
 
 
 @lru_cache

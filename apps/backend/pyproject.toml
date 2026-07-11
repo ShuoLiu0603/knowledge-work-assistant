@@ -1,7 +1,7 @@
 [project]
 name = "agentic-rag-backend"
 version = "0.1.0"
-description = "Minimal FastAPI backend shell for the Agentic RAG platform."
+description = "FastAPI backend for the Knowledge Work Assistant Agentic RAG reference implementation."
 requires-python = ">=3.12"
 dependencies = [
   "alembic>=1.13,<2.0",

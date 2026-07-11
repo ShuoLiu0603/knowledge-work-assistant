@@ -111,12 +111,9 @@ EMBEDDING_MODEL=your-embedding-model
 EMBEDDING_DIMENSION=1024
 ```
 
-<<<<<<< HEAD
+
 `EMBEDDING_DIMENSION` 必须与模型实际输出一致。修改模型或维度后，需要重建对应的 Qdrant collection；已有向量不会自动迁移。
 =======
-如果更换 Embedding 模型，必须同步修改 `EMBEDDING_DIMENSION`。已有 Qdrant collection 的向量维度不会自动迁移，模型或维度变更后应重建相关 collection 与索引。
-
->>>>>>> a8ecf8f677fa64815aa88336df0382ecc8296223
 
 ### 2. 启动开发环境
 
@@ -167,10 +164,6 @@ python scripts/smoke_demo.py
 <<<<<<< HEAD
 默认 Compose 流程假设配置文件是项目根目录的 `.env`。如果使用其他 `--env-file`，还必须将 `APP_ENV_FILE` 设为该文件相对 `infra/*.yml` 的路径，确保 Compose 插值与 backend/worker 读取同一份配置。
 =======
-- [开发模板](.env.example)
-- 后端定义：[config.py](apps/backend/app/core/config.py)
->>>>>>> a8ecf8f677fa64815aa88336df0382ecc8296223
-
 ## 本地测试
 
 安装后端和前端依赖：
@@ -241,8 +234,6 @@ scripts/            质量门禁、迁移校验、冒烟演示与评估脚本
 - [演示数据](demo/README.md)
 =======
 开发模式允许 `AUTO_CREATE_TABLES=true` 方便本地运行；生产必须使用 `AUTO_CREATE_TABLES=false` 和 Alembic。
-
->>>>>>> a8ecf8f677fa64815aa88336df0382ecc8296223
 
 ## 已知限制
 

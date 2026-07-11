@@ -113,11 +113,8 @@ EMBEDDING_DIMENSION=1024
 
 `EMBEDDING_DIMENSION` must match the model output. Changing the model or dimension requires rebuilding the corresponding Qdrant collection; existing vectors are not migrated automatically.
 
-<<<<<<< HEAD
+
 ### 2. Start the development stack
-=======
-Start the development stack:
->>>>>>> a8ecf8f677fa64815aa88336df0382ecc8296223
 
 ```bash
 docker compose -f infra/docker-compose.yml --env-file .env up --build
@@ -163,12 +160,9 @@ Configuration groups cover the application and CORS, PostgreSQL pooling, Redis, 
 
 Environment variables are loaded at process startup. Restart the backend, worker, and Beat after changing them. Never commit a local `.env` file or real credentials.
 
-<<<<<<< HEAD
+
 The default Compose workflow assumes the configuration file is `.env` in the repository root. When using another `--env-file`, also set `APP_ENV_FILE` to that file's path relative to `infra/*.yml`; this keeps Compose interpolation and the backend/worker service environment on the same configuration source.
 =======
-- [Development template](.env.example)
-- Backend schema: [config.py](apps/backend/app/core/config.py)
->>>>>>> a8ecf8f677fa64815aa88336df0382ecc8296223
 
 ## Local Testing
 
@@ -239,8 +233,6 @@ scripts/            Quality gate, migration verification, smoke demo, and evalua
 - [Production Deployment](docs/production_deployment.md)
 - [Demo Data (Chinese)](demo/README.md)
 =======
->>>>>>> a8ecf8f677fa64815aa88336df0382ecc8296223
-
 ## Known Limitations
 
 - No cross-encoder reranker is currently active; retrieval fusion relies on Dense, BM25, and weighted RRF.

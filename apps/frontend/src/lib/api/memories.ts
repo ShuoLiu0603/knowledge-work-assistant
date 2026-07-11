@@ -1,5 +1,5 @@
 import { apiRequest } from "./client";
-import type { UserMemory, UserMemoryExport, UserMemoryUpdateJob } from "./types";
+import type { MemoryKind, UserMemory, UserMemoryExport, UserMemoryUpdateJob } from "./types";
 
 export async function listUserMemories(token: string, status?: string): Promise<UserMemory[]> {
   const q = status ? `?status=${encodeURIComponent(status)}` : "";
@@ -10,12 +10,7 @@ export async function createUserMemory(
   token: string,
   payload: {
     content: string;
-    category?: string;
-    kind?: string;
-    canonical_key?: string;
-    memory_layer?: string;
-    profile_slot?: string;
-    pinned?: boolean;
+    kind?: MemoryKind;
     confirm_sensitive?: boolean;
   },
 ): Promise<UserMemory> {
@@ -33,12 +28,7 @@ export async function updateUserMemory(
     expected_revision?: number;
     content?: string;
     status?: string;
-    category?: string;
-    kind?: string;
-    canonical_key?: string;
-    memory_layer?: string;
-    profile_slot?: string;
-    pinned?: boolean;
+    kind?: MemoryKind;
     confirm_sensitive?: boolean;
   },
 ): Promise<UserMemory> {

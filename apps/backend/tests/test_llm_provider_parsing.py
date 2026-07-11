@@ -3,8 +3,11 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 from app.llm.provider import LlmMessage, OpenAICompatibleProvider, parse_memory_operations
-from app.llm.structured_outputs import IntentOutput
+from app.llm.structured_outputs import IntentOutput, MemoryOperationOutput
+from app.schemas.memory import UserMemoryCreate
 
 
 class LlmProviderParsingTests(unittest.TestCase):
@@ -43,6 +46,19 @@ class LlmProviderParsingTests(unittest.TestCase):
 
         self.assertEqual(len(operations), 1)
         self.assertEqual(operations[0].action, "archive")
+
+    def test_legacy_project_kind_is_normalized_in_llm_output(self) -> None:
+        output = MemoryOperationOutput(kind="project")
+
+        self.assertEqual(output.kind, "profile")
+
+    def test_manual_memory_schema_rejects_project_kind(self) -> None:
+        with self.assertRaises(ValidationError):
+            UserMemoryCreate(content="User works on a RAG project", kind="project")
+
+    def test_manual_memory_schema_rejects_internal_category(self) -> None:
+        with self.assertRaises(ValidationError):
+            UserMemoryCreate(content="User prefers concise answers", category="response_detail")
 
     def test_openai_provider_uses_langchain_structured_output(self) -> None:
         chat = FakeStructuredChat({"intent": "summary"})

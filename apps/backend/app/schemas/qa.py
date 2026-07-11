@@ -1,13 +1,19 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.retrieval_log import RetrievalLogRead
+from app.schemas.text_limits import validate_question_token_limit
 
 
 class AskKnowledgeBaseRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=1000)
+    question: str = Field(min_length=1, max_length=16000)
     top_k: int | None = Field(default=None, ge=1, le=10)
     search_scope: str = "single"
     department_id: str | None = None
+
+    @field_validator("question", mode="before")
+    @classmethod
+    def validate_question(cls, value: object) -> str:
+        return validate_question_token_limit(value)
 
 
 class CitationRead(BaseModel):

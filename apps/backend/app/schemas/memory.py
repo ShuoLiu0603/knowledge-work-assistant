@@ -1,29 +1,24 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UserMemoryCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     content: str = Field(min_length=1, max_length=2000)
-    category: str | None = Field(default=None, max_length=80)
-    kind: str = Field(default="preference", max_length=40)
-    canonical_key: str | None = Field(default=None, max_length=160)
-    memory_layer: str | None = Field(default=None, max_length=30)
-    profile_slot: str | None = Field(default=None, max_length=80)
-    pinned: bool | None = None
+    kind: Literal["preference", "profile", "instruction"] = "preference"
     confirm_sensitive: bool = False
 
 
 class UserMemoryUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     expected_revision: int | None = Field(default=None, ge=1)
     content: str | None = Field(default=None, min_length=1, max_length=2000)
     status: str | None = Field(default=None, max_length=30)
-    category: str | None = Field(default=None, max_length=80)
-    kind: str | None = Field(default=None, max_length=40)
-    canonical_key: str | None = Field(default=None, max_length=160)
-    memory_layer: str | None = Field(default=None, max_length=30)
-    profile_slot: str | None = Field(default=None, max_length=80)
-    pinned: bool | None = None
+    kind: Literal["preference", "profile", "instruction"] | None = None
     confirm_sensitive: bool = False
 
 

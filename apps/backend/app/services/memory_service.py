@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import replace
 import inspect
+import re
 import tiktoken
 from datetime import datetime, timezone
 
@@ -15,6 +16,8 @@ from app.db.models.agent_run import AgentRun
 from app.db.models.conversation import Conversation, Message
 from app.db.models.user_memory import UserMemory, UserMemoryEvent, UserMemoryRecallLog, UserMemoryUpdateJob
 from app.llm.provider import MemoryCandidate, MemoryOperation, get_llm_provider
+from app.llm.context_compression import compress_memory_context
+from app.llm.token_counter import count_tokens, tokenizer_for_model
 from app.memory import commands as memory_commands
 from app.memory import context as memory_contexts
 from app.memory import editor as memory_editor
@@ -792,6 +795,7 @@ def build_memory_context_for_question(
     if profile_memories is None:
         profile_memories = [
             {
+                "id": memory.id,
                 "content": memory.content,
                 "category": memory.category,
                 "kind": memory.kind,
@@ -818,6 +822,7 @@ def build_memory_context_for_question(
         )
         long_memories = [
             {
+                "id": memory.id,
                 "content": memory.content,
                 "category": memory.category,
                 "kind": memory.kind,
@@ -845,6 +850,34 @@ def build_memory_context_for_question(
         if is_full_memory_recall_query(query)
         else get_settings().memory_context_max_long_memories
     )
+    settings = get_settings()
+    sources = memory_contexts.build_memory_compression_sources(
+        long_memories,
+        short_memory,
+        summary,
+        profile_memories,
+        max_long_memories,
+    )
+    raw_context = memory_contexts.render_memory_sources(sources)
+    if count_tokens(raw_context) <= settings.memory_context_max_tokens:
+        return raw_context
+
+    compression = compress_memory_context(
+        query,
+        sources,
+        settings.memory_context_max_tokens,
+    )
+    for completion in compression.completions:
+        create_llm_call_log(
+            db,
+            completion,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            agent_name="memory_context_compression",
+        )
+    if compression.content:
+        return compression.content
+
     return format_memory_context(
         long_memories,
         short_memory,
@@ -914,7 +947,16 @@ def update_conversation_summary(
     for delta in batches:
         text = build_conversation_summary_prompt_from_delta(summary, delta)
         if hasattr(provider, "summarize_with_metadata"):
-            completion = provider.summarize_with_metadata(text)
+            summary_max_tokens = get_settings().conversation_summary_max_tokens
+            summary_target_tokens = max(
+                1,
+                int(summary_max_tokens * get_settings().context_compression_target_ratio),
+            )
+            completion = call_summary_with_target(
+                provider,
+                text,
+                summary_target_tokens,
+            )
             create_llm_call_log(
                 db,
                 completion,
@@ -928,7 +970,33 @@ def update_conversation_summary(
             summary = provider.summarize(text).strip()
         if not summary:
             raise RuntimeError("Conversation summary provider returned an empty summary")
-        summary = summary[: get_settings().conversation_summary_max_chars]
+        if hasattr(provider, "summarize_with_metadata"):
+            for _retry in range(get_settings().context_compression_retry_limit):
+                actual_tokens = count_tokens(summary)
+                if actual_tokens <= get_settings().conversation_summary_max_tokens:
+                    break
+                retry_target = max(
+                    1,
+                    int(
+                        summary_target_tokens
+                        * get_settings().conversation_summary_max_tokens
+                        / actual_tokens
+                        * 0.9
+                    ),
+                )
+                completion = call_summary_with_target(provider, summary, retry_target)
+                create_llm_call_log(
+                    db,
+                    completion,
+                    user_id=user_id,
+                    conversation_id=conversation.id,
+                    agent_name="conversation_summary_compression_retry",
+                    autocommit=False,
+                )
+                summary = completion.content.strip()
+                if not summary:
+                    raise RuntimeError("Conversation summary compression returned an empty summary")
+        summary = trim_conversation_summary_tokens(summary, get_settings().conversation_summary_max_tokens)
 
     return commit_conversation_summary(
         db,
@@ -954,7 +1022,7 @@ def commit_conversation_summary(
             Conversation.summary_message_count == expected_cursor,
         )
         .values(
-            summary=summary[: get_settings().conversation_summary_max_chars],
+            summary=trim_conversation_summary_tokens(summary, get_settings().conversation_summary_max_tokens),
             summary_message_count=message_count,
             updated_at=datetime.now(timezone.utc),
         )
@@ -966,6 +1034,37 @@ def commit_conversation_summary(
     if current is None:
         return ""
     return current.summary or ""
+
+
+def call_summary_with_target(provider, text: str, target_tokens: int):
+    method = provider.summarize_with_metadata
+    parameters = inspect.signature(method).parameters
+    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if "target_tokens" in parameters or accepts_kwargs:
+        return method(text, target_tokens=target_tokens)
+    return method(text)
+
+
+def trim_conversation_summary_tokens(summary: str, max_tokens: int) -> str:
+    text = summary.strip()
+    if max_tokens <= 0:
+        return ""
+    if count_tokens(text) <= max_tokens:
+        return text
+
+    sentences = [part.strip() for part in re.split(r"(?<=[。！？.!?])\s+|\n+", text) if part.strip()]
+    selected: list[str] = []
+    for sentence in sentences:
+        candidate = " ".join([*selected, sentence])
+        if count_tokens(candidate) > max_tokens:
+            break
+        selected.append(sentence)
+    if selected:
+        return " ".join(selected)
+
+    encoding = tokenizer_for_model(get_settings().llm_model)
+    token_ids = encoding.encode(text)
+    return encoding.decode(token_ids[:max_tokens]).rstrip()
 
 
 def should_update_conversation_summary(db: Session, conversation_id: str) -> bool:

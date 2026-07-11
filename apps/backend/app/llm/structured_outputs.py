@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 INTENTS = {"rag", "memory", "chat", "summary", "writing"}
 MEMORY_ACTIONS = {"create", "update", "supersede", "pending", "ignore"}
-MEMORY_KINDS = {"preference", "profile", "project", "instruction"}
+MEMORY_KINDS = {"preference", "profile", "instruction"}
 IMPORTANCE_LEVELS = {"low", "medium", "high"}
 SENSITIVITY_LEVELS = {"low", "medium", "high"}
 
@@ -56,6 +56,8 @@ class MemoryOperationOutput(BaseModel):
     @field_validator("kind", mode="before")
     @classmethod
     def normalize_kind(cls, value: object) -> str:
+        if str(value or "").strip().lower() == "project":
+            return "profile"
         return normalize_allowed(value, MEMORY_KINDS, "preference")
 
     @field_validator("importance", mode="before")
@@ -78,6 +80,25 @@ class MemoryOperationsOutput(BaseModel):
         if isinstance(value, dict):
             return [value]
         return value[:5] if isinstance(value, list) else []
+
+
+class CompressedMemoryItemOutput(BaseModel):
+    content: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+    section: Literal["profile", "long_term", "summary", "recent"]
+
+
+class MemoryContextCompressionOutput(BaseModel):
+    items: list[CompressedMemoryItemOutput] = Field(default_factory=list)
+
+
+class ExtractedEvidenceOutput(BaseModel):
+    chunk_id: str = Field(min_length=1)
+    quotes: list[str] = Field(min_length=1)
+
+
+class RagEvidenceCompressionOutput(BaseModel):
+    evidence: list[ExtractedEvidenceOutput] = Field(default_factory=list)
 
 
 def parse_json_value(raw: str) -> Any:

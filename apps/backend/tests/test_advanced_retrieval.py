@@ -5,10 +5,12 @@ from unittest.mock import patch
 
 from app.db.models.document import Document, DocumentChunk
 from app.rag.advanced_retrieval import (
+    FusedCandidate,
     RetrievalCandidate,
     fuse_candidates,
     hydrate_retrieved_chunks,
     plan_retrieval_queries,
+    retrieve_advanced_chunks,
     retrieve_bm25_routes,
 )
 from app.rag.query_rewrite import QueryRewritePlan
@@ -72,6 +74,34 @@ class AdvancedRetrievalTests(unittest.TestCase):
         self.assertEqual([item.chunk.chunk_id for item in fused], ["a", "b"])
         self.assertEqual(fused[0].routes, ["dense_original", "bm25_subquery_1"])
         self.assertGreater(fused[0].rrf_score, fused[1].rrf_score)
+
+    def test_selected_chunks_preserve_full_content_without_keyword_compression(self) -> None:
+        content = (
+            "Sam Bankman-Fried was the former CEO of FTX. "
+            "The prosecution accused him of committing fraud for personal gain."
+        )
+        chunk = make_chunk("full-content", score=0.9, content=content)
+        fused = FusedCandidate(
+            chunk=chunk,
+            routes=["dense_original"],
+            rrf_score=0.12345678,
+            best_score=0.9,
+            matched_terms=["fraud"],
+        )
+        rewrite_plan = QueryRewritePlan(rewritten_query="fraud", sub_questions=[])
+
+        with (
+            patch("app.rag.advanced_retrieval.rewrite_query", return_value=rewrite_plan),
+            patch("app.rag.advanced_retrieval.retrieve_dense_routes", return_value={}),
+            patch("app.rag.advanced_retrieval.retrieve_bm25_routes", return_value={}),
+            patch("app.rag.advanced_retrieval.fuse_candidates", return_value=[fused]),
+        ):
+            result = retrieve_advanced_chunks(None, "owner", "kb", "Who committed fraud?")
+
+        self.assertEqual(result.selected_chunks[0].content, content)
+        self.assertEqual(result.selected_chunks[0].rrf_score, 0.123457)
+        self.assertEqual(result.selected_chunks[0].retrieval_routes, ["dense_original"])
+        self.assertEqual(result.compression_chars_saved, 0)
 
     def test_dense_hits_are_hydrated_from_indexed_database_chunks(self) -> None:
         with isolated_session() as session:

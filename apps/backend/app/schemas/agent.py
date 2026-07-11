@@ -1,17 +1,23 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.qa import CitationRead
+from app.schemas.text_limits import validate_question_token_limit
 
 
 class AgentRunRequest(BaseModel):
     knowledge_base_id: str | None = None
-    input: str = Field(min_length=1, max_length=2000)
+    input: str = Field(min_length=1, max_length=16000)
     top_k: int | None = Field(default=None, ge=1, le=10)
     search_scope: Literal["single", "department", "public", "accessible", "all"] = "single"
     department_id: str | None = None
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def validate_input(cls, value: object) -> str:
+        return validate_question_token_limit(value)
 
 
 class AgentTraceStep(BaseModel):

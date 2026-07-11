@@ -341,7 +341,7 @@ export function ChatPage({ token, user, onLogout }: Props) {
     const content = newMemory.trim();
     if (!content) return;
     setError("");
-    createUserMemory(token, { content, category: "general", kind: "preference" })
+    createUserMemory(token, { content, kind: "preference" })
       .then((m) => {
         setMemories((prev) => [m, ...prev.filter((x) => x.id !== m.id)]);
         setNewMemory("");

@@ -15,6 +15,52 @@ from helpers import create_user
 
 
 class RuntimeSchemaTests(unittest.TestCase):
+    def test_runtime_schema_migrates_legacy_project_memory_to_profile(self) -> None:
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        try:
+            Base.metadata.create_all(engine)
+            now = datetime.now(timezone.utc)
+            with SessionLocal() as session:
+                user = create_user(session, "runtime-project-memory@example.com", "Runtime Project Memory")
+                memory = UserMemory(
+                    user_id=user.id,
+                    content="user works on an agentic RAG project",
+                    normalized_content="user works on an agentic rag project",
+                    content_hash="runtime-project-memory-hash",
+                    category="current_project",
+                    kind="project",
+                    canonical_key="project:current_project",
+                    memory_layer="profile",
+                    profile_slot="current_project",
+                    scope_id=user.id,
+                    pinned=True,
+                    source_text="seed",
+                    embedding=[],
+                    embedding_model="",
+                    embedding_dimension=0,
+                    last_touched_at=now,
+                )
+                session.add(memory)
+                session.commit()
+                memory_id = memory.id
+
+            ensure_runtime_schema(engine)
+
+            with SessionLocal() as session:
+                migrated = session.get(UserMemory, memory_id)
+                self.assertIsNotNone(migrated)
+                self.assertEqual(migrated.kind, "profile")
+                self.assertEqual(migrated.category, "current_project")
+                self.assertEqual(migrated.canonical_key, "project:current_project")
+        finally:
+            Base.metadata.drop_all(engine)
+            engine.dispose()
+
     def test_runtime_schema_backfills_memory_governance_before_unique_indexes(self) -> None:
         engine = create_engine(
             "sqlite+pysqlite:///:memory:",

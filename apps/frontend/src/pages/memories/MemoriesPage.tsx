@@ -11,6 +11,7 @@ import {
   retryUserMemoryUpdateJob,
   restoreUserMemory,
   updateUserMemory,
+  type MemoryKind,
   type User,
   type UserMemory,
   type UserMemoryUpdateJob,
@@ -18,7 +19,7 @@ import {
 import { AppShell } from "../../components/layout/AppShell";
 import { TopBar } from "../../components/layout/TopBar";
 import { Button } from "../../components/ui/Button";
-import { Input } from "../../components/ui/Input";
+import { Select } from "../../components/ui/Select";
 import { Textarea } from "../../components/ui/Textarea";
 import { StatusPill } from "../../components/ui/StatusPill";
 import { ConfirmDialog } from "../../components/ui/ConfirmDialog";
@@ -27,10 +28,10 @@ import styles from "./MemoriesPage.module.css";
 
 type Props = { token: string; user: User; onLogout: () => Promise<void> };
 type MemoryStatus = UserMemory["status"];
+type Option = { value: string; label: string; disabled?: boolean };
 type Draft = {
   content: string;
-  category: string;
-  kind: string;
+  kind: MemoryKind;
   status: MemoryStatus;
   revision: number;
   confirmSensitive: boolean;
@@ -40,6 +41,28 @@ type ConfirmAction = { kind: "delete" | "purge"; memoryId: string } | null;
 const STATUS_OPTS: MemoryStatus[] = ["active", "pending", "superseded", "ignored", "deleted"];
 const RECENT_JOB_LIMIT = 8;
 const VISIBLE_JOB_STATUSES = new Set<UserMemoryUpdateJob["status"]>(["queued", "processing", "failed"]);
+const MEMORY_KIND_OPTIONS: Option[] = [
+  { value: "preference", label: "偏好（preference）" },
+  { value: "profile", label: "用户画像（profile）" },
+  { value: "instruction", label: "长期指令（instruction）" },
+];
+const KIND_LABELS: Record<string, string> = {
+  preference: "偏好",
+  profile: "用户画像",
+  project: "用户画像",
+  instruction: "长期指令",
+};
+const STATUS_LABELS: Record<string, string> = {
+  active: "生效中",
+  pending: "待审批",
+  superseded: "已被替代",
+  ignored: "已忽略",
+  deleted: "已删除",
+  queued: "排队中",
+  processing: "处理中",
+  completed: "已完成",
+  failed: "失败",
+};
 
 function isLeaseExpired(job: UserMemoryUpdateJob) {
   if (job.status !== "processing" || !job.lease_expires_at) return false;
@@ -51,12 +74,25 @@ function formatTimestamp(value: string) {
   return new Date(value).toLocaleString();
 }
 
+function normalizeMemoryKind(value: string): MemoryKind {
+  if (value === "profile" || value === "instruction") return value;
+  if (value === "project") return "profile";
+  return "preference";
+}
+
+function memoryKindLabel(value: string): string {
+  return KIND_LABELS[value] ?? `未知类型：${value || "-"}`;
+}
+
+function statusLabel(value: string): string {
+  return STATUS_LABELS[value] ?? value;
+}
+
 export function MemoriesPage({ token, user, onLogout }: Props) {
   const [items, setItems] = useState<UserMemory[]>([]);
   const [filter, setFilter] = useState<MemoryStatus | "">("active");
   const [content, setContent] = useState("");
-  const [category, setCategory] = useState("general");
-  const [kind, setKind] = useState("preference");
+  const [kind, setKind] = useState<MemoryKind>("preference");
   const [confirmSensitive, setConfirmSensitive] = useState(false);
   const [editingId, setEditingId] = useState("");
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -144,13 +180,11 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
     try {
       const m = await createUserMemory(token, {
         content: content.trim(),
-        category: category.trim() || "general",
-        kind: kind.trim() || "preference",
+        kind,
         confirm_sensitive: confirmSensitive,
       });
       upsertVisibleMemory(m);
       setContent("");
-      setCategory("general");
       setKind("preference");
       setConfirmSensitive(false);
     } catch (e) {
@@ -164,8 +198,7 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
     setEditingId(m.id);
     setDraft({
       content: m.content,
-      category: m.category,
-      kind: m.kind,
+      kind: normalizeMemoryKind(m.kind),
       status: m.status,
       revision: m.revision,
       confirmSensitive: false,
@@ -184,8 +217,7 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
       const updated = await updateUserMemory(token, memId, {
         expected_revision: draft.revision,
         content: draft.content.trim(),
-        category: draft.category.trim() || "general",
-        kind: draft.kind.trim() || "preference",
+        kind: draft.kind,
         status: draft.status,
         confirm_sensitive: draft.confirmSensitive,
       });
@@ -301,8 +333,12 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
           </h2>
           <form onSubmit={handleCreate} className={page.formStack}>
             <Textarea label="内容" value={content} onChange={(e) => setContent(e.target.value)} rows={5} />
-            <Input label="分类" value={category} onChange={(e) => setCategory(e.target.value)} maxLength={80} />
-            <Input label="类型" value={kind} onChange={(e) => setKind(e.target.value)} maxLength={40} />
+            <Select
+              label="类型"
+              options={MEMORY_KIND_OPTIONS}
+              value={kind}
+              onChange={(event) => setKind(normalizeMemoryKind(event.target.value))}
+            />
             <label className={styles.confirmSensitive}>
               <input
                 type="checkbox"
@@ -357,7 +393,7 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
                     <div key={job.id} className={styles.jobRow}>
                       <div className={styles.jobBody}>
                         <div className={styles.jobTopLine}>
-                          <StatusPill variant={job.status} label={job.status} />
+                          <StatusPill variant={job.status} label={statusLabel(job.status)} />
                           {leaseExpired && <StatusPill variant="failed" label="租约已过期" />}
                           <span className={page.muted} style={{ fontSize: 11 }}>
                             尝试 {job.attempts} 次
@@ -396,7 +432,7 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
           <div className={page.toolbar}>
             <div>
               <h2 className={page.sectionTitle}>记忆列表</h2>
-              <p className={page.subtitle}>{filter ? `${filter} ${items.length} 条` : `未删除 ${items.length} 条`}</p>
+              <p className={page.subtitle}>{filter ? `${statusLabel(filter)} ${items.length} 条` : `未删除 ${items.length} 条`}</p>
             </div>
             <div className={page.controlRow}>
               <Button variant="secondary" size="sm" onClick={exportMemories}>
@@ -420,7 +456,7 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
                 <option value="">未删除</option>
                 {STATUS_OPTS.map((s) => (
                   <option key={s} value={s}>
-                    {s}
+                    {statusLabel(s)}
                   </option>
                 ))}
               </select>
@@ -441,17 +477,12 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
                       onChange={(e) => setDraft({ ...draft, content: e.target.value })}
                       rows={4}
                     />
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
-                      <Input
-                        label="分类"
-                        value={draft.category}
-                        onChange={(e) => setDraft({ ...draft, category: e.target.value })}
-                        maxLength={80}
-                      />
-                      <Input
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <Select
                         label="类型"
+                        options={MEMORY_KIND_OPTIONS}
                         value={draft.kind}
-                        onChange={(e) => setDraft({ ...draft, kind: e.target.value })}
+                        onChange={(e) => setDraft({ ...draft, kind: normalizeMemoryKind(e.target.value) })}
                       />
                       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                         <label style={{ fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)" }}>
@@ -470,7 +501,7 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
                         >
                           {STATUS_OPTS.map((s) => (
                             <option key={s} value={s}>
-                              {s}
+                              {statusLabel(s)}
                             </option>
                           ))}
                         </select>
@@ -503,15 +534,15 @@ export function MemoriesPage({ token, user, onLogout }: Props) {
                 ) : (
                   <>
                     <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-                      <StatusPill variant={m.status} label={m.status} />
+                      <StatusPill variant={m.status} label={statusLabel(m.status)} />
                       <span style={{ fontSize: 12, color: "var(--color-text-muted)" }}>
-                        {m.category} / {m.kind}
+                        {memoryKindLabel(m.kind)}
                       </span>
                     </div>
                     <p style={{ margin: "0 0 4px", fontSize: 14, lineHeight: 1.5 }}>{m.content}</p>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                       <small style={{ color: "var(--color-text-muted)", fontSize: 11 }}>
-                        touched {m.touched_count} / merged {m.merge_count} /{" "}
+                        触达 {m.touched_count} 次 / 合并 {m.merge_count} 次 /{" "}
                         {new Date(m.updated_at).toLocaleString()}
                       </small>
                       <div style={{ display: "flex", gap: 4 }}>

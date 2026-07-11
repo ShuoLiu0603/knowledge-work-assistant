@@ -35,6 +35,16 @@ def fake_completion(content: str = "[]"):
     )
 
 
+class ConversationSummaryTrimmingTests(unittest.TestCase):
+    def test_summary_is_trimmed_at_complete_sentence_boundary(self) -> None:
+        summary = "First complete fact. Second complete fact. Third fact is unfinished and much too long"
+
+        trimmed = memory_service.trim_conversation_summary_tokens(summary, 9)
+
+        self.assertEqual(trimmed, "First complete fact. Second complete fact.")
+        self.assertLessEqual(memory_service.count_tokens(trimmed), 9)
+
+
 def find_memory_id(existing_memories: list[dict], marker: str) -> str | None:
     marker = marker.lower()
     for memory in existing_memories:
@@ -3022,7 +3032,9 @@ class MemoryServiceTests(unittest.TestCase):
             conversation_summary_min_tokens=1,
             conversation_summary_min_messages=8,
             conversation_summary_max_unprocessed=30,
-            conversation_summary_max_chars=3000,
+            conversation_summary_max_tokens=1200,
+            context_compression_target_ratio=0.9,
+            context_compression_retry_limit=1,
         )
         with (
             isolated_session() as session,

@@ -57,12 +57,7 @@ def create_item(
         db,
         current_user.id,
         payload.content.strip(),
-        category=payload.category or "general",
         kind=payload.kind,
-        canonical_key=payload.canonical_key,
-        memory_layer=payload.memory_layer,
-        profile_slot=payload.profile_slot,
-        pinned=payload.pinned,
         allow_sensitive=payload.confirm_sensitive,
     )
     return to_memory_read(memory)
@@ -144,12 +139,7 @@ def update_item(
         expected_revision=payload.expected_revision,
         content=payload.content.strip() if payload.content is not None else None,
         status=payload.status,
-        category=payload.category,
         kind=payload.kind,
-        canonical_key=payload.canonical_key,
-        memory_layer=payload.memory_layer,
-        profile_slot=payload.profile_slot,
-        pinned=payload.pinned,
         allow_sensitive=payload.confirm_sensitive,
     )
     return to_memory_read(memory)

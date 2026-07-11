@@ -301,6 +301,19 @@ class MemoryContextGuardTests(unittest.TestCase):
         self.assertLessEqual(len(char_limited), 90)
         self.assertLessEqual(budget.count(token_limited), 30)
 
+    def test_token_budget_is_not_overridden_by_character_limit(self) -> None:
+        result = context.format_memory_context(
+            long_memories=[{"content": "User is building an enterprise RAG system."}],
+            short_memory=[{"role": "user", "content": "Keep the full recent message available."}],
+            conversation_summary="The project uses FastAPI, Qdrant, and LangGraph.",
+            max_chars=40,
+            max_tokens=120,
+        )
+        budget = context.TextBudget.from_limits(max_chars=40, max_tokens=120)
+
+        self.assertGreater(len(result), 40)
+        self.assertLessEqual(budget.count(result), 120)
+
     def test_recent_context_keeps_newest_messages_and_preserves_their_order(self) -> None:
         result = context.format_memory_context(
             long_memories=[],

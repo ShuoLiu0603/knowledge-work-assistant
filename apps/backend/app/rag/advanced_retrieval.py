@@ -15,7 +15,6 @@ from app.rag.query_rewrite import normalize_whitespace, rewrite_query
 from app.rag.retrieval import RetrievedChunk, retrieve_dense_chunks
 
 TERM_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？.!?])\s+|\n+")
 
 _SETTINGS = get_settings()
 MAX_ROUTE_QUERIES = _SETTINGS.retrieval_max_route_queries
@@ -25,7 +24,6 @@ SUB_QUERY_WEIGHT = _SETTINGS.retrieval_subquery_weight
 DENSE_PREFILTER_MULTIPLIER = _SETTINGS.retrieval_dense_prefilter_multiplier
 BM25_PREFILTER_TERMS = _SETTINGS.retrieval_bm25_prefilter_terms
 MAX_MATCHED_TERMS = _SETTINGS.retrieval_max_matched_terms
-CONTEXT_COMPRESSION_FALLBACK_SENTENCES = _SETTINGS.context_compression_fallback_sentences
 
 
 @dataclass(frozen=True)
@@ -111,11 +109,14 @@ def retrieve_advanced_chunks(
 
     fused = fuse_candidates(route_candidates, settings.rrf_k)
     selected_fused = fused[:limit]
-    selected_chunks, saved = compress_selected_chunks(
-        selected_fused,
-        " ".join(retrieval_queries),
-        settings.context_compression_chunk_chars,
-    )
+    selected_chunks = [
+        replace(
+            candidate.chunk,
+            rrf_score=round(candidate.rrf_score, 6),
+            retrieval_routes=candidate.routes,
+        )
+        for candidate in selected_fused
+    ]
 
     return AdvancedRetrievalResult(
         question=question,
@@ -130,7 +131,7 @@ def retrieve_advanced_chunks(
         selected_chunk_logs=selected_chunks_to_log(selected_fused, selected_chunks),
         rrf_k=settings.rrf_k,
         reranker_enabled=False,
-        compression_chars_saved=saved,
+        compression_chars_saved=0,
     )
 
 
@@ -392,46 +393,6 @@ def fuse_candidates(route_candidates: dict[str, list[RetrievalCandidate]], rrf_k
             )
         )
     return sorted(fused, key=lambda item: item.rrf_score, reverse=True)
-
-
-def compress_selected_chunks(
-    candidates: list[FusedCandidate],
-    query: str,
-    max_chars: int,
-) -> tuple[list[RetrievedChunk], int]:
-    selected: list[RetrievedChunk] = []
-    saved = 0
-    terms = searchable_terms(query)
-    for candidate in candidates:
-        original = candidate.chunk.content
-        compressed = compress_context(original, terms, max_chars)
-        saved += max(0, len(original) - len(compressed))
-        selected.append(
-            replace(
-                candidate.chunk,
-                content=compressed,
-                rrf_score=round(candidate.rrf_score, 6),
-                retrieval_routes=candidate.routes,
-            )
-        )
-    return selected, saved
-
-
-def compress_context(content: str, terms: list[str], max_chars: int) -> str:
-    normalized = " ".join(content.split())
-    if len(normalized) <= max_chars:
-        return normalized
-
-    sentences = [part.strip() for part in SENTENCE_SPLIT_RE.split(content) if part.strip()]
-    matched = [
-        sentence
-        for sentence in sentences
-        if any(term.lower() in sentence.lower() for term in terms)
-    ]
-    compressed = " ".join(matched or sentences[:CONTEXT_COMPRESSION_FALLBACK_SENTENCES])
-    if len(compressed) > max_chars:
-        return compact_snippet(compressed, max_chars=max_chars)
-    return compressed
 
 
 def candidates_to_log(route_candidates: dict[str, list[RetrievalCandidate]]) -> list[dict]:

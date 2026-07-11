@@ -5,8 +5,12 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.rag.answering import compact_snippet, generate_grounded_answer, select_answer_context_chunks
+from app.rag.answering import format_answer_context
 from app.rag.advanced_retrieval import retrieve_advanced_chunks
 from app.rag.retrieval import RetrievedChunk
+from app.llm.context_compression import compress_rag_evidence
+from app.llm.token_counter import count_tokens
+from app.core.config import get_settings
 from app.schemas.qa import AskKnowledgeBaseRequest, AskKnowledgeBaseResponse, CitationRead
 from app.services.audit_service import record_audit_event
 from app.services.knowledge_base_service import ensure_kb_access, resolve_search_scope
@@ -137,6 +141,24 @@ def retrieve_rag_evidence(
         max_security_level=scope.max_security_level,
         scope_type=scope.scope_type,
     )
+    settings = get_settings()
+    raw_context = format_answer_context(retrieval.selected_chunks)
+    compression = None
+    if count_tokens(raw_context) > settings.rag_context_max_tokens:
+        compression = compress_rag_evidence(
+            question,
+            retrieval.selected_chunks,
+            settings.rag_context_max_tokens,
+            sub_questions=retrieval.sub_questions,
+        )
+        for completion in compression.completions:
+            create_llm_call_log(
+                db,
+                completion,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                agent_name="rag_evidence_compression",
+            )
     log = create_retrieval_log(
         db,
         user_id,
@@ -146,7 +168,11 @@ def retrieve_rag_evidence(
         message_id=message_id,
     )
     retrieval_log = to_retrieval_log_read(log)
-    evidence_chunks = select_answer_context_chunks(retrieval.selected_chunks)
+    evidence_chunks = (
+        compression.chunks
+        if compression is not None and compression.chunks is not None
+        else select_answer_context_chunks(retrieval.selected_chunks)
+    )
     record_audit_event(
         db,
         actor_user_id=user_id,
@@ -163,6 +189,8 @@ def retrieve_rag_evidence(
             "question_preview": question[:160],
             "candidate_count": len(retrieval.candidates),
             "selected_count": len(retrieval.selected_chunks),
+            "context_compressed": bool(compression and compression.chunks is not None),
+            "context_compression_fallback": bool(compression and compression.fallback_used),
             "max_returned_security_level": max((chunk.security_level for chunk in retrieval.selected_chunks), default=None),
         },
     )

@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.qa import CitationRead
+from app.schemas.text_limits import validate_question_token_limit
 
 
 class ConversationCreate(BaseModel):
@@ -41,6 +42,11 @@ class MessageRead(BaseModel):
 
 
 class StreamMessageRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=1000)
+    question: str = Field(min_length=1, max_length=16000)
     top_k: int | None = Field(default=None, ge=1, le=10)
     memory_mode: Literal["auto", "normal", "off"] = "auto"
+
+    @field_validator("question", mode="before")
+    @classmethod
+    def validate_question(cls, value: object) -> str:
+        return validate_question_token_limit(value)

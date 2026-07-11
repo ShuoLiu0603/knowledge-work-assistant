@@ -194,6 +194,7 @@ def ensure_runtime_schema(engine: Engine) -> None:
 
     with engine.begin() as connection:
         connection.execute(text("UPDATE document_chunks SET qdrant_point_id = id WHERE qdrant_point_id IS NULL"))
+        connection.execute(text("UPDATE user_memories SET kind = 'profile' WHERE kind = 'project'"))
         connection.execute(
             text(
                 f"""

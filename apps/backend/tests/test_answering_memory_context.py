@@ -123,14 +123,15 @@ class AnsweringMemoryContextTests(unittest.TestCase):
             patch(
                 "app.rag.answering.get_settings",
                 return_value=SimpleNamespace(
-                    answer_context_max_chars=100,
-                    context_compression_chunk_chars=700,
+                    rag_context_max_tokens=130,
                 ),
             ),
+            patch("app.rag.answering.count_tokens", side_effect=len),
         ):
             result = generate_grounded_answer("What is covered?", chunks)
 
         self.assertEqual([chunk.chunk_id for chunk in result.used_chunks], ["chunk-1"])
+        self.assertEqual(result.used_chunks[0].content, "A" * 80)
         self.assertIn("chunk #0", provider.contexts[0])
         self.assertNotIn("chunk #1", provider.contexts[0])
 

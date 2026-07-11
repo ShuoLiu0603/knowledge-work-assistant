@@ -138,13 +138,15 @@ export type AgentRun = {
   updated_at: string;
 };
 
+export type MemoryKind = "preference" | "profile" | "instruction";
+
 export type UserMemory = {
   id: string;
   user_id: string;
   content: string;
   content_hash: string;
   status: "active" | "pending" | "superseded" | "ignored" | "deleted";
-  kind: string;
+  kind: MemoryKind;
   category: string;
   canonical_key: string;
   memory_layer: string;

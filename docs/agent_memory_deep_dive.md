@@ -773,7 +773,7 @@ Conversation 保存：
 - 如果一批消息全部被过滤，保留旧 summary，但 cursor 可以前进，避免反复扫描。
 - delta 按 `MEMORY_SUMMARY_DELTA_MAX_CHARS` 分批。
 - 每批把 previous summary 与新 delta 交给 summarizer，形成滚动摘要。
-- 最终 summary 截断到 `CONVERSATION_SUMMARY_MAX_CHARS`。
+- summarizer 提示词明确要求输出到 `CONVERSATION_SUMMARY_MAX_TOKENS` 以内；程序复核 token，超限重试后才做边界安全收口。
 - `summary_message_count` 使用条件更新，旧任务不能覆盖新 cursor。
 
 摘要投递有两层可靠性：
@@ -880,10 +880,7 @@ Conversation summary
 Recent conversation
 ```
 
-双重上限：
-
-- `MEMORY_CONTEXT_MAX_TOKENS`
-- `MEMORY_CONTEXT_MAX_CHARS`
+生产回答使用 `MEMORY_CONTEXT_MAX_TOKENS` 作为独立预算。原始上下文超限时，模型按提示词中的目标 token 压缩，并通过 source id、受保护事实覆盖和输出 token 复核；失败时回退到确定性完整单元装箱。`MEMORY_CONTEXT_MAX_CHARS` 仅保留给显式字符模式调用。
 
 默认权重：
 
@@ -1398,9 +1395,10 @@ max(
 | `QUERY_REWRITE_MAX_CHARS` | 300 | rewritten query 字符上限 |
 | `QUERY_REWRITE_SUBQUERY_MAX_CHARS` | 300 | 单个 subquery 字符上限 |
 | `QUERY_REWRITE_MAX_SUBQUERIES` | 3 | subquery 数量上限；0 关闭拆分 |
-| `CONTEXT_COMPRESSION_CHUNK_CHARS` | 700 | 上下文压缩的分段字符目标 |
-| `CONTEXT_COMPRESSION_FALLBACK_SENTENCES` | 2 | 压缩失败时保留的前导句数 |
-| `ANSWER_CONTEXT_MAX_CHARS` | 4000 | 回答生成接收的最大知识上下文 |
+| `QUESTION_MAX_TOKENS` | 1000 | 单次问题独立 token 上限；超限明确拒绝 |
+| `RAG_CONTEXT_MAX_TOKENS` | 6000 | RAG 证据独立 token 上限；必要时执行可验证的抽取式压缩 |
+| `CONTEXT_COMPRESSION_TARGET_RATIO` | 0.9 | 模型目标相对组件上限的比例 |
+| `CONTEXT_COMPRESSION_RETRY_LIMIT` | 1 | 压缩输出超限或验证失败时的重试次数 |
 
 候选规模还受 Dense 和 BM25 两条路线、有效 route 数和权限过滤影响。增大 route/limit 会提高召回成本与 RetrievalLog 体积，不应只看最终 top_k。
 
@@ -1412,7 +1410,7 @@ max(
 | `SHORT_MEMORY_TTL_SECONDS` | 86400 | Redis working memory TTL |
 | `SHORT_MEMORY_CONTENT_MAX_CHARS` | 2000 | 单条缓存消息内容上限 |
 | `MEMORY_CONTEXT_MAX_CHARS` | 3000 | 完整 memory context 的字符硬上限 |
-| `MEMORY_CONTEXT_MAX_TOKENS` | 900 | memory context 的主 token budget |
+| `MEMORY_CONTEXT_MAX_TOKENS` | 1600 | memory context 的独立 token budget |
 | `MEMORY_CONTEXT_MAX_LONG_MEMORIES` | 8 | 格式化阶段接收的长期记忆上限 |
 | `MEMORY_CONTEXT_PROFILE_WEIGHT` | 0.25 | profile/pinned 区段预算权重 |
 | `MEMORY_CONTEXT_LONG_TERM_WEIGHT` | 0.35 | 其他长期记忆权重 |
@@ -1459,7 +1457,7 @@ clamp(
 | `CONVERSATION_SUMMARY_MIN_TOKENS` | 500 | 普通摘要的最小 token 门槛 |
 | `CONVERSATION_SUMMARY_MIN_MESSAGES` | 8 | 普通摘要的最小消息数 |
 | `CONVERSATION_SUMMARY_MAX_UNPROCESSED` | 30 | 单次 worker 处理的未摘要消息上限 |
-| `CONVERSATION_SUMMARY_MAX_CHARS` | 3000 | 持久化摘要字符上限 |
+| `CONVERSATION_SUMMARY_MAX_TOKENS` | 1200 | 持久化摘要独立 token 上限和模型压缩目标依据 |
 | `CONVERSATION_SUMMARY_LEASE_MIN_SECONDS` | 60 | 摘要租约最小时长 |
 
 `MIN_TOKENS` 不能大于 `TRIGGER_TOKENS`，`MIN_MESSAGES` 不能大于 `MAX_UNPROCESSED`。摘要实际租约会在最小值与 LLM 最坏时间预算之间取较大值。

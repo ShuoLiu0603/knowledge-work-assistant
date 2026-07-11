@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import os
 
-import tiktoken
 from langchain_core.documents import Document
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
 
 from app.core.config import get_settings
+from app.llm.token_counter import count_tokens
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", get_settings().transformers_verbosity)
 
@@ -27,9 +27,6 @@ CHUNK_SEPARATORS = [
     " ",
     "",
 ]
-
-TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
-
 
 def split_documents(
     documents: list[Document],
@@ -62,7 +59,3 @@ def with_token_count(document: Document) -> Document:
         page_content=document.page_content.strip(),
         metadata={**document.metadata, "token_count": count_tokens(document.page_content)},
     )
-
-
-def count_tokens(text: str) -> int:
-    return max(1, len(TOKEN_ENCODING.encode(text)))

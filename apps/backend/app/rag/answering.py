@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from app.core.config import get_settings
 from app.llm.provider import LlmCompletion
 from app.llm.provider import get_llm_provider
+from app.llm.token_counter import count_tokens
 from app.rag.retrieval import RetrievedChunk
 
 
@@ -17,32 +18,16 @@ class GeneratedAnswer:
 
 
 def select_answer_context_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
-    settings = get_settings()
     selected: list[RetrievedChunk] = []
-    used_chars = 0
+    used_tokens = 0
+    max_tokens = get_settings().rag_context_max_tokens
     for chunk in chunks:
-        snippet = compact_snippet(chunk.content, max_chars=settings.context_compression_chunk_chars)
-        if used_chars + len(snippet) > settings.answer_context_max_chars:
-            break
-        used_chars += len(snippet)
-        selected.append(
-            RetrievedChunk(
-                chunk_id=chunk.chunk_id,
-                document_id=chunk.document_id,
-                knowledge_base_id=chunk.knowledge_base_id,
-                chunk_index=chunk.chunk_index,
-                content=snippet,
-                score=chunk.score,
-                file_name=chunk.file_name,
-                title_path=chunk.title_path,
-                page_number=chunk.page_number,
-                section_name=chunk.section_name,
-                metadata=chunk.metadata,
-                security_level=chunk.security_level,
-                rrf_score=chunk.rrf_score,
-                retrieval_routes=chunk.retrieval_routes,
-            )
-        )
+        row = format_answer_context_row(chunk, citation_index=len(selected) + 1)
+        row_tokens = count_tokens(row)
+        if used_tokens + row_tokens > max_tokens:
+            continue
+        selected.append(chunk)
+        used_tokens += row_tokens
     return selected
 
 
@@ -66,10 +51,14 @@ def generate_grounded_answer(
 
 
 def format_answer_context(chunks: list[RetrievedChunk]) -> str:
-    rows: list[str] = []
-    for index, chunk in enumerate(chunks, start=1):
-        rows.append(f"[{index}] 来源：{chunk.file_name}，chunk #{chunk.chunk_index}\n{chunk.content}")
-    return "\n\n".join(rows)
+    return "\n\n".join(
+        format_answer_context_row(chunk, citation_index=index)
+        for index, chunk in enumerate(chunks, start=1)
+    )
+
+
+def format_answer_context_row(chunk: RetrievedChunk, citation_index: int) -> str:
+    return f"[{citation_index}] 来源：{chunk.file_name}，chunk #{chunk.chunk_index}\n{chunk.content}"
 
 
 def compact_snippet(text: str, max_chars: int) -> str:

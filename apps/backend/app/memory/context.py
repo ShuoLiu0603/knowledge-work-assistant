@@ -94,8 +94,7 @@ def format_memory_context(
         f"Conversation summary:\n{summary}\n\n"
         f"Recent conversation:\n{recent}"
     )
-    context = budget.truncate(context, budget.limit)
-    return truncate_chars(context, max_chars) if len(context) > max_chars else context
+    return budget.truncate(context, budget.limit)
 
 
 def allocate_section_budgets(budget: "TextBudget", available: int, has_content: dict[str, bool]) -> dict[str, int]:
@@ -158,6 +157,75 @@ def split_profile_memories(memories: list[dict]) -> tuple[list[dict], list[dict]
         else:
             semantic.append(memory)
     return profiles, semantic
+
+
+def build_memory_compression_sources(
+    long_memories: list[dict],
+    short_memory: list[dict],
+    conversation_summary: str | None,
+    profile_memories: list[dict],
+    max_long_memories: int,
+) -> list[dict]:
+    sources: list[dict] = []
+    for index, memory in enumerate(prioritize_profile_memories(profile_memories)):
+        content = normalize_text(str(memory.get("content") or ""))
+        if content:
+            sources.append(
+                {
+                    "id": str(memory.get("id") or f"profile:{index}"),
+                    "section": "profile",
+                    "content": content,
+                    "protected": True,
+                }
+            )
+    for index, memory in enumerate(prioritize_memories(long_memories)[:max_long_memories]):
+        content = normalize_text(str(memory.get("content") or ""))
+        if content:
+            sources.append(
+                {
+                    "id": str(memory.get("id") or f"long_term:{index}"),
+                    "section": "long_term",
+                    "content": content,
+                    "protected": bool(memory.get("pinned")) or normalize_key(memory.get("kind")) == "instruction",
+                }
+            )
+    if conversation_summary and conversation_summary.strip():
+        sources.append(
+            {
+                "id": "conversation_summary",
+                "section": "summary",
+                "content": conversation_summary.strip(),
+                "protected": False,
+            }
+        )
+    for index, item in enumerate(short_memory):
+        content = normalize_text(str(item.get("content") or ""))
+        if content:
+            sources.append(
+                {
+                    "id": f"recent:{index}",
+                    "section": "recent",
+                    "content": f"{item.get('role')}: {content}",
+                    "protected": index >= max(0, len(short_memory) - 2),
+                }
+            )
+    return sources
+
+
+def render_memory_sources(sources: list[dict]) -> str:
+    grouped = {"profile": [], "long_term": [], "summary": [], "recent": []}
+    for source in sources:
+        grouped[str(source["section"])].append(f"- {source['content']}")
+    return (
+        f"Stable preferences and profile:\n{join_lines_or_none(grouped['profile'])}\n\n"
+        f"Relevant long-term memories:\n{join_lines_or_none(grouped['long_term'])}\n\n"
+        f"Conversation summary:\n{join_lines_or_none(grouped['summary'])}\n\n"
+        f"Recent conversation:\n{join_lines_or_none(grouped['recent'])}"
+    )
+
+
+def join_lines_or_none(values: list[str]) -> str:
+    return "\n".join(values) if values else f"- {EMPTY_VALUE}"
 
 
 def budgeted_lines(values: list[object], limit: int, budget: "TextBudget") -> str:

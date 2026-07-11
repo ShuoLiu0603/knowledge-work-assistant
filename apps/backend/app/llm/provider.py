@@ -148,7 +148,15 @@ class LlmProvider:
         text: str,
         request_text: str = "",
         style_context: str = "",
+        target_tokens: int | None = None,
     ) -> LlmCompletion:
+        length_rule = (
+            f" The complete response must contain no more than {target_tokens} tokens. "
+            "End at a complete sentence and prioritize decisions, active facts, corrections, dates, and "
+            "unresolved items."
+            if target_tokens is not None
+            else ""
+        )
         return self.complete_with_metadata(
             [
                 LlmMessage(
@@ -161,6 +169,7 @@ class LlmProvider:
                         "Style memory may influence language, tone, brevity, or format only; never use it as "
                         "factual evidence. Preserve citation markers already present in the source when they "
                         "support summarized claims. If the source is empty or insufficient, say so plainly."
+                        + length_rule
                     ),
                 ),
                 LlmMessage(
@@ -325,8 +334,7 @@ class LlmProvider:
             "== Fields ==\n"
             "kind - Type of information:\n"
             "  preference: likes/dislikes, communication style\n"
-            "  profile: identity, name, role, company, background\n"
-            "  project: tech stack, codebase, tools, project context\n"
+            "  profile: identity, name, role, company, background, current work and project context\n"
             "  instruction: behavioral directives (\"always do X\", \"never do Y\")\n\n"
             "category - Fine-grained topic:\n"
             "  general (default), response_detail (verbosity), language,\n"
@@ -342,7 +350,7 @@ class LlmProvider:
             "  low: work-related, non-private. Eligible for create/update/supersede or pending.\n"
             "  medium: somewhat personal. Do not save from chat; return ignore.\n"
             "  high: private/confidential. Do not save from chat; return ignore.\n"
-            "  Use low for most work-related preferences, roles, projects, and instructions.\n\n"
+            "  Use low for most work-related preferences, roles, project context, and instructions.\n\n"
             "importance - How essential (low / medium / high):\n"
             "  low: nice to have; medium: useful context; high: critical identity/instruction\n\n"
             "evidence - The exact user phrase supporting this memory.\n"

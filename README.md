@@ -110,8 +110,6 @@ EMBEDDING_API_KEY=replace-me
 EMBEDDING_MODEL=your-embedding-model
 EMBEDDING_DIMENSION=1024
 ```
-
-
 `EMBEDDING_DIMENSION` 必须与模型实际输出一致。修改模型或维度后，需要重建对应的 Qdrant collection；已有向量不会自动迁移。
 =======
 

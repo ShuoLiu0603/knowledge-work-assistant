@@ -161,7 +161,7 @@ python scripts/smoke_demo.py
 
 环境变量在进程启动时读取。修改后应重启 backend、worker 和 Beat。不要提交本地 `.env` 或任何真实凭据。
 
-<<<<<<< HEAD
+
 默认 Compose 流程假设配置文件是项目根目录的 `.env`。如果使用其他 `--env-file`，还必须将 `APP_ENV_FILE` 设为该文件相对 `infra/*.yml` 的路径，确保 Compose 插值与 backend/worker 读取同一份配置。
 =======
 ## 本地测试

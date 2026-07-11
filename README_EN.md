@@ -208,7 +208,7 @@ Complete at least the following hardening work before deployment:
 - Pin and scan container images and dependencies; add SBOM generation, vulnerability scanning, malicious-file inspection, and supply-chain controls.
 - Run authorization, concurrency, queue recovery, load, fault-injection, and data-recovery tests against the target infrastructure.
 
-<<<<<<< HEAD
+
 ## Repository Layout
 
 ```text

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.api.routes.health import health_check, readiness_check
 from app.core import health as health_module
@@ -42,6 +43,19 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(json.loads(response.body), report)
+
+    def test_worker_check_returns_after_first_celery_ping_reply(self) -> None:
+        control = MagicMock()
+        control.broadcast.return_value = [{"celery@worker": {"ok": "pong"}}]
+        fake_app = SimpleNamespace(control=control)
+
+        with (
+            patch("app.core.health.get_settings", return_value=SimpleNamespace(healthcheck_timeout_seconds=3)),
+            patch("app.workers.celery_app.celery_app", fake_app),
+        ):
+            self.assertEqual(health_module.check_worker(), {"status": "ok"})
+
+        control.broadcast.assert_called_once_with("ping", reply=True, timeout=3, limit=1)
 
 
 if __name__ == "__main__":

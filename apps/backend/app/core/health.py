@@ -83,7 +83,15 @@ def check_worker() -> HealthCheck:
     try:
         from app.workers.celery_app import celery_app
 
-        responses = celery_app.control.inspect(timeout=get_settings().healthcheck_timeout_seconds).ping() or {}
+        responses = (
+            celery_app.control.broadcast(
+                "ping",
+                reply=True,
+                timeout=get_settings().healthcheck_timeout_seconds,
+                limit=1,
+            )
+            or []
+        )
         if not responses:
             raise RuntimeError("No Celery workers responded")
         return ok()

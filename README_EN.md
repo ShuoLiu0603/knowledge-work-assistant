@@ -246,4 +246,4 @@ scripts/            Quality gate, migration verification, smoke demo, and evalua
 
 ## License
 
-This repository currently has no open-source license. Until an explicit `LICENSE` file is added, no permission to copy, modify, or redistribute the source code should be assumed. Select a license compatible with the dependencies and distribution goals before inviting external reuse.
+MIT

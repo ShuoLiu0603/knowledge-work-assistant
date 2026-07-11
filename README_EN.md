@@ -162,7 +162,6 @@ Environment variables are loaded at process startup. Restart the backend, worker
 
 
 The default Compose workflow assumes the configuration file is `.env` in the repository root. When using another `--env-file`, also set `APP_ENV_FILE` to that file's path relative to `infra/*.yml`; this keeps Compose interpolation and the backend/worker service environment on the same configuration source.
-=======
 
 ## Local Testing
 
@@ -232,7 +231,7 @@ scripts/            Quality gate, migration verification, smoke demo, and evalua
 - [RAG Evaluation (Chinese)](docs/evaluation.md)
 - [Production Deployment](docs/production_deployment.md)
 - [Demo Data (Chinese)](demo/README.md)
-=======
+
 ## Known Limitations
 
 - No cross-encoder reranker is currently active; retrieval fusion relies on Dense, BM25, and weighted RRF.

@@ -4,29 +4,23 @@ from sqlalchemy.engine.reflection import Inspector
 
 from app.db.base import Base
 
-PROFILE_SINGLETON_SLOTS = (
+CORE_PROFILE_SINGLETON_SLOTS = (
     "response_detail",
     "language",
     "format",
     "name",
-    "company",
-    "team",
+    "preferred_address",
     "current_role",
+    "tone",
+    "accessibility",
 )
-PROJECT_SINGLETON_SLOTS = (
-    "current_project",
-    "current_stack",
-    "backend_framework",
-    "frontend_framework",
-)
-PROFILE_MEMORY_CATEGORIES = PROFILE_SINGLETON_SLOTS + ("role", "profile", "background")
-PROJECT_STICKY_CATEGORIES = PROJECT_SINGLETON_SLOTS + ("architecture", "tooling")
-STICKY_MEMORY_CATEGORIES = PROFILE_MEMORY_CATEGORIES + PROJECT_STICKY_CATEGORIES
-SINGLETON_MEMORY_SLOTS = PROFILE_SINGLETON_SLOTS + PROJECT_SINGLETON_SLOTS
-PROFILE_SINGLETON_SLOT_SQL = ", ".join(f"'{slot}'" for slot in PROFILE_SINGLETON_SLOTS)
-PROJECT_SINGLETON_SLOT_SQL = ", ".join(f"'{slot}'" for slot in PROJECT_SINGLETON_SLOTS)
-STICKY_MEMORY_CATEGORY_SQL = ", ".join(f"'{category}'" for category in STICKY_MEMORY_CATEGORIES)
-SINGLETON_MEMORY_SLOT_SQL = ", ".join(f"'{slot}'" for slot in SINGLETON_MEMORY_SLOTS)
+CORE_PROFILE_CATEGORIES = CORE_PROFILE_SINGLETON_SLOTS + ("global_instruction",)
+EPISODIC_MEMORY_CATEGORIES = ("decision", "event", "task")
+PROCEDURAL_MEMORY_CATEGORIES = ("workflow", "task_instruction", "domain_rule")
+CORE_PROFILE_CATEGORY_SQL = ", ".join(f"'{category}'" for category in CORE_PROFILE_CATEGORIES)
+CORE_PROFILE_SINGLETON_SLOT_SQL = ", ".join(f"'{slot}'" for slot in CORE_PROFILE_SINGLETON_SLOTS)
+EPISODIC_MEMORY_CATEGORY_SQL = ", ".join(f"'{category}'" for category in EPISODIC_MEMORY_CATEGORIES)
+PROCEDURAL_MEMORY_CATEGORY_SQL = ", ".join(f"'{category}'" for category in PROCEDURAL_MEMORY_CATEGORIES)
 
 
 def ensure_runtime_schema(engine: Engine) -> None:
@@ -200,25 +194,17 @@ def ensure_runtime_schema(engine: Engine) -> None:
                 f"""
                 UPDATE user_memories
                 SET memory_layer = CASE
-                    WHEN category IN ({STICKY_MEMORY_CATEGORY_SQL})
-                         OR kind IN ('profile', 'instruction')
-                    THEN 'profile'
-                    ELSE memory_layer
+                    WHEN category IN ({CORE_PROFILE_CATEGORY_SQL}) THEN 'profile'
+                    WHEN category IN ({EPISODIC_MEMORY_CATEGORY_SQL}) THEN 'episodic'
+                    WHEN kind = 'instruction'
+                         OR category IN ({PROCEDURAL_MEMORY_CATEGORY_SQL})
+                    THEN 'procedural'
+                    ELSE 'semantic'
+                END,
+                profile_slot = CASE
+                    WHEN category IN ({CORE_PROFILE_SINGLETON_SLOT_SQL}) THEN category
+                    ELSE ''
                 END
-                WHERE memory_layer = 'semantic'
-                """
-            )
-        )
-        connection.execute(
-            text(
-                f"""
-                UPDATE user_memories
-                SET profile_slot = CASE
-                    WHEN category IN ({STICKY_MEMORY_CATEGORY_SQL}) THEN category
-                    WHEN kind IN ('profile', 'instruction') THEN category
-                    ELSE profile_slot
-                END
-                WHERE profile_slot = ''
                 """
             )
         )
@@ -245,18 +231,7 @@ def ensure_runtime_schema(engine: Engine) -> None:
                 SET canonical_key = 'profile:' || profile_slot
                 WHERE canonical_key = ''
                   AND memory_layer = 'profile'
-                  AND profile_slot IN ({PROFILE_SINGLETON_SLOT_SQL})
-                """
-            )
-        )
-        connection.execute(
-            text(
-                f"""
-                UPDATE user_memories
-                SET canonical_key = 'project:' || profile_slot
-                WHERE canonical_key = ''
-                  AND memory_layer = 'profile'
-                  AND profile_slot IN ({PROJECT_SINGLETON_SLOT_SQL})
+                  AND profile_slot IN ({CORE_PROFILE_SINGLETON_SLOT_SQL})
                 """
             )
         )
@@ -264,8 +239,8 @@ def ensure_runtime_schema(engine: Engine) -> None:
         pinned_false = "false" if dialect == "postgresql" else "0"
         connection.execute(
             text(
-                f"UPDATE user_memories SET pinned = {pinned_true} "
-                f"WHERE memory_layer = 'profile' AND pinned = {pinned_false}"
+                f"UPDATE user_memories SET pinned = CASE "
+                f"WHEN memory_layer = 'profile' THEN {pinned_true} ELSE {pinned_false} END"
             )
         )
         connection.execute(
@@ -285,7 +260,7 @@ def ensure_runtime_schema(engine: Engine) -> None:
                     FROM user_memories
                     WHERE status = 'active'
                       AND memory_layer = 'profile'
-                      AND profile_slot IN ({SINGLETON_MEMORY_SLOT_SQL})
+                      AND profile_slot IN ({CORE_PROFILE_SINGLETON_SLOT_SQL})
                 )
                 UPDATE user_memories
                 SET status = 'superseded',
@@ -383,7 +358,7 @@ def create_profile_singleton_unique_index_if_supported(engine: Engine, inspector
                 ON user_memories (user_id, scope_type, scope_id, profile_slot)
                 WHERE status = 'active'
                   AND memory_layer = 'profile'
-                  AND profile_slot IN ({SINGLETON_MEMORY_SLOT_SQL})
+                  AND profile_slot IN ({CORE_PROFILE_SINGLETON_SLOT_SQL})
                 """
             )
         )

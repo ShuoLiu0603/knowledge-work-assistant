@@ -1,5 +1,4 @@
 from datetime import datetime
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -8,7 +7,6 @@ class UserMemoryCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content: str = Field(min_length=1, max_length=2000)
-    kind: Literal["preference", "profile", "instruction"] = "preference"
     confirm_sensitive: bool = False
 
 
@@ -18,7 +16,6 @@ class UserMemoryUpdate(BaseModel):
     expected_revision: int | None = Field(default=None, ge=1)
     content: str | None = Field(default=None, min_length=1, max_length=2000)
     status: str | None = Field(default=None, max_length=30)
-    kind: Literal["preference", "profile", "instruction"] | None = None
     confirm_sensitive: bool = False
 
 

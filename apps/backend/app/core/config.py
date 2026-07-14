@@ -29,7 +29,6 @@ INSECURE_PRODUCTION_VALUES = {
 INSECURE_PRODUCTION_MARKERS = ("replace-with", "replace_me", "your-", "example")
 MIN_PRODUCTION_JWT_SECRET_LENGTH = 32
 ALLOWED_MEMORY_UPDATE_MODES = {"sync", "async", "disabled"}
-ALLOWED_AGENT_GRAPH_BACKENDS = {"langgraph", "sequential"}
 ALLOWED_MODEL_PROVIDERS = {"openai_compatible"}
 ALLOWED_JWT_ALGORITHMS = {"HS256"}
 
@@ -66,20 +65,18 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_timeout_seconds: int = Field(default=30, gt=0)
     llm_default_temperature: float = Field(default=0.1, ge=0, le=2)
-    llm_intent_temperature: float = Field(default=0.0, ge=0, le=2)
     llm_summary_temperature: float = Field(default=0.2, ge=0, le=2)
-    llm_writing_temperature: float = Field(default=0.3, ge=0, le=2)
-    llm_chat_temperature: float = Field(default=0.2, ge=0, le=2)
-    llm_rag_temperature: float = Field(default=0.2, ge=0, le=2)
-    llm_memory_answer_temperature: float = Field(default=0.2, ge=0, le=2)
     llm_memory_editor_temperature: float = Field(default=0.0, ge=0, le=2)
-    llm_query_rewrite_temperature: float = Field(default=0.0, ge=0, le=2)
     llm_context_compression_temperature: float = Field(default=0.0, ge=0, le=2)
-    agent_graph_backend: str = "langgraph"
     agent_stream_max_concurrency: int = Field(default=8, ge=1, le=256)
     agent_stream_queue_maxsize: int = Field(default=128, ge=1)
     agent_stream_min_timeout_seconds: float = Field(default=30.0, gt=0)
-    agent_stream_timeout_llm_calls: int = Field(default=4, ge=1)
+    agent_stream_timeout_llm_calls: int = Field(default=8, ge=1)
+    agent_max_model_calls: int = Field(default=6, ge=2, le=20)
+    agent_max_tool_calls: int = Field(default=4, ge=1, le=20)
+    agent_max_memory_calls: int = Field(default=2, ge=0, le=10)
+    agent_max_rag_calls: int = Field(default=3, ge=0, le=10)
+    agent_tool_observation_max_chars: int = Field(default=2400, ge=200, le=20000)
     conversation_lease_grace_seconds: int = Field(default=30, ge=0)
     conversation_summary_dispatch_queue_size: int = Field(default=256, ge=1)
     short_memory_max_messages: int = Field(default=12, ge=1)
@@ -146,17 +143,10 @@ class Settings(BaseSettings):
     embedding_timeout_seconds: int = Field(default=30, gt=0)
     retrieval_top_k: int = Field(default=5, ge=1)
     retrieval_route_limit: int = Field(default=8, ge=1)
-    retrieval_max_route_queries: int = Field(default=4, ge=1)
-    retrieval_original_query_weight: float = Field(default=1.2, gt=0)
-    retrieval_rewrite_query_weight: float = Field(default=1.1, gt=0)
-    retrieval_subquery_weight: float = Field(default=1.0, gt=0)
     retrieval_dense_prefilter_multiplier: int = Field(default=4, ge=1)
     retrieval_bm25_prefilter_terms: int = Field(default=12, ge=1)
     retrieval_max_matched_terms: int = Field(default=32, ge=1)
     rrf_k: int = Field(default=60, ge=1)
-    query_rewrite_max_chars: int = Field(default=300, ge=1)
-    query_rewrite_subquery_max_chars: int = Field(default=300, ge=1)
-    query_rewrite_max_subqueries: int = Field(default=3, ge=0)
     question_max_tokens: int = Field(default=1000, ge=1)
     rag_context_max_tokens: int = Field(default=6000, ge=1)
     context_compression_target_ratio: float = Field(default=0.9, gt=0, le=1)
@@ -185,16 +175,6 @@ class Settings(BaseSettings):
             if normalized not in APP_ENV_ALIASES:
                 raise ValueError(f"APP_ENV must be one of {', '.join(sorted(APP_ENV_ALIASES))}")
             return APP_ENV_ALIASES[normalized]
-        return value
-
-    @field_validator("agent_graph_backend", mode="before")
-    @classmethod
-    def validate_agent_graph_backend(cls, value: object) -> object:
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized not in ALLOWED_AGENT_GRAPH_BACKENDS:
-                raise ValueError("AGENT_GRAPH_BACKEND must be langgraph or sequential")
-            return normalized
         return value
 
     @field_validator("memory_update_mode", mode="before")

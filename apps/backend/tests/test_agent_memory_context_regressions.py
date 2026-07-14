@@ -2,33 +2,14 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from app.agents.memory_agent import filter_memory_history, load_memory_context
-from app.agents.state import AgentGraphState
+from app.agents.memory_agent import filter_memory_history, load_core_memory_context
+from app.agents.state import AgentRunState
 from app.db.models.conversation import Conversation, Message
 from helpers import create_user, isolated_session
-
-
-def memory(memory_id: str, *, profile: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        id=memory_id,
-        content=f"memory {memory_id}",
-        category="preference" if profile else "project",
-        kind="profile" if profile else "fact",
-        status="active",
-        memory_layer="profile" if profile else "semantic",
-        canonical_key=None,
-        profile_slot=None,
-        scope_type="global",
-        scope_id=None,
-        pinned=profile,
-        revision=1,
-        extra_metadata={},
-    )
 
 
 class AgentMemoryContextRegressionTests(unittest.TestCase):
@@ -57,21 +38,29 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
         self.assertEqual(metadata["private_turn_message_count"], 2)
         self.assertTrue(metadata["current_turn_removed"])
 
-    def test_load_context_uses_one_profile_aware_recall_and_filtered_history(self) -> None:
+    def test_load_context_injects_core_profile_without_semantic_recall(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "memory-context@example.com", "Memory Context")
             conversation = Conversation(user_id=user.id, title="Context", search_scope="accessible")
             session.add(conversation)
             session.commit()
             session.refresh(conversation)
-            state = AgentGraphState(
+            state = AgentRunState(
                 user_id=user.id,
                 knowledge_base_id=None,
                 conversation_id=conversation.id,
                 message_id="current-message",
                 input="current question",
             )
-            loaded = [memory("profile", profile=True), memory("semantic", profile=False)]
+            loaded = [
+                {
+                    "id": "profile",
+                    "content": "User prefers Chinese answers",
+                    "category": "language",
+                    "kind": "preference",
+                    "memory_layer": "profile",
+                }
+            ]
             captured: dict = {}
 
             def build_context(*args, **kwargs) -> str:
@@ -87,16 +76,15 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
                         {"role": "user", "content": "current question"},
                     ],
                 ),
-                patch("app.agents.memory_agent.retrieve_relevant_memories", return_value=loaded) as retrieve,
+                patch("app.agents.memory_agent.list_core_profile_context", return_value=loaded),
+                patch("app.agents.memory_agent.retrieve_relevant_memories") as retrieve,
                 patch("app.agents.memory_agent.build_memory_context_for_question", side_effect=build_context),
             ):
-                load_memory_context(session, state)
+                load_core_memory_context(session, state)
 
-            retrieve.assert_called_once()
-            self.assertTrue(retrieve.call_args.kwargs["include_profile"])
-            self.assertEqual(retrieve.call_args.kwargs["limit"], 25)
+            retrieve.assert_not_called()
             self.assertEqual([item["id"] for item in state.profile_memories], ["profile"])
-            self.assertEqual([item["id"] for item in state.long_term_memories], ["semantic"])
+            self.assertEqual(state.long_term_memories, [])
             self.assertEqual(
                 captured["preloaded_short_memory"],
                 [
@@ -114,7 +102,7 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
             session.add(conversation)
             session.commit()
             session.refresh(conversation)
-            state = AgentGraphState(
+            state = AgentRunState(
                 user_id=caller.id,
                 knowledge_base_id=None,
                 conversation_id=conversation.id,
@@ -122,7 +110,7 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
             )
 
             with self.assertRaises(HTTPException) as raised:
-                load_memory_context(session, state)
+                load_core_memory_context(session, state)
 
             self.assertEqual(raised.exception.status_code, 404)
 
@@ -173,7 +161,7 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
             session.commit()
             current = messages[-1]
 
-            state = AgentGraphState(
+            state = AgentRunState(
                 user_id=user.id,
                 knowledge_base_id=None,
                 conversation_id=conversation.id,
@@ -188,9 +176,9 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
 
             with (
                 patch("app.agents.memory_agent.get_short_term_memory", return_value=redis_window),
-                patch("app.agents.memory_agent.retrieve_relevant_memories", return_value=[]),
+                patch("app.agents.memory_agent.list_core_profile_context", return_value=[]),
             ):
-                load_memory_context(session, state)
+                load_core_memory_context(session, state)
 
             self.assertNotIn("PRIVATE_SECRET", state.memory_context)
             self.assertNotIn("PRIVATE_REPLY", state.memory_context)

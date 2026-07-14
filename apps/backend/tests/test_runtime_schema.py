@@ -11,11 +11,12 @@ import app.db.models  # noqa: F401
 from app.db.base import Base
 from app.db.models.user_memory import UserMemory
 from app.db.runtime_schema import ensure_runtime_schema
+from app.memory.repository import list_recent_active_memories
 from helpers import create_user
 
 
 class RuntimeSchemaTests(unittest.TestCase):
-    def test_runtime_schema_migrates_legacy_project_memory_to_profile(self) -> None:
+    def test_runtime_schema_migrates_legacy_project_memory_to_on_demand_semantic(self) -> None:
         engine = create_engine(
             "sqlite+pysqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -57,6 +58,16 @@ class RuntimeSchemaTests(unittest.TestCase):
                 self.assertEqual(migrated.kind, "profile")
                 self.assertEqual(migrated.category, "current_project")
                 self.assertEqual(migrated.canonical_key, "project:current_project")
+                self.assertEqual(migrated.memory_layer, "semantic")
+                self.assertEqual(migrated.profile_slot, "")
+                self.assertFalse(migrated.pinned)
+                recalled_candidates = list_recent_active_memories(
+                    session,
+                    migrated.user_id,
+                    limit=10,
+                    include_profile=False,
+                )
+                self.assertIn(migrated.id, [memory.id for memory in recalled_candidates])
         finally:
             Base.metadata.drop_all(engine)
             engine.dispose()

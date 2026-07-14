@@ -116,10 +116,7 @@ def active_memory_filters(user_id: str, now: datetime) -> tuple:
 def profile_memory_filter():
     return or_(
         UserMemory.memory_layer == "profile",
-        UserMemory.pinned.is_(True),
-        UserMemory.profile_slot != "",
-        UserMemory.category.in_(policy.STICKY_MEMORY_CATEGORIES),
-        UserMemory.kind.in_(policy.PROFILE_MEMORY_KINDS),
+        UserMemory.category.in_(policy.CORE_PROFILE_CATEGORIES),
     )
 
 

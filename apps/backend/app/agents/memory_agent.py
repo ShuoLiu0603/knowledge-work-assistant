@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.agents.state import AgentGraphState, add_trace
+from app.agents.state import AgentRunState, add_trace
 from app.core.config import get_settings
 from app.db.models.conversation import Conversation
 from app.memory.jobs import (
@@ -12,7 +12,6 @@ from app.memory.jobs import (
     dispatch_memory_update_job,
     record_memory_update_job_dispatch_failure,
 )
-from app.memory import policy as memory_policy
 from app.services.memory_service import (
     build_memory_context_for_question,
     filter_memory_history_messages,
@@ -20,6 +19,7 @@ from app.services.memory_service import (
     get_conversation_memory_context_messages,
     get_recent_db_messages,
     get_short_term_memory,
+    list_core_profile_context,
     process_user_memory,
     retrieve_relevant_memories,
     should_skip_memory_for_turn,
@@ -31,7 +31,7 @@ PROFILE_MEMORY_LIMIT = get_settings().memory_profile_limit
 SEMANTIC_MEMORY_LIMIT = get_settings().memory_semantic_limit
 
 
-def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
+def load_core_memory_context(db: Session, state: AgentRunState) -> AgentRunState:
     if state.memory_enabled is None:
         state.memory_enabled = not should_skip_memory_for_turn(state.input)
     if not state.memory_enabled:
@@ -40,6 +40,7 @@ def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
         state.profile_memories = []
         state.long_term_memories = []
         state.memory_context = format_memory_context([], [], None, profile_memories=[])
+        state.core_memory_context = state.memory_context
         add_trace(
             state,
             node="memory_agent",
@@ -70,19 +71,8 @@ def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
             current_message_id=state.message_id,
         )
 
-    memories = retrieve_relevant_memories(
-        db,
-        state.user_id,
-        state.input,
-        limit=PROFILE_MEMORY_LIMIT + SEMANTIC_MEMORY_LIMIT,
-        conversation_id=state.conversation_id,
-        message_id=state.message_id,
-        include_profile=True,
-    )
-    profiles = [memory for memory in memories if memory_policy.is_profile_memory(memory)]
-    semantic_memories = [memory for memory in memories if not memory_policy.is_profile_memory(memory)]
-    state.profile_memories = [memory_to_dict(memory) for memory in profiles]
-    state.long_term_memories = [memory_to_dict(memory) for memory in semantic_memories]
+    state.profile_memories = list_core_profile_context(db, state.user_id, limit=PROFILE_MEMORY_LIMIT)
+    state.long_term_memories = []
     state.memory_context = build_memory_context_for_question(
         db,
         state.user_id,
@@ -93,10 +83,11 @@ def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
         preloaded_profile_memories=state.profile_memories,
         conversation_summary=state.conversation_summary,
     )
+    state.core_memory_context = state.memory_context
     add_trace(
         state,
         node="memory_agent",
-        action="load_context",
+        action="load_core_context",
         input_data={"conversation_id": state.conversation_id},
         output_data={
             "short_term_memory_count": len(state.short_term_memory),
@@ -108,6 +99,39 @@ def load_memory_context(db: Session, state: AgentGraphState) -> AgentGraphState:
         },
     )
     return state
+
+
+def recall_long_term_memory(db: Session, state: AgentRunState, query: str) -> list[dict]:
+    if not state.memory_enabled:
+        return []
+    memories = retrieve_relevant_memories(
+        db,
+        state.user_id,
+        query,
+        limit=SEMANTIC_MEMORY_LIMIT,
+        conversation_id=state.conversation_id,
+        message_id=state.message_id,
+        include_profile=False,
+    )
+    recalled = [memory_to_dict(memory) for memory in memories]
+    existing_ids = {memory.get("id") for memory in state.long_term_memories}
+    for memory in recalled:
+        if memory.get("id") in existing_ids:
+            continue
+        state.long_term_memories.append(memory)
+        existing_ids.add(memory.get("id"))
+    state.memory_recalled = True
+    state.memory_context = build_memory_context_for_question(
+        db,
+        state.user_id,
+        state.input,
+        conversation_id=state.conversation_id,
+        preloaded_short_memory=state.short_term_memory,
+        preloaded_long_memories=state.long_term_memories,
+        preloaded_profile_memories=state.profile_memories,
+        conversation_summary=state.conversation_summary,
+    )
+    return recalled
 
 
 def filter_memory_history(
@@ -137,11 +161,16 @@ def memory_to_dict(memory) -> dict:
         "scope_id": memory.scope_id,
         "pinned": memory.pinned,
         "revision": memory.revision,
-        "metadata": memory.extra_metadata or {},
+        "metadata": {
+            **(memory.extra_metadata or {}),
+            "canonical_key": memory.canonical_key,
+            "memory_layer": memory.memory_layer,
+            "profile_slot": memory.profile_slot,
+        },
     }
 
 
-def update_user_memories(db: Session, state: AgentGraphState) -> AgentGraphState:
+def update_user_memories(db: Session, state: AgentRunState) -> AgentRunState:
     if state.defer_memory_update:
         state.memory_actions = [
             {
@@ -239,7 +268,7 @@ def update_user_memories(db: Session, state: AgentGraphState) -> AgentGraphState
     return state
 
 
-def enqueue_user_memory_update(db: Session, state: AgentGraphState) -> AgentGraphState:
+def enqueue_user_memory_update(db: Session, state: AgentRunState) -> AgentRunState:
     try:
         job = create_memory_update_job(
             db,

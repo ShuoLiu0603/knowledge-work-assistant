@@ -21,26 +21,47 @@ SUMMARY_DELTA_MAX_CHARS = _SETTINGS.memory_summary_delta_max_chars
 FULL_MEMORY_RECALL_LIMIT = _SETTINGS.memory_full_recall_limit
 CANONICAL_KEY_MAX_LENGTH = 160
 
-PROFILE_SINGLETON_CATEGORIES = {
+CORE_PROFILE_SINGLETON_CATEGORIES = {
     "response_detail",
     "language",
     "format",
     "name",
+    "preferred_address",
+    "current_role",
+    "tone",
+    "accessibility",
+}
+CORE_PROFILE_CATEGORIES = CORE_PROFILE_SINGLETON_CATEGORIES | {"global_instruction"}
+ON_DEMAND_SINGLETON_CATEGORIES = {
     "company",
     "team",
-    "current_role",
-}
-PROJECT_SINGLETON_CATEGORIES = {
     "current_project",
     "current_stack",
     "backend_framework",
     "frontend_framework",
 }
-SINGLETON_MEMORY_CATEGORIES = PROFILE_SINGLETON_CATEGORIES | PROJECT_SINGLETON_CATEGORIES
-PROFILE_MEMORY_CATEGORIES = PROFILE_SINGLETON_CATEGORIES | {"role", "profile", "background"}
-PROJECT_STICKY_CATEGORIES = PROJECT_SINGLETON_CATEGORIES | {"architecture", "tooling"}
-STICKY_MEMORY_CATEGORIES = PROFILE_MEMORY_CATEGORIES | PROJECT_STICKY_CATEGORIES
-PROFILE_MEMORY_KINDS = {"profile", "instruction"}
+EPISODIC_MEMORY_CATEGORIES = {"decision", "event", "task"}
+PROCEDURAL_MEMORY_CATEGORIES = {"workflow", "task_instruction", "domain_rule"}
+GLOBAL_INSTRUCTION_MARKERS = (
+    "所有回复",
+    "每次回复",
+    "以后都",
+    "所有对话",
+    "每次对话",
+    "任何对话",
+    "全局",
+    "始终使用",
+    "all responses",
+    "every response",
+    "all conversations",
+    "every conversation",
+    "from now on always",
+    "globally",
+)
+
+# Kept as a public alias for callers that display memory governance metrics.
+# "Sticky" now means core profile only; pinning and importance never change layers.
+STICKY_MEMORY_CATEGORIES = CORE_PROFILE_CATEGORIES
 
 MEMORY_RECALL_MARKERS = (
     "\u4f60\u8bb0\u5f97",
@@ -242,6 +263,11 @@ def should_ignore_memory_request(text: str) -> bool:
     return any(marker in normalized for marker in DO_NOT_REMEMBER_MARKERS)
 
 
+def is_explicit_global_instruction(text: str) -> bool:
+    normalized = normalize_query_text(text)
+    return any(marker in normalized for marker in GLOBAL_INSTRUCTION_MARKERS)
+
+
 def should_skip_memory_for_turn(text: str) -> bool:
     normalized = normalize_query_text(text)
     return any(marker in normalized for marker in (*NO_MEMORY_TURN_MARKERS, *DO_NOT_REMEMBER_MARKERS))
@@ -414,13 +440,12 @@ def resolve_memory_category(candidate: Any) -> str:
 
 def is_profile_memory(memory: Any) -> bool:
     memory_layer = normalize_key(get_memory_field(memory, "memory_layer"))
-    if memory_layer == "profile":
-        return True
-    if bool(get_memory_field(memory, "pinned")):
-        return True
+    category = get_memory_field(memory, "category")
+    if memory_layer in MEMORY_LAYERS:
+        return memory_layer == "profile" or normalize_key(category) in CORE_PROFILE_CATEGORIES
     metadata = get_memory_metadata(memory)
     return is_profile_memory_payload(
-        get_memory_field(memory, "category"),
+        category,
         get_memory_field(memory, "kind"),
         metadata,
     )
@@ -429,30 +454,34 @@ def is_profile_memory(memory: Any) -> bool:
 def is_profile_memory_payload(category: object, kind: object, metadata: dict | None = None) -> bool:
     metadata = metadata or {}
     layer = normalize_key(metadata.get("memory_layer") or metadata.get("layer"))
-    if layer == "profile" or metadata.get("pinned") is True:
+    if layer == "profile":
         return True
-    return normalize_key(category) in STICKY_MEMORY_CATEGORIES or normalize_key(kind) in PROFILE_MEMORY_KINDS
+    return normalize_key(category) in CORE_PROFILE_CATEGORIES
 
 
 def is_profile_singleton_category(category: object) -> bool:
-    return normalize_key(category) in SINGLETON_MEMORY_CATEGORIES
+    return normalize_key(category) in CORE_PROFILE_SINGLETON_CATEGORIES
 
 
 def is_profile_singleton_slot(profile_slot: object) -> bool:
-    return normalize_key(profile_slot) in SINGLETON_MEMORY_CATEGORIES
+    return normalize_key(profile_slot) in CORE_PROFILE_SINGLETON_CATEGORIES
 
 
 def memory_layer_for_fields(kind: object, category: object, metadata: dict | None = None) -> str:
-    return "profile" if is_profile_memory_payload(category, kind, metadata) else "semantic"
+    normalized_category = normalize_key(category)
+    if is_profile_memory_payload(category, kind, metadata):
+        return "profile"
+    if normalized_category in EPISODIC_MEMORY_CATEGORIES:
+        return "episodic"
+    if normalize_key(kind) == "instruction" or normalized_category in PROCEDURAL_MEMORY_CATEGORIES:
+        return "procedural"
+    return "semantic"
 
 
 def profile_slot_for_fields(kind: object, category: object) -> str:
     normalized_category = normalize_key(category)
-    normalized_kind = normalize_key(kind)
-    if normalized_category in STICKY_MEMORY_CATEGORIES:
+    if normalized_category in CORE_PROFILE_SINGLETON_CATEGORIES:
         return normalized_category
-    if normalized_kind in PROFILE_MEMORY_KINDS:
-        return normalized_category or normalized_kind
     return ""
 
 
@@ -488,15 +517,18 @@ def canonical_key_for_fields(
     explicit = normalize_canonical_key(explicit_key)
     if explicit:
         return explicit
-    slot = profile_slot_for_fields(kind, category)
-    return canonical_key_for_profile_slot(slot)
+    normalized_category = normalize_key(category)
+    if normalized_category in CORE_PROFILE_SINGLETON_CATEGORIES:
+        return f"profile:{normalized_category}"
+    if normalized_category in ON_DEMAND_SINGLETON_CATEGORIES:
+        prefix = "profile" if normalized_category in {"company", "team"} else "project"
+        return f"{prefix}:{normalized_category}"
+    return ""
 
 
 def canonical_key_for_profile_slot(profile_slot: object) -> str:
     slot = normalize_key(profile_slot)
-    if slot in PROJECT_SINGLETON_CATEGORIES:
-        return f"project:{slot}"
-    if slot in PROFILE_SINGLETON_CATEGORIES:
+    if slot in CORE_PROFILE_SINGLETON_CATEGORIES:
         return f"profile:{slot}"
     return ""
 
@@ -515,18 +547,11 @@ def profile_memory_priority(memory: Any) -> float:
         "format": 95,
         "response_detail": 90,
         "name": 88,
-        "company": 84,
-        "team": 82,
+        "preferred_address": 86,
         "current_role": 80,
-        "current_project": 78,
-        "current_stack": 76,
-        "backend_framework": 74,
-        "frontend_framework": 74,
-        "role": 70,
-        "profile": 65,
-        "architecture": 62,
-        "tooling": 62,
-        "instruction": 60,
+        "tone": 78,
+        "accessibility": 76,
+        "global_instruction": 70,
     }
     kind_priority = {
         "instruction": 30,

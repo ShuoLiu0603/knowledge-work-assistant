@@ -11,17 +11,13 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.agents.graph import run_agent_graph
-from app.agents.state import AgentGraphState, AgentRunCancelled, AgentRunTimeout
-from app.agents.summary_agent import summarize_with_rag
-from app.agents.supervisor import route_intent
-from app.agents.writing_agent import draft_with_rag
+from app.agents.runtime import run_agent_turn
+from app.agents.state import AgentRunState, AgentRunCancelled, AgentRunTimeout
 from app.db.models.agent_run import AgentRun
 from app.db.models.conversation import Conversation, Message
 from app.db.models.knowledge_base import KnowledgeBaseMember
 from app.db.models.retrieval_log import RetrievalLog
 from app.db.models.user import User
-from app.llm.provider import LlmCompletion
 from app.schemas.agent import AgentRunRequest, AgentTraceStep
 from app.schemas.conversation import ConversationCreate, StreamMessageRequest
 from app.schemas.knowledge_base import KnowledgeBaseCreate
@@ -42,27 +38,6 @@ from app.services.conversation_service import (
 from app.services.knowledge_base_service import create_knowledge_base
 from app.services.retrieval_log_service import get_retrieval_log, list_retrieval_logs
 from helpers import create_user, isolated_session
-
-
-def completion(content: str) -> LlmCompletion:
-    return LlmCompletion(
-        content=content,
-        provider="openai_compatible",
-        model_name="fake-chat",
-        prompt_tokens=2,
-        completion_tokens=2,
-        total_tokens=4,
-        latency_ms=1,
-        status="success",
-    )
-
-
-class FinalOutputProvider:
-    def summarize_with_metadata(self, text: str, request_text: str = "", style_context: str = "") -> LlmCompletion:
-        return completion("final summary")
-
-    def draft_with_metadata(self, request_text: str, grounding: str, style_context: str = "") -> LlmCompletion:
-        return completion("final draft")
 
 
 class FakeLeaseRedis:
@@ -105,22 +80,22 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AgentRunRequest(input="question", search_scope="unknown")
 
-    def test_run_agent_validates_scope_before_graph(self) -> None:
+    def test_run_agent_validates_scope_before_runtime(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "invalid-scope@example.com", "Invalid Scope")
 
-            with patch("app.services.agent_service.run_agent_graph") as graph:
+            with patch("app.services.agent_service.run_agent_turn") as runtime:
                 with self.assertRaises(HTTPException) as raised:
                     run_agent(session, user.id, None, "question", search_scope="unknown")
 
             self.assertEqual(raised.exception.status_code, 400)
-            graph.assert_not_called()
+            runtime.assert_not_called()
 
-    def test_failed_graph_rolls_back_before_persisting_failed_run(self) -> None:
+    def test_failed_runtime_rolls_back_before_persisting_failed_run(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "failed-run@example.com", "Failed Run")
 
-            def leave_failed_transaction(db, state: AgentGraphState) -> AgentGraphState:
+            def leave_failed_transaction(db, state: AgentRunState) -> AgentRunState:
                 db.add(
                     User(
                         email=user.email,
@@ -133,11 +108,11 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 except IntegrityError:
                     pass
                 state.status = "failed"
-                state.error_message = "graph failed"
+                state.error_message = "runtime failed"
                 return state
 
-            with patch("app.services.agent_service.run_agent_graph", side_effect=leave_failed_transaction):
-                with self.assertRaisesRegex(RuntimeError, "graph failed"):
+            with patch("app.services.agent_service.run_agent_turn", side_effect=leave_failed_transaction):
+                with self.assertRaisesRegex(RuntimeError, "runtime failed"):
                     run_agent(
                         session,
                         user.id,
@@ -149,82 +124,29 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
             failed_run = session.scalar(select(AgentRun).where(AgentRun.user_id == user.id))
             self.assertIsNotNone(failed_run)
             self.assertEqual(failed_run.status, "failed")
-            self.assertEqual(failed_run.error_message, "graph failed")
+            self.assertEqual(failed_run.error_message, "runtime failed")
 
-    def test_graph_preserves_http_errors_and_cancellation(self) -> None:
-        state = AgentGraphState(user_id="user", knowledge_base_id=None, input="question")
+    def test_runtime_preserves_http_errors_and_cancellation(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id=None, input="question")
         http_error = HTTPException(status_code=403, detail="forbidden")
 
-        with (
-            patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-            patch("app.agents.graph._run_sequential_nodes", side_effect=http_error),
-        ):
+        with patch("app.agents.runtime.load_core_memory_context", side_effect=http_error):
             with self.assertRaises(HTTPException) as raised:
-                run_agent_graph(Mock(), state)
+                run_agent_turn(Mock(), state)
         self.assertEqual(raised.exception.status_code, 403)
 
         cancel_event = Event()
         cancel_event.set()
-        cancelled_state = AgentGraphState(
+        cancelled_state = AgentRunState(
             user_id="user",
             knowledge_base_id=None,
             input="question",
             cancel_event=cancel_event,
         )
-        with patch("app.agents.graph._run_sequential_nodes") as sequential:
+        with patch("app.agents.runtime.load_core_memory_context") as load_context:
             with self.assertRaises(AgentRunCancelled):
-                run_agent_graph(Mock(), cancelled_state)
-        sequential.assert_not_called()
-
-    def test_full_memory_recall_routes_without_llm_classification(self) -> None:
-        state = AgentGraphState(
-            user_id="user",
-            knowledge_base_id=None,
-            input="what do you remember about me?",
-        )
-
-        with patch("app.agents.supervisor.get_llm_provider") as get_provider:
-            route_intent(Mock(), state)
-
-        get_provider.assert_not_called()
-        self.assertEqual(state.intent, "memory")
-        self.assertEqual(state.trace[-1]["action"], "route_full_memory_recall")
-
-    def test_summary_and_writing_emit_only_the_final_output(self) -> None:
-        for handler, module_name, expected in (
-            (summarize_with_rag, "summary_agent", "final summary"),
-            (draft_with_rag, "writing_agent", "final draft"),
-        ):
-            with self.subTest(handler=handler.__name__):
-                emitted: list[str] = []
-                state = AgentGraphState(
-                    user_id="user",
-                    knowledge_base_id=None,
-                    input="request",
-                    token_callback=emitted.append,
-                )
-
-                with (
-                    patch(
-                        f"app.agents.{module_name}.retrieve_rag_evidence",
-                        return_value=SimpleNamespace(
-                            chunks=[],
-                            citations=[],
-                            retrieval_log_id="retrieval-log",
-                            searched_knowledge_base_ids=[],
-                        ),
-                    ),
-                    patch(f"app.agents.{module_name}.format_answer_context", return_value="grounding"),
-                    patch(f"app.agents.{module_name}.get_llm_provider", return_value=FinalOutputProvider()),
-                    patch(
-                        f"app.agents.{module_name}.create_llm_call_log",
-                        return_value=SimpleNamespace(id=f"{module_name}-log"),
-                    ),
-                ):
-                    handler(Mock(), state)
-
-                self.assertEqual(state.answer, expected)
-                self.assertEqual(emitted, [expected])
+                run_agent_turn(Mock(), cancelled_state)
+        load_context.assert_not_called()
 
     def test_stream_timeout_is_bounded_and_cancels_worker(self) -> None:
         with isolated_session() as session:
@@ -455,24 +377,24 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 KnowledgeBaseCreate(name="Second", visibility="private"),
             )
 
-            def complete_graph(_db, state: AgentGraphState) -> AgentGraphState:
+            def complete_runtime(_db, state: AgentRunState) -> AgentRunState:
                 retrieval_log = RetrievalLog(
                     user_id=state.user_id,
                     scope_type="accessible",
                     searched_knowledge_base_ids=[first.id, second.id],
-                    question=state.input,
-                    rewritten_query=state.input,
+                    query=state.input,
                 )
                 _db.add(retrieval_log)
                 _db.commit()
                 _db.refresh(retrieval_log)
-                state.intent = "rag"
                 state.retrieval_log_id = retrieval_log.id
+                state.retrieval_log_ids = [retrieval_log.id]
+                state.rag_searched = True
                 state.status = "completed"
                 state.answer = "answer"
                 return state
 
-            with patch("app.services.agent_service.run_agent_graph", side_effect=complete_graph):
+            with patch("app.services.agent_service.run_agent_turn", side_effect=complete_runtime):
                 run = run_agent(
                     session,
                     user.id,
@@ -501,13 +423,12 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
             session.add(membership)
             session.commit()
 
-            def complete_chat(_db, state: AgentGraphState) -> AgentGraphState:
-                state.intent = "chat"
+            def complete_chat(_db, state: AgentRunState) -> AgentRunState:
                 state.status = "completed"
                 state.answer = "hello"
                 return state
 
-            with patch("app.services.agent_service.run_agent_graph", side_effect=complete_chat):
+            with patch("app.services.agent_service.run_agent_turn", side_effect=complete_chat):
                 run = run_agent(
                     session,
                     viewer.id,
@@ -521,18 +442,18 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
             session.commit()
             self.assertEqual(get_agent_run(session, viewer.id, run.id).answer, "hello")
 
-    def test_completed_retrieval_intent_requires_retrieval_provenance(self) -> None:
+    def test_completed_rag_search_requires_retrieval_provenance(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "missing-provenance@example.com", "Missing Provenance")
 
-            def incomplete_rag(_db, state: AgentGraphState) -> AgentGraphState:
-                state.intent = "rag"
+            def incomplete_rag(_db, state: AgentRunState) -> AgentRunState:
+                state.rag_searched = True
                 state.status = "completed"
                 state.answer = "unsupported answer"
                 return state
 
             with (
-                patch("app.services.agent_service.run_agent_graph", side_effect=incomplete_rag),
+                patch("app.services.agent_service.run_agent_turn", side_effect=incomplete_rag),
                 self.assertRaises(RuntimeError) as raised,
             ):
                 run_agent(
@@ -575,7 +496,6 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 user_id=viewer.id,
                 knowledge_base_id=None,
                 input="question",
-                intent="rag",
                 status="completed",
                 answer="sensitive answer",
                 state={"searched_knowledge_base_ids": [first.id, second.id]},
@@ -599,7 +519,6 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 user_id=user.id,
                 knowledge_base_id=None,
                 input="question",
-                intent="rag",
                 status="completed",
                 answer="legacy multi-scope answer",
                 state={"search_scope": "accessible"},
@@ -627,8 +546,7 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 knowledge_base_id=None,
                 scope_type="accessible",
                 searched_knowledge_base_ids=[],
-                question="question",
-                rewritten_query="question",
+                query="question",
                 selected_chunks=[
                     {
                         "knowledge_base_id": kb.id,
@@ -659,8 +577,7 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 knowledge_base_id=None,
                 scope_type="accessible",
                 searched_knowledge_base_ids=[],
-                question="question",
-                rewritten_query="question",
+                query="question",
                 selected_chunks=[{"content_preview": "UNATTRIBUTED_SECRET_PREVIEW"}],
             )
             session.add(log)
@@ -684,7 +601,6 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
             hidden_run = AgentRun(
                 user_id=viewer.id,
                 input="hidden question",
-                intent="rag",
                 status="completed",
                 answer="hidden answer",
                 state={"searched_knowledge_base_ids": [kb.id]},
@@ -692,7 +608,6 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
             visible_run = AgentRun(
                 user_id=viewer.id,
                 input="hello",
-                intent="chat",
                 status="completed",
                 answer="hello",
                 state={"searched_knowledge_base_ids": []},
@@ -701,15 +616,13 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 user_id=viewer.id,
                 scope_type="accessible",
                 searched_knowledge_base_ids=[kb.id],
-                question="hidden question",
-                rewritten_query="hidden question",
+                query="hidden question",
             )
             visible_log = RetrievalLog(
                 user_id=viewer.id,
                 scope_type="accessible",
                 searched_knowledge_base_ids=[],
-                question="empty search",
-                rewritten_query="empty search",
+                query="empty search",
             )
             session.add_all([membership, hidden_run, visible_run, hidden_log, visible_log])
             session.commit()
@@ -746,7 +659,6 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 user_id=viewer.id,
                 conversation_id=conversation.id,
                 input="question",
-                intent="rag",
                 status="completed",
                 answer="answer",
                 state={"searched_knowledge_base_ids": [kb.id]},
@@ -757,8 +669,7 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                 conversation_id=None,
                 scope_type="accessible",
                 searched_knowledge_base_ids=[kb.id],
-                question="question",
-                rewritten_query="question",
+                query="question",
                 selected_chunks=[{"preview": "SECRET_CHUNK"}],
             )
             session.add_all([run, retrieval_log])
@@ -789,10 +700,9 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                     AgentRun(
                         user_id=user.id,
                         input=f"question {index}",
-                        intent="chat",
                         status="completed",
                         answer=f"answer {index}",
-                        state={},
+                        state={"searched_knowledge_base_ids": []},
                     )
                 )
             session.commit()
@@ -822,7 +732,6 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                     knowledge_base_id=args[2],
                     conversation_id=kwargs["conversation_id"],
                     input=args[3],
-                    intent="chat",
                     status="completed",
                     answer="temporary answer",
                     citations=[],
@@ -887,7 +796,6 @@ class AgentRuntimeRegressionTests(unittest.TestCase):
                     knowledge_base_id=args[2],
                     conversation_id=kwargs["conversation_id"],
                     input=args[3],
-                    intent="chat",
                     status="completed",
                     answer="normal answer",
                     state={"memory_enabled": kwargs["memory_enabled"]},

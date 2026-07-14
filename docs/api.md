@@ -105,7 +105,7 @@ SSE 流式响应使用 `text/event-stream`，事件包含 `conversation`、`user
 | POST | `/api/agent-runs` | 运行 Agent 编排流程 |
 | GET | `/api/agent-runs/{run_id}` | 查看单次 Agent run 和 trace |
 
-Agent trace 用于展示 Memory、Supervisor、RAG、Summary、Writing 等节点的执行链路。
+Agent trace 用于展示模型步骤、`memory(query)` / `rag(query)` 工具调用、最终回答与记忆更新链路。
 
 ## 记忆
 

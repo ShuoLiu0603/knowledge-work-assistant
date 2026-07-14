@@ -4,384 +4,212 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sqlalchemy import select
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field
 
-from app.agents.graph import run_agent_graph
-from app.agents.state import AgentGraphState
-from app.db.models.user_memory import UserMemoryUpdateJob
-from app.llm.provider import LlmCompletion
-from app.schemas.knowledge_base import KnowledgeBaseCreate
-from app.services.knowledge_base_service import create_knowledge_base
-from helpers import create_user, isolated_session
-
-
-class FakeAgentLlmProvider:
-    provider_name = "openai_compatible"
-
-    def classify_intent(self, text: str) -> str:
-        return "rag"
-
-    def extract_memory_candidates(self, text: str) -> list[str]:
-        return []
+from app.agents.runtime import build_agent_tools, run_agent_runtime
+from app.agents.state import AgentRunState
+from app.core.config import get_settings
+from app.rag.retrieval import RetrievedChunk
 
 
-class FakeSummaryLlmProvider(FakeAgentLlmProvider):
-    def classify_intent(self, text: str) -> str:
-        return "summary"
+class ScriptedChatModel(BaseChatModel):
+    responses: list[AIMessage]
+    bound_tool_names: list[list[str]] = Field(default_factory=list)
+    system_prompts: list[str] = Field(default_factory=list)
 
-    def summarize_with_metadata(
+    @property
+    def _llm_type(self) -> str:
+        return "scripted-chat-model"
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        self.bound_tool_names.append([tool.name for tool in tools])
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        if not self.responses:
+            raise AssertionError("Scripted model received an unexpected call")
+        self.system_prompts.append(str(messages[0].content))
+        return ChatResult(generations=[ChatGeneration(message=self.responses.pop(0))])
+
+
+def final_answer(content: str) -> AIMessage:
+    return AIMessage(content=content)
+
+
+def tool_call(name: str, query: str, call_id: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": name,
+                "args": {"query": query},
+                "id": call_id,
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def chunk(chunk_id: str, content: str) -> RetrievedChunk:
+    return RetrievedChunk(
+        chunk_id=chunk_id,
+        document_id=f"document-{chunk_id}",
+        knowledge_base_id="kb-1",
+        chunk_index=0,
+        content=content,
+        score=0.9,
+        file_name=f"{chunk_id}.md",
+        title_path=None,
+        page_number=None,
+        section_name=None,
+        metadata={},
+    )
+
+
+def evidence(log_id: str, chunks: list[RetrievedChunk]) -> SimpleNamespace:
+    return SimpleNamespace(
+        chunks=chunks,
+        citations=[],
+        retrieval_log_id=log_id,
+        searched_knowledge_base_ids=["kb-1"],
+    )
+
+
+class AgentRuntimeTests(unittest.TestCase):
+    def run_script(
         self,
-        text: str,
-        request_text: str = "",
-        style_context: str = "",
-    ) -> LlmCompletion:
-        return LlmCompletion(
-            content="最终摘要",
-            provider="openai_compatible",
-            model_name="fake-chat",
-            prompt_tokens=5,
-            completion_tokens=3,
-            total_tokens=8,
-            latency_ms=1,
-            status="success",
+        state: AgentRunState,
+        responses: list[AIMessage],
+        *,
+        memories: list[dict] | None = None,
+        rag_results: list[SimpleNamespace] | None = None,
+        settings_updates: dict | None = None,
+    ):
+        model = ScriptedChatModel(responses=list(responses))
+        settings = get_settings().model_copy(update=settings_updates or {})
+        logs = iter(SimpleNamespace(id=f"llm-log-{index}") for index in range(1, 20))
+        with (
+            patch("app.agents.runtime.create_chat_model", return_value=model),
+            patch("app.agents.runtime.create_llm_call_log", side_effect=lambda *args, **kwargs: next(logs)),
+            patch("app.agents.runtime.recall_long_term_memory", return_value=memories or []) as recall,
+            patch("app.agents.runtime.retrieve_rag_evidence", side_effect=rag_results or []) as retrieve,
+            patch("app.agents.runtime.get_settings", return_value=settings),
+        ):
+            run_agent_runtime(None, state)
+        return model, recall, retrieve
+
+    def test_direct_model_response_finishes_without_tools(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="你好")
+
+        model, recall, retrieve = self.run_script(state, [final_answer("你好，有什么可以帮你？")])
+
+        self.assertEqual(state.answer, "你好，有什么可以帮你？")
+        self.assertEqual(state.model_call_count, 1)
+        self.assertEqual(state.tool_call_count, 0)
+        recall.assert_not_called()
+        retrieve.assert_not_called()
+        self.assertEqual(model.bound_tool_names[0], ["memory", "rag"])
+
+    def test_memory_result_can_be_followed_by_a_final_answer(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="你记得我的项目吗？")
+        memories = [{"id": "memory-1", "category": "current_project", "content": "用户正在构建 Agentic RAG。"}]
+
+        _model, recall, retrieve = self.run_script(
+            state,
+            [tool_call("memory", "当前项目", "memory-1"), final_answer("你正在构建 Agentic RAG。")],
+            memories=memories,
         )
 
+        recall.assert_called_once_with(None, state, "当前项目")
+        retrieve.assert_not_called()
+        self.assertEqual(state.memory_queries, ["当前项目"])
+        self.assertEqual(state.tool_call_count, 1)
 
-class AgentGraphTests(unittest.TestCase):
-    def test_agent_graph_records_supervisor_and_rag_trace(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph@example.com", "AgentGraph")
-            kb = create_knowledge_base(
-                session,
-                user.id,
-                KnowledgeBaseCreate(name="Agent Graph KB", visibility="private"),
-            )
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=kb.id,
-                input="What is the policy?",
-            )
+    def test_memory_miss_does_not_force_rag(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="你记得我的项目吗？")
 
-            with (
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.services.memory_service.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
-            ):
-                build_rag_answer.return_value.answer = "No matching context."
-                build_rag_answer.return_value.citations = []
-                build_rag_answer.return_value.retrieval_log_id = "retrieval-log-id"
-                build_rag_answer.return_value.llm_log_id = "llm-log-id"
+        _model, recall, retrieve = self.run_script(
+            state,
+            [tool_call("memory", "当前项目", "memory-1"), final_answer("保存的记忆中没有找到该项目。")],
+        )
 
-                run_agent_graph(session, state)
+        recall.assert_called_once()
+        retrieve.assert_not_called()
+        self.assertIn("没有找到", state.answer)
 
-            trace_nodes = [step["node"] for step in state.trace]
-            graph_trace = state.trace[-1]
+    def test_agent_can_use_memory_and_multiple_distinct_rag_queries(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="结合我的项目说明差旅和报销制度")
+        first = chunk("chunk-1", "差旅需要提前审批。")
+        second = chunk("chunk-2", "餐费按发票实报实销。")
 
-            self.assertEqual(state.status, "completed")
-            self.assertIn("memory_agent", trace_nodes)
-            self.assertIn("supervisor", trace_nodes)
-            self.assertIn("rag_agent", trace_nodes)
-            self.assertEqual(graph_trace["node"], "graph")
-            self.assertIn(graph_trace["output"]["backend"], {"langgraph", "sequential"})
-            self.assertEqual(state.retrieval_log_id, "retrieval-log-id")
-            self.assertEqual(state.llm_log_id, "llm-log-id")
+        _model, recall, retrieve = self.run_script(
+            state,
+            [
+                tool_call("memory", "当前项目", "memory-1"),
+                tool_call("rag", "差旅审批制度", "rag-1"),
+                tool_call("rag", "餐费报销标准", "rag-2"),
+                final_answer("差旅需提前审批[1]，餐费按发票报销[2]。"),
+            ],
+            memories=[{"id": "memory-1", "category": "current_project", "content": "Agentic RAG"}],
+            rag_results=[evidence("retrieval-1", [first]), evidence("retrieval-2", [second])],
+        )
 
-    def test_agent_graph_can_run_with_sequential_backend(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-sequential@example.com", "AgentGraphSequential")
-            kb = create_knowledge_base(
-                session,
-                user.id,
-                KnowledgeBaseCreate(name="Sequential Agent Graph KB", visibility="private"),
-            )
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=kb.id,
-                input="What is the policy?",
-            )
+        recall.assert_called_once()
+        self.assertEqual([call.args[3] for call in retrieve.call_args_list], ["差旅审批制度", "餐费报销标准"])
+        self.assertEqual(state.rag_queries, ["差旅审批制度", "餐费报销标准"])
+        self.assertEqual(state.retrieval_log_ids, ["retrieval-1", "retrieval-2"])
+        self.assertEqual([citation.chunk_id for citation in state.citations], ["chunk-1", "chunk-2"])
 
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.services.memory_service.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
-            ):
-                build_rag_answer.return_value.answer = "No matching context."
-                build_rag_answer.return_value.citations = []
-                build_rag_answer.return_value.retrieval_log_id = "retrieval-log-id"
-                build_rag_answer.return_value.llm_log_id = "llm-log-id"
+    def test_repeated_rag_query_is_blocked_and_counts_toward_total_budget(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="查询制度")
 
-                run_agent_graph(session, state)
+        _model, _recall, retrieve = self.run_script(
+            state,
+            [
+                tool_call("rag", "差旅制度", "rag-1"),
+                tool_call("rag", "差旅制度", "rag-2"),
+                final_answer("只执行了一次有效检索。"),
+            ],
+            rag_results=[evidence("retrieval-1", [chunk("chunk-1", "差旅制度")])],
+        )
 
-            graph_trace = state.trace[-1]
-            self.assertEqual(state.status, "completed")
-            self.assertEqual(graph_trace["output"]["requested_backend"], "sequential")
-            self.assertEqual(graph_trace["output"]["backend"], "sequential")
+        retrieve.assert_called_once()
+        self.assertEqual(state.tool_call_count, 2)
+        self.assertEqual(state.rag_tool_call_count, 1)
+        self.assertEqual(state.tool_observations[-1]["status"], "duplicate")
 
-    def test_agent_graph_fails_when_langgraph_is_missing(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-missing@example.com", "AgentGraphMissing")
-            kb = create_knowledge_base(
-                session,
-                user.id,
-                KnowledgeBaseCreate(name="Missing Agent Graph KB", visibility="private"),
-            )
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=kb.id,
-                input="What is the policy?",
-            )
+    def test_last_model_call_has_no_tools_and_must_finish(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="回顾信息")
 
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="langgraph")),
-                patch("app.agents.graph._run_langgraph_nodes", side_effect=ImportError("missing langgraph")),
-            ):
-                run_agent_graph(session, state)
+        model, _recall, _retrieve = self.run_script(
+            state,
+            [
+                tool_call("memory", "项目", "memory-1"),
+                tool_call("memory", "偏好", "memory-2"),
+                final_answer("已根据现有信息作答。"),
+            ],
+            settings_updates={"agent_max_model_calls": 3, "agent_max_memory_calls": 3},
+        )
 
-            graph_trace = state.trace[-1]
-            self.assertEqual(state.status, "failed")
-            self.assertEqual(state.error_message, "missing langgraph")
-            self.assertEqual(graph_trace["output"]["requested_backend"], "langgraph")
-            self.assertEqual(graph_trace["output"]["backend"], "langgraph")
-            self.assertEqual(graph_trace["output"]["status"], "failed")
+        self.assertEqual(state.model_call_count, 3)
+        self.assertIn("No tools are available for this step", model.system_prompts[-1])
+        self.assertEqual(state.answer, "已根据现有信息作答。")
 
-    def test_langgraph_returned_state_is_copied_back_to_outer_state(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-returned-state@example.com", "AgentGraphReturnedState")
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=None,
-                input="你好",
-            )
-            returned_state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=None,
-                input="你好",
-                intent="chat",
-                answer="你好，有什么可以帮你？",
-                memory_actions=[{"action": "ignore", "memory_id": None, "content": "", "reason": "test"}],
-                trace=[{"node": "fake_langgraph", "action": "done", "input": {}, "output": {}}],
-            )
+    def test_memory_disabled_exposes_only_rag(self) -> None:
+        state = AgentRunState(
+            user_id="user",
+            knowledge_base_id="kb-1",
+            input="查询制度",
+            memory_enabled=False,
+        )
 
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="langgraph")),
-                patch("app.agents.graph._run_langgraph_nodes", return_value=returned_state),
-            ):
-                run_agent_graph(session, state)
-
-            self.assertEqual(state.intent, "chat")
-            self.assertEqual(state.answer, "你好，有什么可以帮你？")
-            self.assertEqual(state.memory_actions[0]["reason"], "test")
-            self.assertEqual(state.trace[0]["node"], "fake_langgraph")
-            self.assertEqual(state.trace[-1]["node"], "graph")
-
-    def test_summary_agent_does_not_stream_intermediate_rag_answer(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-summary@example.com", "AgentGraphSummary")
-            kb = create_knowledge_base(
-                session,
-                user.id,
-                KnowledgeBaseCreate(name="Summary Agent Graph KB", visibility="private"),
-            )
-            tokens: list[str] = []
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=kb.id,
-                input="请总结这份制度",
-                token_callback=tokens.append,
-            )
-
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeSummaryLlmProvider()),
-                patch("app.services.memory_service.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.summary_agent.get_llm_provider", return_value=FakeSummaryLlmProvider()),
-                patch(
-                    "app.agents.summary_agent.retrieve_rag_evidence",
-                    return_value=SimpleNamespace(
-                        chunks=[],
-                        citations=[],
-                        retrieval_log_id="retrieval-log-id",
-                        searched_knowledge_base_ids=[kb.id],
-                    ),
-                ),
-                patch("app.agents.summary_agent.format_answer_context", return_value="RAG evidence"),
-            ):
-                run_agent_graph(session, state)
-
-            self.assertEqual(tokens, ["最终摘要"])
-            self.assertEqual(state.answer, "最终摘要")
-            self.assertEqual(state.intent, "summary")
-
-    def test_memory_update_failure_does_not_fail_completed_answer(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-memory-failure@example.com", "AgentGraphMemoryFailure")
-            kb = create_knowledge_base(
-                session,
-                user.id,
-                KnowledgeBaseCreate(name="Memory Failure KB", visibility="private"),
-            )
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=kb.id,
-                input="What is the policy?",
-            )
-
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
-                patch("app.agents.memory_agent.process_user_memory", side_effect=RuntimeError("memory offline")),
-            ):
-                build_rag_answer.return_value.answer = "Grounded answer."
-                build_rag_answer.return_value.citations = []
-                build_rag_answer.return_value.retrieval_log_id = "retrieval-log-id"
-                build_rag_answer.return_value.llm_log_id = "llm-log-id"
-
-                run_agent_graph(session, state)
-
-            self.assertEqual(state.status, "completed")
-            self.assertEqual(state.answer, "Grounded answer.")
-            self.assertEqual(state.memory_actions[0]["action"], "ignore")
-            self.assertIn("memory update failed", state.memory_actions[0]["reason"])
-
-    def test_async_memory_update_queues_after_answer_without_processing_inline(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-memory-async@example.com", "AgentGraphMemoryAsync")
-            kb = create_knowledge_base(
-                session,
-                user.id,
-                KnowledgeBaseCreate(name="Memory Async KB", visibility="private"),
-            )
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=kb.id,
-                input="What is the policy?",
-                conversation_id="conversation-id",
-                message_id="user-message-id",
-            )
-
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-                patch("app.agents.memory_agent.get_settings", return_value=SimpleNamespace(memory_update_mode="async")),
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
-                patch("app.agents.memory_agent.process_user_memory") as process_user_memory,
-                patch("app.agents.memory_agent.enqueue_memory_update") as enqueue_memory_update,
-            ):
-                build_rag_answer.return_value.answer = "Grounded answer."
-                build_rag_answer.return_value.citations = []
-                build_rag_answer.return_value.retrieval_log_id = "retrieval-log-id"
-                build_rag_answer.return_value.llm_log_id = "llm-log-id"
-
-                run_agent_graph(session, state)
-
-            self.assertEqual(state.status, "completed")
-            self.assertEqual(state.answer, "Grounded answer.")
-            self.assertEqual(state.memory_actions[0]["action"], "queued")
-            job_id = state.memory_actions[0]["job_id"]
-            job = session.get(UserMemoryUpdateJob, job_id)
-            self.assertIsNotNone(job)
-            self.assertEqual(job.user_id, user.id)
-            self.assertEqual(job.conversation_id, "conversation-id")
-            self.assertEqual(job.message_id, "user-message-id")
-            self.assertEqual(job.user_message, "What is the policy?")
-            self.assertEqual(job.assistant_message, "Grounded answer.")
-            self.assertEqual(job.status, "queued")
-            process_user_memory.assert_not_called()
-            enqueue_memory_update.assert_called_once_with(job_id)
-
-    def test_no_memory_turn_skips_recall_and_memory_update(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-no-memory@example.com", "AgentGraphNoMemory")
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=None,
-                input="Please answer without memory.",
-            )
-
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
-                patch("app.agents.memory_agent.retrieve_relevant_memories") as retrieve_relevant_memories,
-                patch("app.agents.memory_agent.process_user_memory") as process_user_memory,
-                patch("app.agents.memory_agent.enqueue_memory_update") as enqueue_memory_update,
-            ):
-                build_rag_answer.return_value.answer = "Grounded answer."
-                build_rag_answer.return_value.citations = []
-                build_rag_answer.return_value.retrieval_log_id = None
-                build_rag_answer.return_value.llm_log_id = None
-
-                run_agent_graph(session, state)
-
-            retrieve_relevant_memories.assert_not_called()
-            process_user_memory.assert_not_called()
-            enqueue_memory_update.assert_not_called()
-            self.assertEqual(state.memory_actions[0]["action"], "ignore")
-            self.assertEqual(state.memory_actions[0]["reason"], "user requested no memory for this turn")
-            self.assertTrue(any(step["action"] == "load_context_skipped" for step in state.trace))
-            self.assertTrue(any(step["action"] == "update_user_memories_skipped" for step in state.trace))
-
-    def test_async_memory_update_keeps_queued_job_when_worker_dispatch_fails(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-memory-dispatch-failure@example.com", "AgentGraphMemoryDispatchFailure")
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=None,
-                input="Hello",
-            )
-
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-                patch("app.agents.memory_agent.get_settings", return_value=SimpleNamespace(memory_update_mode="async")),
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
-                patch("app.agents.memory_agent.enqueue_memory_update", side_effect=RuntimeError("broker down")),
-            ):
-                build_rag_answer.return_value.answer = "Hello."
-                build_rag_answer.return_value.citations = []
-                build_rag_answer.return_value.retrieval_log_id = None
-                build_rag_answer.return_value.llm_log_id = None
-
-                run_agent_graph(session, state)
-
-            self.assertEqual(state.status, "completed")
-            self.assertEqual(state.memory_actions[0]["action"], "queued")
-            self.assertIn("worker dispatch failed", state.memory_actions[0]["reason"])
-            job = session.scalar(select(UserMemoryUpdateJob).where(UserMemoryUpdateJob.user_id == user.id))
-            self.assertIsNotNone(job)
-            self.assertEqual(job.status, "queued")
-            self.assertEqual(job.error_message, "worker dispatch failed: broker down")
-
-    def test_disabled_memory_update_is_explicit_in_trace(self) -> None:
-        with isolated_session() as session:
-            user = create_user(session, "agent-graph-memory-disabled@example.com", "AgentGraphMemoryDisabled")
-            state = AgentGraphState(
-                user_id=user.id,
-                knowledge_base_id=None,
-                input="Hello",
-            )
-
-            with (
-                patch("app.agents.graph.get_settings", return_value=SimpleNamespace(agent_graph_backend="sequential")),
-                patch("app.agents.memory_agent.get_settings", return_value=SimpleNamespace(memory_update_mode="disabled")),
-                patch("app.agents.supervisor.get_llm_provider", return_value=FakeAgentLlmProvider()),
-                patch("app.agents.rag_agent.build_rag_answer") as build_rag_answer,
-                patch("app.agents.memory_agent.process_user_memory") as process_user_memory,
-            ):
-                build_rag_answer.return_value.answer = "Hello."
-                build_rag_answer.return_value.citations = []
-                build_rag_answer.return_value.retrieval_log_id = None
-                build_rag_answer.return_value.llm_log_id = None
-
-                run_agent_graph(session, state)
-
-            self.assertEqual(state.status, "completed")
-            self.assertEqual(state.memory_actions[0]["action"], "ignore")
-            self.assertEqual(state.memory_actions[0]["reason"], "memory update disabled")
-            self.assertTrue(any(step["action"] == "update_user_memories_disabled" for step in state.trace))
-            process_user_memory.assert_not_called()
+        self.assertEqual([item.name for item in build_agent_tools(None, state)], ["rag"])
+        model, recall, _retrieve = self.run_script(state, [final_answer("直接回答。")])
+        recall.assert_not_called()
+        self.assertEqual(model.bound_tool_names[0], ["rag"])
 
 
 if __name__ == "__main__":

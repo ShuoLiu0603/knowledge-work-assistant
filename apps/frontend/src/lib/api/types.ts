@@ -99,10 +99,7 @@ export type RetrievalLog = {
   searched_knowledge_base_ids: string[];
   conversation_id: string | null;
   message_id: string | null;
-  question: string;
-  rewritten_query: string;
-  sub_questions: unknown[];
-  expanded_queries: unknown[];
+  query: string;
   retrieval_routes: unknown[];
   candidates: unknown[];
   selected_chunks: unknown[];
@@ -126,9 +123,10 @@ export type AgentRun = {
   conversation_id: string | null;
   message_id: string | null;
   retrieval_log_id: string | null;
+  retrieval_log_ids: string[];
+  searched_knowledge_base_ids: string[];
   input: string;
-  intent: "rag" | "memory" | "chat" | "summary" | "writing";
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   answer: string;
   citations: Citation[];
   trace: AgentTraceStep[];
@@ -289,7 +287,7 @@ export type AskKnowledgeBaseResult = {
   question: string;
   answer: string;
   citations: Citation[];
-  retrieval_log: RetrievalLog | null;
+  retrieval_logs: RetrievalLog[];
 };
 
 export type Conversation = {

@@ -17,15 +17,15 @@ Knowledge Work Assistant is an engineering reference implementation for enterpri
 |---|---|
 | Identity and authorization | Registration, login, access/refresh tokens, administrator role, department scope, knowledge-base membership, L1-L5 document classification |
 | Enterprise knowledge bases | Public/private knowledge bases, member management, PDF/DOCX/TXT/Markdown/CSV upload, document status, and chunk inspection |
-| Knowledge assistance | Query rewriting, sub-question decomposition, Dense + BM25 retrieval, weighted RRF, context compression, streaming answers, and citations |
-| Agent orchestration | Five intents: `rag`, `memory`, `chat`, `summary`, and `writing`; LangGraph or sequential execution backend |
+| Knowledge assistance | Agent-authored search queries, Dense + BM25 retrieval, RRF, context compression, repeated retrieval, streaming answers, and citations |
+| Agent orchestration | One LangChain `create_agent` loop; the model may answer directly or repeatedly call `memory(query)` and `rag(query)` as needed |
 | Conversational memory | Redis short-term memory, incremental summaries, PostgreSQL long-term memory, and an optional Qdrant semantic index |
 | Memory governance | Automatic candidates, pending approval, revisions, soft delete, restore, purge, export, index reconciliation, and recall logs |
 | Administration and audit | Agent traces, LLM call logs, retrieval logs, feedback, memory events, audit logs, and administrative metrics |
 
 ## Engineering Characteristics
 
-- A fixed Agent graph and deterministic backend routing constrain model behavior; the LLM cannot invoke arbitrary tools.
+- The Agent receives only the controlled `memory` and `rag` tools; authorization scope, call budgets, deadlines, and final-answer fallback remain backend-enforced.
 - Authorization filters apply to both Dense and BM25 retrieval, while enterprise evidence remains separate from user memory.
 - PostgreSQL is authoritative for business data and long-term memory; Qdrant contains rebuildable vector indexes.
 - Celery durable jobs, idempotency keys, fenced leases, exponential backoff, and Beat recovery scans cover key asynchronous failure windows.
@@ -39,7 +39,7 @@ Knowledge Work Assistant is an engineering reference implementation for enterpri
 flowchart LR
     Browser[React + Vite] --> API[FastAPI API]
     API --> Services[Service / Authorization]
-    Services --> Agent[Agent Graph]
+    Services --> Agent[LangChain Agent Loop]
     Agent --> RAG[RAG Pipeline]
     Agent --> Memory[Memory Pipeline]
 
@@ -61,7 +61,7 @@ flowchart LR
 The system has two primary data paths:
 
 1. **Document ingestion:** upload the source file to MinIO, persist document metadata, then let Celery parse, split, embed, and write data to PostgreSQL and Qdrant.
-2. **Conversation execution:** commit the user message, load authorized conversation and memory context, classify intent, execute retrieval or the selected Agent node, stream the response, and persist logs, messages, summaries, and memory update jobs.
+2. **Conversation execution:** commit the user message, always load the compact core profile and authorized conversation context, then let the model answer directly or call long-term memory and knowledge-base retrieval until it has enough evidence or reaches its budget; persist logs, messages, summaries, and memory update jobs afterward.
 
 See [Agent and Memory Deep Dive (Chinese)](docs/agent_memory_deep_dive.md) for the complete sequence, transaction boundaries, failure semantics, and data model.
 
@@ -234,10 +234,10 @@ scripts/            Quality gate, migration verification, smoke demo, and evalua
 
 ## Known Limitations
 
-- No cross-encoder reranker is currently active; retrieval fusion relies on Dense, BM25, and weighted RRF.
+- No cross-encoder reranker is currently active; each `rag(query)` call fuses Dense and BM25 rankings with unweighted RRF.
 - The code and development template disable the long-term memory Qdrant index by default, while the production template enables it; PostgreSQL remains authoritative in both cases.
 - Memory supports user preferences, style, and conversational continuity; it is never enterprise factual evidence.
-- `summary` and `writing` operate on authorized knowledge-base retrieval, not arbitrary pasted text.
+- Each turn permits at most 6 model calls and 4 tool calls (2 Memory, 3 RAG); the final model call has no tools and must close the response.
 - Agent streaming concurrency is enforced per Uvicorn process, not as a global quota across replicas.
 - Citations identify the evidence supplied to the model; they are not sentence-level fact verification.
 - First-user administrator bootstrap is suitable only for single-instance initialization; production needs an explicit administrator lifecycle.

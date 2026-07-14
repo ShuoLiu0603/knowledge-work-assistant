@@ -9,7 +9,7 @@ from app.db.models.agent_run import AgentRun
 from app.db.models.audit_log import AuditLog
 from app.db.models.conversation import Message
 from app.db.models.llm_call_log import LlmCallLog
-from app.llm.provider import LlmCompletion, LlmMessage, LlmProvider
+from app.llm.provider import stream_text_chunks
 from app.schemas.conversation import ConversationCreate, StreamMessageRequest
 from app.schemas.knowledge_base import KnowledgeBaseCreate
 from app.services.conversation_service import create_conversation, delete_conversation, message_token_usage, stream_message_response
@@ -17,36 +17,11 @@ from app.services.knowledge_base_service import create_knowledge_base
 from helpers import create_user, isolated_session
 
 
-class FakeTokenProvider(LlmProvider):
-    provider_name = "openai_compatible"
-    model_name = "fake-chat"
-
-    def complete_with_metadata(self, messages: list[LlmMessage], temperature: float = 0.1) -> LlmCompletion:
-        content = "The policy is approved. [1]"
-        return LlmCompletion(
-            content=content,
-            provider=self.provider_name,
-            model_name=self.model_name,
-            prompt_tokens=10,
-            completion_tokens=6,
-            total_tokens=16,
-            latency_ms=1,
-            status="success",
-        )
-
-
 class ConversationStreamingTests(unittest.TestCase):
-    def test_provider_base_emits_tokens_through_callback(self) -> None:
-        tokens: list[str] = []
+    def test_final_answer_is_split_into_streamable_chunks(self) -> None:
+        answer = "The policy is approved. [1]"
 
-        completion = FakeTokenProvider().answer_question_with_metadata(
-            "What is the policy?",
-            "[1] 来源：policy.md，chunk #0\nThe policy is approved.",
-            on_token=tokens.append,
-        )
-
-        self.assertEqual("".join(tokens), completion.content)
-        self.assertIn("[1]", completion.content)
+        self.assertEqual("".join(stream_text_chunks(answer)), answer)
 
     def test_stream_message_response_emits_tokens_before_persisted_assistant_message(self) -> None:
         with isolated_session() as session:
@@ -72,7 +47,6 @@ class ConversationStreamingTests(unittest.TestCase):
                     knowledge_base_id=args[2],
                     conversation_id=kwargs["conversation_id"],
                     input=args[3],
-                    intent="rag",
                     status="completed",
                     answer="企业级回答",
                     citations=[],
@@ -133,7 +107,6 @@ class ConversationStreamingTests(unittest.TestCase):
                     knowledge_base_id=args[2],
                     conversation_id=kwargs["conversation_id"],
                     input=args[3],
-                    intent="rag",
                     status="completed",
                     answer="已完成回答",
                     citations=[],
@@ -185,7 +158,6 @@ class ConversationStreamingTests(unittest.TestCase):
                     knowledge_base_id=args[2],
                     conversation_id=kwargs["conversation_id"],
                     input=args[3],
-                    intent="rag",
                     status="completed",
                     answer="公共知识库回答",
                     citations=[],
@@ -279,7 +251,6 @@ class ConversationStreamingTests(unittest.TestCase):
                 user_id=user.id,
                 knowledge_base_id="kb",
                 input="Question",
-                intent="rag",
                 status="completed",
                 answer="Answer",
                 state={"llm_log_id": second.id, "llm_log_ids": [first.id, second.id]},

@@ -1,78 +1,62 @@
 # Agent 编排说明
 
-本项目的 Agent 编排目标是把不同意图路由到合适节点，同时复用已经稳定的 RAG service。
+本项目使用一个 LangChain `create_agent` 循环。模型不经过独立意图分类器：当前上下文足够时直接输出最终回答；信息不足时可以按需、多次调用 `memory(query)` 或 `rag(query)`。
 
-## AgentState
+## AgentRunState
 
-`AgentState` 保存一次 Agent run 的关键状态：
+`AgentRunState` 保存一次运行的关键状态：
 
-- 用户、知识库、会话和消息 id。
-- 用户输入和判断出的 intent。
-- 短期记忆、长期记忆和会话摘要。
-- RAG answer、citations、retrieval_log_id。
-- memory_actions。
-- trace、status 和 error_message。
+- 用户、知识库授权范围、会话和消息 ID。
+- 用户输入、核心画像、会话摘要与最近对话。
+- 按需召回的普通长期记忆、Memory query 与召回观察。
+- 多批 RAG query、累计 chunk、稳定引用和全部 RetrievalLog ID。
+- 模型、总工具、Memory、RAG 调用计数。
+- memory actions、trace、status、deadline、取消信号和错误信息。
 
-## 节点职责
+## 执行循环
 
-### Memory Agent
+```text
+加载核心画像与会话上下文
+→ 模型判断
+  → 信息充分：直接回答
+  → 缺少用户长期信息：memory(query) → 重新判断
+  → 缺少企业文档证据：rag(query) → 重新判断
+→ 回答后执行或投递长期记忆更新
+```
 
-- 回答前加载 Redis 短期记忆、`conversations.summary` 和相关长期记忆。
-- 回答后处理用户输入中的长期偏好。
-- LLM 提出 `create`、`update`、`supersede`、`pending` 或 `ignore`；服务层还可根据去重与冲突结果记录 `touch`、`merge` 等派生 action。
-- 异步模式先返回 deferred/queued 状态，最终写入由 durable job 完成。
+模型每回合只能执行一个工具调用。默认上限是 6 次模型调用、4 次工具调用，其中 Memory 最多 2 次、RAG 最多 3 次；最后一次模型调用不再提供工具，必须基于已有信息回答或明确说明证据不足。
 
-### Supervisor Agent
+## `memory(query)`
 
-- 使用 LLM Provider 判断意图。
-- 输出 `rag`、`memory`、`chat`、`summary` 或 `writing`。
-- 明确的 full-memory-recall 标记先于 LLM 分类，确定性路由到 `memory`。
-- 其他请求依赖分类 Prompt 与结构化标签；无法归一化的输出回退为 `rag`，当前不再根据原始用户文本做第二次语义规则裁决。
-- 不直接回答问题。
+- 只搜索当前用户的普通长期记忆，例如项目、技术栈、历史决策、事件和工作流。
+- 核心姓名、称呼、当前角色、语言及稳定响应偏好已经固定注入，无需再次搜索。
+- 不搜索企业知识库，不能作为制度或文档事实证据。
+- 同一标准化 query 不重复执行。
 
-### RAG Agent
+## `rag(query)`
 
-- 调用已有 RAG service。
-- 返回 grounded answer 和 citations。
+- 只搜索服务层预先解析并授权的知识库范围；模型不能改变 KB、部门或密级。
+- 每次调用接受一条模型生成的独立 query，执行 Dense + BM25 + RRF。
+- 模型可以根据首轮结果换一个实质不同的 query 再查。
+- 每次调用产生独立 RetrievalLog；所有批次的证据与日志都会保留并关联到最终消息。
+- 企业声明必须使用累计证据中的稳定数字引用。
 
-### Memory Answer
+## Trace
 
-- 当用户询问“你记得我什么/我的偏好是什么”等问题时，不检索知识库。
-- 只基于长期记忆、短期记忆和会话摘要回答。
-- 不返回知识库 citations。
+每一步向 `agent_runs.trace` 写入 `node`、`action`、`input` 和 `output`。主要动作包括：
 
-### Chat
+- `load_core_context`
+- `call_tools` / `respond`
+- `memory` / `rag`
+- `final_answer`
+- `defer_user_memories` / `update_user_memories`
+- `complete` / `cancel` / `timeout` / `error`
 
-- 用于寒暄、感谢等无需检索的轻量对话。
-- 不回答企业事实问题。
-- 不重写检索流程。
+前端按模型步骤、工具 query、结果数量和最终状态展示轨迹，不再展示 intent。
 
-### Summary Agent
+## 安全边界
 
-- 调用 RAG service 获取依据。
-- 使用 LLM Provider 生成摘要。
-- 结合记忆上下文做基础个性化。
-
-### Writing Agent
-
-- 调用 RAG service 获取依据。
-- 使用 LLM Provider 生成草稿。
-- 仍然保留引用和 trace。
-
-## Trace 设计
-
-每个节点向 `agent_runs.trace` 写入：
-
-- `node`：节点名称。
-- `action`：执行动作。
-- `input`：关键输入摘要。
-- `output`：关键输出摘要。
-
-这样可以在前端或接口中解释一次回答为什么进入某个 Agent、加载了多少记忆、是否触发记忆更新。
-
-## 当前边界
-
-- 不实现完整自主规划。
-- 不新增工具调用市场。
-- 不让 Agent 绕过权限校验。
-- 不让 Memory Agent 替代 RAG 检索。
+- 工具内容按不可信数据处理，不能覆盖 system rules。
+- 用户记忆和企业证据严格分离。
+- 权限、预算、超时、重复调用、检索 provenance 与最终收口由后端执行。
+- Memory miss 不允许转而到 RAG 搜索个人信息；企业证据不足时不得用模型常识猜测内部事实。

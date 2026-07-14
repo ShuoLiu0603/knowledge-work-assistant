@@ -8,9 +8,9 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.agents.graph import run_agent_graph
+from app.agents.runtime import run_agent_turn
 from app.agents.memory_agent import update_user_memories
-from app.agents.state import AgentGraphState, ensure_agent_run_active
+from app.agents.state import AgentRunState, ensure_agent_run_active
 from app.db.models.agent_run import AgentRun
 from app.db.models.conversation import Conversation, Message
 from app.db.models.retrieval_log import RetrievalLog
@@ -51,7 +51,7 @@ def run_agent(
         scope_type=search_scope,
         department_id=department_id,
     )
-    state = AgentGraphState(
+    state = AgentRunState(
         user_id=user_id,
         knowledge_base_id=scope.primary_knowledge_base_id,
         input=normalized_input,
@@ -68,16 +68,23 @@ def run_agent(
         searched_knowledge_base_ids=[],
     )
     started_at = datetime.now(timezone.utc)
-    run_agent_graph(db, state)
+    run_agent_turn(db, state)
     ensure_agent_run_active(state)
     retrieval_log = None
     if state.retrieval_log_id:
         retrieval_log = db.get(RetrievalLog, state.retrieval_log_id)
         if retrieval_log is not None:
-            state.searched_knowledge_base_ids = list(retrieval_log.searched_knowledge_base_ids or [])
+            state.searched_knowledge_base_ids = list(
+                dict.fromkeys(
+                    [
+                        *state.searched_knowledge_base_ids,
+                        *list(retrieval_log.searched_knowledge_base_ids or []),
+                    ]
+                )
+            )
     if (
         state.status == "completed"
-        and state.intent in {"rag", "summary", "writing"}
+        and state.rag_searched
         and retrieval_log is None
     ):
         state.status = "failed"
@@ -106,7 +113,6 @@ def run_agent(
         message_id=message_id,
         retrieval_log_id=state.retrieval_log_id,
         input=state.input,
-        intent=state.intent,
         status=state.status,
         answer=state.answer,
         citations=[citation.model_dump(mode="json") for citation in state.citations],
@@ -145,7 +151,7 @@ def apply_deferred_memory_update(
         if source_message is not None
         else bool(stored_state.get("memory_enabled", True))
     )
-    state = AgentGraphState(
+    state = AgentRunState(
         user_id=run.user_id,
         knowledge_base_id=run.knowledge_base_id,
         input=run.input,
@@ -153,7 +159,6 @@ def apply_deferred_memory_update(
         search_department_id=stored_state.get("search_department_id"),
         conversation_id=run.conversation_id,
         message_id=source_message_id,
-        intent=run.intent,
         answer=run.answer,
         trace=list(run.trace or []),
         status=run.status,
@@ -234,9 +239,9 @@ def to_agent_run_read(run: AgentRun) -> AgentRunRead:
         conversation_id=run.conversation_id,
         message_id=run.message_id,
         retrieval_log_id=run.retrieval_log_id,
+        retrieval_log_ids=stored_retrieval_log_ids(run),
         searched_knowledge_base_ids=stored_searched_knowledge_base_ids(run),
         input=run.input,
-        intent=run.intent,
         status=run.status,
         answer=run.answer,
         citations=[CitationRead(**citation) for citation in run.citations],
@@ -248,10 +253,9 @@ def to_agent_run_read(run: AgentRun) -> AgentRunRead:
     )
 
 
-def state_snapshot(state: AgentGraphState, started_at: datetime) -> dict:
+def state_snapshot(state: AgentRunState, started_at: datetime) -> dict:
     return {
         "input": state.input,
-        "intent": state.intent,
         "status": state.status,
         "conversation_id": state.conversation_id,
         "message_id": state.message_id,
@@ -259,12 +263,43 @@ def state_snapshot(state: AgentGraphState, started_at: datetime) -> dict:
         "search_department_id": state.search_department_id,
         "searched_knowledge_base_ids": state.searched_knowledge_base_ids,
         "retrieval_log_id": state.retrieval_log_id,
+        "retrieval_log_ids": state.retrieval_log_ids,
         "llm_log_id": state.llm_log_id,
         "llm_log_ids": state.llm_log_ids,
         "citation_count": len(state.citations),
         "conversation_summary": state.conversation_summary,
         "short_term_memory_count": len(state.short_term_memory),
-        "long_term_memories": state.long_term_memories,
+        "profile_memory_count": len(state.profile_memories),
+        "profile_memory_ids": [memory.get("id") for memory in state.profile_memories],
+        "long_term_memory_count": len(state.long_term_memories),
+        "long_term_memory_ids": [memory.get("id") for memory in state.long_term_memories],
+        "memory_recalled": state.memory_recalled,
+        "rag_searched": state.rag_searched,
+        "rag_chunk_count": len(state.rag_chunks),
+        "rag_chunk_ids": [chunk.chunk_id for chunk in state.rag_chunks],
+        "model_call_count": state.model_call_count,
+        "tool_call_count": state.tool_call_count,
+        "memory_tool_call_count": state.memory_tool_call_count,
+        "rag_tool_call_count": state.rag_tool_call_count,
+        "memory_queries": state.memory_queries,
+        "rag_queries": state.rag_queries,
+        "tool_history": [
+            {
+                key: observation.get(key)
+                for key in (
+                    "tool",
+                    "query",
+                    "status",
+                    "result_count",
+                    "new_result_count",
+                    "duplicate_result_count",
+                    "retrieval_log_id",
+                    "error",
+                )
+                if observation.get(key) is not None
+            }
+            for observation in state.tool_observations
+        ],
         "memory_actions": state.memory_actions,
         "memory_enabled": state.memory_enabled,
         "started_at": started_at.isoformat(),
@@ -282,12 +317,7 @@ def ensure_agent_run_access(db: Session, user_id: str, run: AgentRun) -> None:
         if retrieval_log is not None:
             ensure_retrieval_log_access(db, user_id, retrieval_log)
             knowledge_base_ids.extend(retrieval_log_provenance_ids(retrieval_log))
-    if (
-        not has_explicit_provenance
-        and not run.knowledge_base_id
-        and run.intent in {"rag", "summary", "writing"}
-        and retrieval_log is None
-    ):
+    if not has_explicit_provenance and not run.knowledge_base_id and retrieval_log is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent run provenance is unavailable",
@@ -303,3 +333,12 @@ def stored_searched_knowledge_base_ids(run: AgentRun) -> list[str]:
         normalized = [value for value in stored if isinstance(value, str) and value]
         return list(dict.fromkeys(normalized))
     return [run.knowledge_base_id] if run.knowledge_base_id else []
+
+
+def stored_retrieval_log_ids(run: AgentRun) -> list[str]:
+    state = run.state if isinstance(run.state, dict) else {}
+    stored = state.get("retrieval_log_ids")
+    normalized = [value for value in stored if isinstance(value, str) and value] if isinstance(stored, list) else []
+    if run.retrieval_log_id:
+        normalized.append(run.retrieval_log_id)
+    return list(dict.fromkeys(normalized))

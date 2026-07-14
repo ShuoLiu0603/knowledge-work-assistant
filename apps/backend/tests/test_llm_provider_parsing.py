@@ -5,9 +5,16 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from app.llm.provider import LlmMessage, OpenAICompatibleProvider, parse_memory_operations
-from app.llm.structured_outputs import IntentOutput, MemoryOperationOutput
-from app.schemas.memory import UserMemoryCreate
+from langchain_core.messages import HumanMessage, ToolMessage
+
+from app.llm.provider import (
+    LlmMessage,
+    OpenAICompatibleChatModel,
+    OpenAICompatibleProvider,
+    parse_memory_operations,
+)
+from app.llm.structured_outputs import MemoryClassificationOutput, MemoryOperationOutput
+from app.schemas.memory import UserMemoryCreate, UserMemoryUpdate
 
 
 class LlmProviderParsingTests(unittest.TestCase):
@@ -52,27 +59,84 @@ class LlmProviderParsingTests(unittest.TestCase):
 
         self.assertEqual(output.kind, "profile")
 
-    def test_manual_memory_schema_rejects_project_kind(self) -> None:
-        with self.assertRaises(ValidationError):
-            UserMemoryCreate(content="User works on a RAG project", kind="project")
+    def test_manual_memory_schemas_reject_user_supplied_classification(self) -> None:
+        for schema, payload in (
+            (UserMemoryCreate, {"content": "User works on a RAG project", "kind": "profile"}),
+            (UserMemoryCreate, {"content": "User prefers concise answers", "category": "response_detail"}),
+            (UserMemoryUpdate, {"content": "User works on a RAG project", "kind": "profile"}),
+            (UserMemoryUpdate, {"content": "User prefers concise answers", "category": "response_detail"}),
+        ):
+            with self.subTest(schema=schema.__name__, payload=payload), self.assertRaises(ValidationError):
+                schema(**payload)
 
-    def test_manual_memory_schema_rejects_internal_category(self) -> None:
-        with self.assertRaises(ValidationError):
-            UserMemoryCreate(content="User prefers concise answers", category="response_detail")
+    def test_memory_classification_normalizes_unknown_values(self) -> None:
+        output = MemoryClassificationOutput(kind="unknown", category="organization")
+
+        self.assertEqual(output.kind, "preference")
+        self.assertEqual(output.category, "general")
 
     def test_openai_provider_uses_langchain_structured_output(self) -> None:
-        chat = FakeStructuredChat({"intent": "summary"})
+        chat = FakeStructuredChat({"action": "create", "content": "User prefers concise answers"})
 
         with patch("app.llm.provider.create_chat_model", return_value=chat):
             output, completion = OpenAICompatibleProvider().complete_structured_with_metadata(
-                [LlmMessage("user", "summarize this")],
-                IntentOutput,
+                [LlmMessage("user", "classify this memory operation")],
+                MemoryOperationOutput,
                 temperature=0,
             )
 
-        self.assertIs(chat.schema, IntentOutput)
-        self.assertEqual(output.intent, "summary")
-        self.assertIn("summary", completion.content)
+        self.assertIs(chat.schema, MemoryOperationOutput)
+        self.assertEqual(output.action, "create")
+        self.assertIn("concise", completion.content)
+
+    def test_memory_classifier_uses_structured_output(self) -> None:
+        chat = FakeStructuredChat({"kind": "profile", "category": "current_project"})
+
+        with patch("app.llm.provider.create_chat_model", return_value=chat):
+            classification = OpenAICompatibleProvider().classify_memory_with_metadata(
+                "User works on an Agentic RAG project"
+            )
+
+        self.assertIs(chat.schema, MemoryClassificationOutput)
+        self.assertEqual(classification.kind, "profile")
+        self.assertEqual(classification.category, "current_project")
+
+    def test_tool_follow_up_preserves_provider_reasoning_content(self) -> None:
+        model = OpenAICompatibleChatModel(model="fake-model", api_key="test-key")
+        result = model._create_chat_result(
+            {
+                "model": "fake-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "private reasoning state",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {"name": "memory", "arguments": '{"query":"project"}'},
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+        )
+        assistant_message = result.generations[0].message
+
+        payload = model._get_request_payload(
+            [
+                HumanMessage(content="What is my project?"),
+                assistant_message,
+                ToolMessage(content="Agentic RAG", tool_call_id="call-1"),
+            ]
+        )
+
+        self.assertEqual(assistant_message.additional_kwargs["reasoning_content"], "private reasoning state")
+        self.assertEqual(payload["messages"][1]["reasoning_content"], "private reasoning state")
 
 
 class FakeStructuredChat:

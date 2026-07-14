@@ -69,10 +69,19 @@ sequenceDiagram
 
   U->>API: ask question
   API->>A: run_agent
-  A->>MEM: load short/long memory
-  A->>LLM: classify intent
-  A->>RAG: retrieve and build grounded answer
-  RAG->>LLM: answer with retrieved context
+  A->>MEM: load core profile + conversation context
+  loop bounded model/tool steps
+    A->>LLM: decide: answer, memory(query), or rag(query)
+    opt memory(query)
+      A->>MEM: recall ordinary long-term memory
+      MEM-->>A: memory observation
+    end
+    opt rag(query)
+      A->>RAG: authorized Dense + BM25 + RRF
+      RAG-->>A: evidence + RetrievalLog
+    end
+  end
+  LLM-->>A: final answer
   A->>MEM: update user memories
   A->>LOG: save agent_run and trace
   API-->>U: SSE tokens + citations

@@ -22,15 +22,6 @@ function valFromRecord(o: unknown, key: string): string {
   return v != null ? String(v) : "";
 }
 
-function listFromRecord(o: unknown, key: string): unknown[] {
-  if (typeof o !== "object" || !o) return [];
-  return Array.isArray((o as Record<string, unknown>)[key]) ? ((o as Record<string, unknown>)[key] as unknown[]) : [];
-}
-
-function formatList(v: unknown[]): string {
-  return v.length ? v.map(String).join(", ") : "-";
-}
-
 export function RetrievalLogPanel({ logs, selectedId, onSelect }: Props) {
   const active = logs.find((l) => l.id === selectedId) ?? logs[0] ?? null;
 
@@ -44,7 +35,7 @@ export function RetrievalLogPanel({ logs, selectedId, onSelect }: Props) {
         >
           {logs.map((l) => (
             <option key={l.id} value={l.id}>
-              {new Date(l.created_at).toLocaleString()} · {l.rewritten_query}
+              {new Date(l.created_at).toLocaleString()} · {l.query}
             </option>
           ))}
         </select>
@@ -63,12 +54,8 @@ export function RetrievalLogPanel({ logs, selectedId, onSelect }: Props) {
             <div><span className={styles.label}>compressed:</span> {active.compression_chars_saved} chars</div>
           </div>
           <div style={{ marginBottom: 8 }}>
-            <strong>rewritten_query</strong>
-            <p className={styles.text}>{active.rewritten_query}</p>
-          </div>
-          <div style={{ marginBottom: 8 }}>
-            <strong>expanded_queries</strong>
-            <p className={styles.text}>{formatList(active.expanded_queries)}</p>
+            <strong>query</strong>
+            <p className={styles.text}>{active.query}</p>
           </div>
           <div>
             <strong>selected_chunks</strong>

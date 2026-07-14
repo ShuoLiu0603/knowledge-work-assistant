@@ -35,7 +35,6 @@ class AgentRun(Base):
         index=True,
     )
     input: Mapped[str] = mapped_column(Text, nullable=False)
-    intent: Mapped[str] = mapped_column(String(30), nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="completed")
     answer: Mapped[str] = mapped_column(Text, nullable=False, default="")
     citations: Mapped[list] = mapped_column(JSON, nullable=False, default=list)

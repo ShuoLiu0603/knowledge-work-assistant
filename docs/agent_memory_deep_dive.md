@@ -1,15 +1,15 @@
 # Agent 与记忆模块深度设计文档
 
-> 本文以当前代码实现为唯一事实来源，描述 Agent 编排、意图识别、一次对话的完整时序，以及记忆模块的数据模型、读写策略、隐私边界、异步可靠性和失败语义。
+> 本文以当前代码实现为唯一事实来源，描述单 Agent 工具循环、一次对话的完整时序，以及记忆模块的数据模型、读写策略、隐私边界、异步可靠性和失败语义。
 >
 > 关键实现目录：`apps/backend/app/agents`、`apps/backend/app/memory`、`apps/backend/app/services`、`apps/backend/app/workers`。
 
 ## 1. 设计定位
 
-本项目的 Agent 是受控的工作流编排层，不是开放式自主 Agent：
+本项目使用有边界的 Agentic 工具循环：
 
-- LLM 不能任意选择工具或绕过服务层。
-- 图结构、可走分支和每个节点的职责固定在代码中。
+- LLM 可以直接回答，也可以多次调用 `memory(query)` 和 `rag(query)`；不存在独立意图分类器。
+- LLM 不能增加工具、扩大检索范围或绕过服务层；每轮调用次数由后端预算控制。
 - 知识库范围、成员权限、文档密级和历史 provenance 由后端校验。
 - PostgreSQL 是业务数据和长期记忆的权威来源。
 - Redis 用于短期缓存、Celery broker、会话协调租约和任务状态。
@@ -21,7 +21,7 @@
 
 1. 记忆不是企业事实证据。
 2. Agent 不能扩大当前用户的知识库访问范围。
-3. `rag`、`summary`、`writing` 成功完成时必须存在真实 RetrievalLog。
+3. 每次成功执行 `rag(query)` 都必须产生真实 RetrievalLog；发生过 RAG 的 completed run 必须保留检索 provenance。
 4. 自动记忆只接受来自当前 user Message 的证据。
 5. PostgreSQL memory row 是真相，Qdrant memory point 只是可重建索引。
 6. 用户选择不使用记忆的对话轮不能进入记忆上下文或会话摘要。
@@ -33,12 +33,10 @@
 flowchart TB
     FE[React Frontend]
     API[FastAPI Conversation API]
-    GRAPH[Controlled Agent Graph]
-    SUP[Supervisor]
-    RAG[RAG / Chat / Memory Answer]
-    SUM[Summary Agent]
-    WRITE[Writing Agent]
-    MEM[Memory Agent]
+    AGENT[LangChain create_agent Loop]
+    MEMORY[memory query Tool]
+    RAG[rag query Tool]
+    CORE[Core Profile / Conversation Context]
 
     PG[(PostgreSQL)]
     REDIS[(Redis)]
@@ -50,21 +48,17 @@ flowchart TB
     BEAT[Celery Beat]
 
     FE -->|SSE request| API
-    API --> GRAPH
-    GRAPH --> MEM
-    MEM --> SUP
-    SUP --> RAG
-    SUP --> SUM
-    SUP --> WRITE
-    RAG --> LLM
-    SUM --> LLM
-    WRITE --> LLM
+    API --> CORE
+    CORE --> AGENT
+    AGENT --> LLM
+    AGENT -. optional, repeatable .-> MEMORY
+    AGENT -. optional, repeatable .-> RAG
     RAG --> QD
     RAG --> PG
-    MEM --> PG
-    MEM --> REDIS
-    MEM --> EMB
-    MEM -. optional .-> QD
+    MEMORY --> PG
+    MEMORY --> REDIS
+    MEMORY --> EMB
+    MEMORY -. optional .-> QD
     API --> PG
     API --> REDIS
     WORKER --> PG
@@ -89,17 +83,14 @@ flowchart TB
 
 | 文件 | 职责 |
 |---|---|
-| `agents/state.py` | AgentGraphState、trace、取消和 deadline 检查 |
-| `agents/graph.py` | LangGraph 与 sequential 两种执行后端 |
-| `agents/supervisor.py` | 意图识别和路由归一化 |
-| `agents/rag_agent.py` | RAG、Memory Answer、Chat 三类处理 |
-| `agents/summary_agent.py` | 基于知识库证据的摘要 |
-| `agents/writing_agent.py` | 基于知识库证据的写作 |
-| `agents/memory_agent.py` | 回答前加载记忆、回答后更新记忆 |
-| `services/agent_service.py` | 创建状态、运行图、保存 AgentRun、provenance 校验 |
+| `agents/state.py` | `AgentRunState`、trace、取消和 deadline 检查 |
+| `agents/runtime.py` | LangChain `create_agent`、两个工具、动态 Prompt、预算和最终回答 |
+| `agents/memory_agent.py` | 回答前只加载核心画像/会话上下文，工具调用时召回普通长期记忆，回答后更新记忆 |
+| `services/qa_service.py` | 单次 RAG 工具调用的授权范围、混合检索、压缩和 RetrievalLog |
+| `services/agent_service.py` | 创建状态、运行 Agent、保存 AgentRun、provenance 校验 |
 | `services/conversation_service.py` | SSE、消息事务、线程、队列、并发和会话租约 |
 
-### 3.2 AgentGraphState
+### 3.2 AgentRunState
 
 一次 Agent run 的主要状态字段：
 
@@ -108,12 +99,13 @@ flowchart TB
 | 身份 | `user_id` | 当前用户 |
 | 检索范围 | `knowledge_base_id`、`search_scope`、`search_department_id` | 请求目标与范围 |
 | 当前轮 | `input`、`conversation_id`、`message_id`、`top_k` | 用户问题和来源 user Message |
-| 路由 | `intent` | `rag/memory/chat/summary/writing` |
 | 回答 | `answer`、`citations` | 最终文本和引用 |
-| 检索 | `retrieval_log_id`、`searched_knowledge_base_ids` | 真实检索记录和来源库 |
+| 检索 | `retrieval_log_id`、`retrieval_log_ids`、`rag_chunks`、`rag_queries`、`searched_knowledge_base_ids` | 多次 RAG 的证据、日志和来源库 |
 | LLM | `llm_log_id`、`llm_log_ids` | 本轮可计入的 LLM 日志 |
 | 记忆输入 | `short_term_memory`、`profile_memories`、`long_term_memories`、`conversation_summary` | 四类记忆来源 |
 | Prompt 上下文 | `memory_context` | 预算裁剪后的文本 |
+| 循环 | `model_call_count`、`tool_call_count`、`memory_tool_call_count`、`rag_tool_call_count` | 总预算与分工具预算计数 |
+| 工具历史 | `memory_queries`、`rag_queries`、`tool_observations`、`executed_tool_calls` | 防重复、审计和动态 Prompt 输入 |
 | 记忆输出 | `memory_actions`、`defer_memory_update`、`memory_enabled` | 本轮记忆决定 |
 | 控制 | `token_callback`、`cancel_event`、`deadline_monotonic` | 流式输出、取消和超时 |
 | 可追溯性 | `trace`、`status`、`error_message` | 节点轨迹与结果 |
@@ -127,123 +119,81 @@ flowchart TB
 
 ```json
 {
-  "node": "supervisor",
-  "action": "classify_intent",
-  "input": {},
-  "output": {}
+  "node": "agent_tool",
+  "action": "rag",
+  "input": {"query": "差旅审批制度", "tool_call": 2},
+  "output": {"status": "success", "result_count": 5, "retrieval_log_id": "..."}
 }
 ```
 
-### 3.3 图结构
+### 3.3 单 Agent 循环
 
-实际 LangGraph：
+`runtime.py` 用 LangChain `create_agent` 构建一个运行时；LangChain 内部使用 LangGraph 执行模型与工具之间的循环，但项目不再维护自定义 Graph、Supervisor 或多个 answer agent。
 
 ```mermaid
 flowchart TD
-    START --> LOAD[load_memory]
-    LOAD --> SUP[supervisor]
-    SUP -->|summary| SUMMARY[summary_agent]
-    SUP -->|writing| WRITING[writing_agent]
-    SUP -->|rag / memory / chat| RAG[rag_agent]
-    SUMMARY --> UPDATE[update_memory]
-    WRITING --> UPDATE
-    RAG --> UPDATE
+    START --> CORE[加载核心画像与会话上下文]
+    CORE --> MODEL[模型判断]
+    MODEL -->|信息充分| ANSWER[直接输出最终回答]
+    MODEL -->|需要用户长期信息| MEMORY[memory query]
+    MODEL -->|需要企业文档证据| RAG[rag query]
+    MEMORY --> MODEL
+    RAG --> MODEL
+    ANSWER --> UPDATE[延迟或执行记忆写入]
     UPDATE --> END
 ```
 
-注意：
+关键约束：
 
-- `memory` 和 `chat` 没有单独的 LangGraph 节点；它们都进入 `rag_agent`，再在节点内部按 intent 分支。
-- `AGENT_GRAPH_BACKEND=sequential` 使用相同节点顺序，只是不依赖 LangGraph invoke。
-- Settings 只允许 `langgraph` 和 `sequential`，非法 backend 在进程启动时直接失败。
-- 当前每次运行都会构建并编译图，没有全局缓存 compiled graph。
+- 工具调用不是必经步骤；模型文本且没有 tool call 时即为最终回答。
+- 每个模型回合最多保留一个 tool call，并设置 `parallel_tool_calls=false`。
+- 同一工具的同一标准化 query 不会再次执行，但仍消耗总工具预算，防止坏循环。
+- 默认最多 6 次模型调用、4 次工具调用，其中 Memory 最多 2 次、RAG 最多 3 次。
+- 最后一次模型调用以及总工具预算耗尽后的模型调用会移除全部工具，并要求基于已有上下文收口。
 
-### 3.4 意图识别
+### 3.4 模型如何选择工具
 
-合法标签：
+没有独立 intent 标签、分类 Prompt 或路由器。动态 system Prompt 每一轮都会给模型：
 
-| Intent | 使用场景 | 是否检索知识库 |
-|---|---|---|
-| `rag` | 企业事实、制度、流程、文档问题；不确定时的默认值 | 是 |
-| `memory` | 用户询问系统记住了自己的什么、姓名、偏好、项目背景 | 否 |
-| `chat` | 寒暄、感谢、闲聊、情绪交流 | 否 |
-| `summary` | 明确要求根据知识库信息总结 | 是 |
-| `writing` | 明确要求根据知识库证据写邮件、报告、方案或文章 | 是 |
+- 原始用户请求；
+- 固定核心画像、会话摘要与最近对话；
+- 已按需召回的普通长期记忆；
+- 所有 RAG 调用累计的企业证据与稳定引用编号；
+- 前序 Memory/RAG query；
+- 当前剩余的模型、总工具和分工具预算；
+- 当前真正可用的工具集合。
 
-识别顺序：
+Prompt 明确要求：画像或当前上下文已经足够时直接回答；个人事实缺失才调用 Memory；企业事实缺失才调用 RAG；Memory miss 不能成为搜索个人信息到 RAG 的理由。模型对检索结果不满意时可以用实质不同的 query 再查，但不能做只有同义词变化的无效重试。
 
-1. Supervisor 先检查 full-memory-recall marker，例如“你记得我什么”“what do you remember”。命中后直接返回 `memory`。
-2. 其他请求调用 `LlmProvider.classify_intent_with_metadata()`。
-3. Provider 优先使用 `with_structured_output(IntentOutput)`。
-4. 结构化调用失败时，退回普通 completion，再执行 Pydantic coercion。
-5. 非法或无法归一化的标签回退为 `rag`。
-6. 分类调用保存 `LlmCallLog(agent_name="supervisor")`。
+### 3.5 两个工具的执行语义
 
-分类温度由 `LLM_INTENT_TEMPERATURE` 控制，默认 `0.0`。
+#### `memory(query)`
 
-当前分类器只输出标签，不输出 confidence 和 reason。`normalize_intent(raw_intent, text)` 目前不会根据原始用户文本做第二次规则裁决；除 full-memory-recall marker 外，主要保护来自分类 Prompt、结构化 schema 和非法值回退 `rag`。
+- 只搜索当前用户的普通长期记忆，不包含已经固定注入的核心画像。
+- 适用于项目、技术栈、历史决策、事件、工作流和普通偏好。
+- 不搜索知识库，不产生企业引用，也不能作为企业制度事实证据。
+- 每次调用会写召回日志，并把新命中的记忆合并到后续动态上下文。
 
-### 3.5 各意图执行语义
+#### `rag(query)`
 
-#### RAG
-
-`rag_agent` 调用 `qa_service.build_rag_answer()`：
-
-1. 解析用户可访问的检索范围。
-2. 执行高级检索。
-3. 把选中 chunk 组成受限上下文。
-4. 调用 grounded answer Prompt。
-5. 返回 answer、citations、RetrievalLog 和 LLM log。
-
-#### Memory Answer
-
-- 不搜索知识库。
-- 只使用 `memory_context` 回答用户自身信息。
-- 不返回知识库 citation。
-- Prompt 禁止从记忆回答企业制度或文档事实。
-
-#### Chat
-
-- 不搜索知识库。
-- 记忆只能用于语言、语气和连续性。
-- 如果输入实际包含企业事实问题，Prompt 要求提示用户使用知识库检索，而不是猜测。
-
-#### Summary
-
-- 先按用户请求检索知识库证据。
-- 再由 summarizer 对证据生成摘要。
-- 记忆只影响语言、格式和详略。
-- 当前不是任意粘贴文本摘要器；用户请求本身被当作检索问题。
-
-#### Writing
-
-- 先检索知识库证据，再生成草稿。
-- 证据不足的事实应标记 `[needs evidence]` 或使用占位表达。
-- 记忆只控制风格，不提供业务事实。
+- 只搜索服务层已经解析并授权的知识库范围，模型不能传入或修改 KB ID、部门或密级。
+- 每次调用使用模型提供的一条独立 query，执行 Dense + BM25 + RRF，并产生独立 RetrievalLog。
+- 多次调用的 chunk 按 ID 去重后累计；最终上下文在不同检索批次之间轮询取证，避免后一次检索挤掉前一次的关键证据。
+- 企业声明只能来自这些证据，并使用稳定的 `[1]`、`[2]` 引用编号。
 
 ### 3.6 RAG 检索细节
 
 ```text
-原始问题
--> 结构化 Query Rewrite
--> rewritten query + 最多 N 个 sub-query
--> 截断为 RETRIEVAL_MAX_ROUTE_QUERIES
--> 每条 query 同时走 Dense 与 BM25
+模型调用 rag(query)
+-> 该 query 同时走 Dense 与 BM25
 -> SQL hydration 再校验 KB、document.status、security_level
--> 加权 RRF
+-> 无权重 RRF
 -> Top-K
--> chunk 压缩
--> 总回答上下文裁剪
--> grounded answer
+-> 必要时做可验证的抽取式压缩
+-> 返回 Agent 循环重新判断
 ```
 
-默认权重：
-
-- original query：`1.2`
-- rewritten query：`1.1`
-- sub-query：`1.0`
-
-`QUERY_REWRITE_MAX_SUBQUERIES=3` 理论上可产生 original + rewrite + 3 sub-query，但 `RETRIEVAL_MAX_ROUTE_QUERIES=4` 默认只保留前四条。这是显式的质量/成本上限。
+检索层不再执行 LLM Query Rewrite 或子问题拆解；换 query 和是否继续检索由外层 Agent 循环决定。每次 RAG 调用内部只处理一条 query，因此检索逻辑保持为清晰的“两路召回、一次融合”。
 
 Dense 命中不会直接信任 Qdrant payload。系统会按 chunk id 回 PostgreSQL hydration，并再次校验：
 
@@ -260,15 +210,15 @@ RetrievalLog 保存：
 
 - scope 类型；
 - 实际搜索的知识库 ID；
-- 原始问题、rewrite、sub-questions 和 expanded queries；
+- 本次工具调用实际使用的 query；
 - Dense/BM25 路线；
 - candidates、selected chunks、RRF score、security level；
 - 压缩节省字符数；
 - 关联 conversation、source user Message，最终再关联 assistant Message。
 
-Agent 图完成后，`run_agent()` 会重新读取真实 RetrievalLog，并用日志中的来源更新 `searched_knowledge_base_ids`。
+Agent 完成后，`run_agent()` 保留全部 `retrieval_log_ids`，合并每次检索的 `searched_knowledge_base_ids`，并把所有日志关联到最终 assistant Message。
 
-对于 `rag`、`summary`、`writing`：
+对于发生过 RAG 的 run：
 
 - 如果状态准备标记为 completed，但没有真实 RetrievalLog，run 会被改为 failed。
 - answer 和 citations 会清空。
@@ -369,7 +319,7 @@ run_agent(
 
 流式会话始终先 defer 长期记忆写入，确保 assistant Message 提交前不会把未完成回答沉淀成用户记忆。
 
-### 4.5 图内执行
+### 4.5 Agent 内执行
 
 #### 第一步：load_memory
 
@@ -380,21 +330,16 @@ Memory Agent：
 3. Redis 只在数据库没有可用消息时作为 fallback。
 4. 过滤 private/no-memory user + assistant 整轮。
 5. 删除当前已提交的 user Message，避免同时出现在 `input` 和 history。
-6. 召回 Profile 与相关长期记忆。
-7. 写 UserMemoryRecallLog。
-8. 按 token/char 预算组成 `memory_context`。
+6. 只加载核心 Profile；普通长期记忆保持为空。
+7. 按 token/char 预算组成初始 `memory_context`。
 
-#### 第二步：supervisor
+#### 第二步：模型与工具循环
 
-执行 full-memory marker 旁路或 LLM 结构化意图分类，保存 Supervisor LLM log。
+模型先判断当前上下文是否足以回答。需要用户长期信息时调用 `memory(query)`；需要企业证据时调用 `rag(query)`；每次工具返回后重新综合判断。所有模型调用记录 `LlmCallLog(agent_name="agent_runtime")`，每次 RAG 与 Memory 分别保留检索/召回日志。
 
-#### 第三步：intent handler
+#### 第三步：最终回答
 
-- `rag`：高级检索 + grounded answer；
-- `memory`：只基于 memory context 回答；
-- `chat`：非知识库对话；
-- `summary`：检索证据后总结；
-- `writing`：检索证据后写作。
+模型不再调用 answer 工具；没有 tool call 的模型文本就是最终回答。若达到预算，最后一次调用没有工具，只能基于当前画像、召回记忆和累计 RAG 证据回答，证据不足时必须明确说明未检索到足够信息。
 
 #### 第四步：update_memory
 
@@ -414,7 +359,7 @@ Memory Agent：
 
 1. 验证状态和 RetrievalLog 不变量。
 2. 创建 AgentRun。
-3. 保存 answer、citations、intent、trace、state 和日志 ID。
+3. 保存 answer、citations、trace、state、全部 LLM log ID 和 RetrievalLog ID。
 4. 提交 AgentRun。
 5. 把 run id 放入 Queue。
 
@@ -464,7 +409,7 @@ assistant Message 与 AgentRun/RetrievalLog 关联提交后，`apply_deferred_me
 
 1. 从 `AgentRun.state` 恢复 source user Message id。
 2. 读取 user Message 的 `memory_enabled`。
-3. 恢复 input、answer、intent 和检索来源。
+3. 恢复 input、answer、memory_enabled 和检索来源。
 4. 再次调用 `update_user_memories()`。
 5. 把真实 `create/update/supersede/pending/ignore/queued` actions 写回 run state 和 trace。
 6. 提交更新后的 AgentRun。
@@ -1337,14 +1282,9 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 | `LLM_MODEL` | gpt-4o-mini | Chat model |
 | `LLM_TIMEOUT_SECONDS` | 30 | 单次 LLM 请求超时 |
 | `LLM_DEFAULT_TEMPERATURE` | 0.1 | 未指定任务温度 |
-| `LLM_INTENT_TEMPERATURE` | 0.0 | 意图分类 |
 | `LLM_SUMMARY_TEMPERATURE` | 0.2 | 摘要 |
-| `LLM_WRITING_TEMPERATURE` | 0.3 | 写作 |
-| `LLM_CHAT_TEMPERATURE` | 0.2 | Chat |
-| `LLM_RAG_TEMPERATURE` | 0.2 | RAG answer |
-| `LLM_MEMORY_ANSWER_TEMPERATURE` | 0.2 | Memory Answer |
 | `LLM_MEMORY_EDITOR_TEMPERATURE` | 0.0 | Memory Editor/conflict/reconcile |
-| `LLM_QUERY_REWRITE_TEMPERATURE` | 0.0 | Query planner |
+| `LLM_CONTEXT_COMPRESSION_TEMPERATURE` | 0.0 | Memory/RAG 抽取式压缩 |
 | `EMBEDDING_PROVIDER` | openai_compatible | Embedding adapter |
 | `EMBEDDING_BASE_URL` | OpenAI API | Embedding 兼容端点 |
 | `EMBEDDING_API_KEY` | empty | Embedding 访问凭据 |
@@ -1359,11 +1299,15 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 
 | 变量 | 默认值 | 作用 |
 |---|---:|---|
-| `AGENT_GRAPH_BACKEND` | langgraph | `langgraph` 或 `sequential` 执行后端 |
+| `AGENT_MAX_MODEL_CALLS` | 6 | 单轮模型调用上限；最后一次移除工具 |
+| `AGENT_MAX_TOOL_CALLS` | 4 | 单轮 Memory/RAG 工具调用总上限 |
+| `AGENT_MAX_MEMORY_CALLS` | 2 | 单轮 Memory 工具调用上限 |
+| `AGENT_MAX_RAG_CALLS` | 3 | 单轮 RAG 工具调用上限 |
+| `AGENT_TOOL_OBSERVATION_MAX_CHARS` | 2400 | 单次工具观察回传模型的字符上限 |
 | `AGENT_STREAM_MAX_CONCURRENCY` | 8 | 每个 Uvicorn 进程的同时流式 Agent 上限 |
 | `AGENT_STREAM_QUEUE_MAXSIZE` | 128 | worker thread 到 SSE 主线程的单请求事件队列 |
 | `AGENT_STREAM_MIN_TIMEOUT_SECONDS` | 30 | 流式 Agent 最小 deadline |
-| `AGENT_STREAM_TIMEOUT_LLM_CALLS` | 4 | 用 LLM timeout 推导 Agent deadline 的调用倍数 |
+| `AGENT_STREAM_TIMEOUT_LLM_CALLS` | 8 | 用 LLM timeout 推导 Agent deadline 的调用倍数 |
 | `CONVERSATION_LEASE_GRACE_SECONDS` | 30 | 会话租约超出 Agent deadline 的宽限 |
 | `CONVERSATION_SUMMARY_DISPATCH_QUEUE_SIZE` | 256 | 进程内摘要投递队列容量 |
 
@@ -1378,29 +1322,22 @@ max(
 
 会话租约在此基础上加 `CONVERSATION_LEASE_GRACE_SECONDS`。这两组参数过小会中断合法调用，过大则会拉长异常任务占用容量的时间。
 
-### 7.4 Query Planning、Hybrid Retrieval 与上下文
+### 7.4 Hybrid Retrieval 与上下文
 
 | 变量 | 默认值 | 作用 |
 |---|---:|---|
 | `RETRIEVAL_TOP_K` | 5 | 请求未指定 top_k 时的最终 chunk 数 |
 | `RETRIEVAL_ROUTE_LIMIT` | 8 | 每条 retrieval route 进入融合的候选数 |
-| `RETRIEVAL_MAX_ROUTE_QUERIES` | 4 | 单轮允许执行的 query route 上限 |
-| `RETRIEVAL_ORIGINAL_QUERY_WEIGHT` | 1.2 | 原始 query 的 weighted RRF 权重 |
-| `RETRIEVAL_REWRITE_QUERY_WEIGHT` | 1.1 | rewrite query 权重 |
-| `RETRIEVAL_SUBQUERY_WEIGHT` | 1.0 | 每个 subquery 权重 |
 | `RETRIEVAL_DENSE_PREFILTER_MULTIPLIER` | 4 | Dense 预取规模相对 route limit 的倍数 |
 | `RETRIEVAL_BM25_PREFILTER_TERMS` | 12 | BM25 预过滤使用的 query term 上限 |
 | `RETRIEVAL_MAX_MATCHED_TERMS` | 32 | 候选日志保留的 matched term 上限 |
 | `RRF_K` | 60 | Reciprocal Rank Fusion 平滑常数 |
-| `QUERY_REWRITE_MAX_CHARS` | 300 | rewritten query 字符上限 |
-| `QUERY_REWRITE_SUBQUERY_MAX_CHARS` | 300 | 单个 subquery 字符上限 |
-| `QUERY_REWRITE_MAX_SUBQUERIES` | 3 | subquery 数量上限；0 关闭拆分 |
 | `QUESTION_MAX_TOKENS` | 1000 | 单次问题独立 token 上限；超限明确拒绝 |
 | `RAG_CONTEXT_MAX_TOKENS` | 6000 | RAG 证据独立 token 上限；必要时执行可验证的抽取式压缩 |
 | `CONTEXT_COMPRESSION_TARGET_RATIO` | 0.9 | 模型目标相对组件上限的比例 |
 | `CONTEXT_COMPRESSION_RETRY_LIMIT` | 1 | 压缩输出超限或验证失败时的重试次数 |
 
-候选规模还受 Dense 和 BM25 两条路线、有效 route 数和权限过滤影响。增大 route/limit 会提高召回成本与 RetrievalLog 体积，不应只看最终 top_k。
+候选规模受 Dense、BM25 两条路线和权限过滤影响。一次 Agent turn 可以多次调用 RAG，因而总成本还受 `AGENT_MAX_RAG_CALLS` 与总工具预算约束；增大 route/limit 会同步提高每次调用的召回成本与 RetrievalLog 体积。
 
 ### 7.5 记忆、召回和上下文预算
 
@@ -1539,8 +1476,8 @@ broker visibility timeout 取“显式下限”与“memory lease x multiplier�
 
 与 Agent/记忆主链直接相关的回归覆盖包括：
 
-- 五类意图和 deterministic route override；
-- LangGraph/sequential 状态回传与 trace；
+- 直接回答、Memory→回答、Memory miss、Memory→多次 RAG→回答；
+- 重复 query 拦截、总预算/分工具预算、最后一步强制收口与 trace；
 - RAG 记忆上下文隔离、RetrievalLog provenance 与 fail-closed；
 - SSE 提交顺序、并发槽、deadline、取消和会话租约；
 - short memory DB fallback、token budget 和 no-memory turn；
@@ -1562,8 +1499,8 @@ python scripts/check_project.py
 
 ## 10. 当前边界
 
-- Supervisor 是受控分类器，不是任意 tool-using Agent。
-- 当前没有激活 cross-encoder reranker；Dense + BM25 + weighted RRF 是主融合策略。
+- 当前是单个受预算约束的 tool-using Agent，不包含 Supervisor、Reviewer 或子 Agent。
+- 当前没有激活 cross-encoder reranker；每次 RAG 调用使用 Dense + BM25 + 无权重 RRF。
 - Qdrant memory index 是 best-effort acceleration，短暂漂移需 reconcile 修复。
 - citations 表示提供给模型的证据集合，不是逐句事实核验结果。
 - Redis 不可用时，生产会话并发控制 fail closed；这会牺牲可用性以防止跨进程错序。

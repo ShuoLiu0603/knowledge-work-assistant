@@ -11,10 +11,7 @@ class RetrievalLogRead(BaseModel):
     searched_knowledge_base_ids: list
     conversation_id: str | None
     message_id: str | None
-    question: str
-    rewritten_query: str
-    sub_questions: list
-    expanded_queries: list
+    query: str
     retrieval_routes: list
     candidates: list
     selected_chunks: list

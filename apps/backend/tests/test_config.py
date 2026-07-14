@@ -81,7 +81,6 @@ class ConfigTests(unittest.TestCase):
     def test_invalid_choice_settings_are_rejected(self) -> None:
         invalid_values = (
             {"app_env": "prd"},
-            {"agent_graph_backend": "automatic"},
             {"memory_update_mode": "eventually"},
             {"jwt_algorithm": "none"},
             {"llm_provider": "unsupported"},

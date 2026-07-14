@@ -17,15 +17,15 @@ Knowledge Work Assistant 是一个面向企业知识场景的 Agentic RAG 工程
 |---|---|
 | 身份与权限 | 注册、登录、访问/刷新令牌、管理员角色、部门范围、知识库成员角色、L1-L5 文档密级 |
 | 企业知识库 | 公开/私有知识库、成员管理、PDF/DOCX/TXT/Markdown/CSV 上传、文档状态与分块查看 |
-| 知识问答 | Query Rewrite、子问题拆分、Dense + BM25、加权 RRF、上下文压缩、流式回答与引用 |
-| Agent 编排 | `rag`、`memory`、`chat`、`summary`、`writing` 五类意图；LangGraph 或顺序执行后端 |
+| 知识问答 | Agent 按需生成检索词、Dense + BM25、RRF、上下文压缩、多次检索、流式回答与引用 |
+| Agent 编排 | 单个 LangChain `create_agent` 循环；模型可直接回答，或按需多次调用 `memory(query)` / `rag(query)` |
 | 对话记忆 | Redis 短期记忆、会话增量摘要、PostgreSQL 长期记忆、可选 Qdrant 语义索引 |
 | 记忆治理 | 自动候选、待审批、版本修订、软删除、恢复、永久删除、导出、索引校准与召回日志 |
 | 管理与审计 | Agent trace、LLM 调用日志、检索日志、反馈、记忆事件、审计日志和管理指标 |
 
 ## 工程特性
 
-- 固定 Agent 图和后端确定性路由约束，LLM 不具备任意工具调用权限。
+- Agent 只获得 `memory` 与 `rag` 两个受控工具；权限范围、调用预算、超时与最终收口均由后端约束。
 - 权限过滤贯穿 Dense 与 BM25 两条检索链路，知识库证据与用户记忆严格分离。
 - PostgreSQL 作为业务与长期记忆的权威数据源；Qdrant 仅承担可重建的向量索引。
 - Celery durable job、幂等键、租约 fencing、指数退避和 Beat 扫描恢复覆盖主要异步失败窗口。
@@ -39,7 +39,7 @@ Knowledge Work Assistant 是一个面向企业知识场景的 Agentic RAG 工程
 flowchart LR
     Browser[React + Vite] --> API[FastAPI API]
     API --> Services[Service / Authorization]
-    Services --> Agent[Agent Graph]
+    Services --> Agent[LangChain Agent Loop]
     Agent --> RAG[RAG Pipeline]
     Agent --> Memory[Memory Pipeline]
 
@@ -61,7 +61,7 @@ flowchart LR
 系统包含两条主要数据链路：
 
 1. **文档入库**：上传原文到 MinIO，保存文档元数据，由 Celery 解析、切分、生成向量，并写入 PostgreSQL 与 Qdrant。
-2. **对话执行**：提交用户消息，加载获准的会话与记忆上下文，识别意图，执行检索或相应 Agent 节点，流式返回回答，然后持久化日志、消息、摘要和记忆更新任务。
+2. **对话执行**：提交用户消息，固定加载核心用户画像与获准的会话上下文；模型可直接回答，或按需调用长期记忆与知识库检索，直到信息充分或达到预算，然后持久化日志、消息、摘要和记忆更新任务。
 
 完整时序、事务边界、失败语义和数据模型见 [Agent 与记忆模块深度设计](docs/agent_memory_deep_dive.md)。
 
@@ -234,10 +234,10 @@ scripts/            质量门禁、迁移校验、冒烟演示与评估脚本
 
 ## 已知限制
 
-- 当前没有启用 cross-encoder reranker；检索融合依赖 Dense、BM25 与加权 RRF。
+- 当前没有启用 cross-encoder reranker；每次 `rag(query)` 使用 Dense、BM25 与无权重 RRF 融合。
 - 代码与开发模板默认关闭长期记忆 Qdrant 索引，生产模板默认开启；PostgreSQL 始终是权威数据源。
 - 记忆只用于用户偏好、风格和对话连续性，不能作为企业事实证据。
-- `summary` 与 `writing` 基于获准的知识库检索结果，不是任意粘贴文本处理器。
+- Agent 每轮最多调用 6 次模型、4 次工具（其中 Memory 2 次、RAG 3 次）；最后一次模型调用会移除工具并强制收口。
 - Agent 流式并发限制按 Uvicorn 进程生效，不是跨副本的全局配额。
 - 引用表示提供给模型的证据集合，不等同于逐句事实核验。
 - 开发环境的首用户管理员机制仅适用于单实例引导；生产需要明确的管理员生命周期。

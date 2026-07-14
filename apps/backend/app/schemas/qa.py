@@ -36,4 +36,4 @@ class AskKnowledgeBaseResponse(BaseModel):
     question: str
     answer: str
     citations: list[CitationRead]
-    retrieval_log: RetrievalLogRead | None = None
+    retrieval_logs: list[RetrievalLogRead]

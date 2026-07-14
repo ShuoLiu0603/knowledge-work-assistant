@@ -34,9 +34,9 @@ class AgentRunRead(BaseModel):
     conversation_id: str | None
     message_id: str | None
     retrieval_log_id: str | None
+    retrieval_log_ids: list[str]
     searched_knowledge_base_ids: list[str]
     input: str
-    intent: str
     status: str
     answer: str
     citations: list[CitationRead]

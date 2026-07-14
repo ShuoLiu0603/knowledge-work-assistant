@@ -9,33 +9,15 @@ from fastapi import HTTPException
 from app.db.models.document import Document, DocumentChunk
 from app.db.models.knowledge_base import KnowledgeBaseMember
 from app.db.models.audit_log import AuditLog
-from app.llm.provider import LlmCompletion
-from app.rag.advanced_retrieval import retrieve_bm25_routes
+from app.rag.advanced_retrieval import retrieve_bm25_route
 from app.rag.retrieval import RetrievedChunk
 from app.rag.vector_store import search_knowledge_base_chunks
 from app.schemas.admin import AdminUserUpdate
 from app.schemas.knowledge_base import KnowledgeBaseCreate
 from app.services.admin_service import list_admin_users, update_admin_user
 from app.services.knowledge_base_service import create_knowledge_base
-from app.services.qa_service import build_rag_answer
+from app.services.qa_service import retrieve_rag_evidence
 from helpers import create_user, isolated_session
-
-
-class FakeRagLlmProvider:
-    def answer_question_with_metadata(self, question: str, context: str, memory_context: str = "", on_token=None) -> LlmCompletion:
-        content = "Answer from retrieved policy. [1]"
-        if on_token:
-            on_token(content)
-        return LlmCompletion(
-            content=content,
-            provider="openai_compatible",
-            model_name="fake-chat",
-            prompt_tokens=10,
-            completion_tokens=6,
-            total_tokens=16,
-            latency_ms=1,
-            status="success",
-        )
 
 
 class SecurityLevelTests(unittest.TestCase):
@@ -68,11 +50,11 @@ class SecurityLevelTests(unittest.TestCase):
             )
             session.commit()
 
-            low_routes = retrieve_bm25_routes(session, kb.id, ["reimbursement policy"], route_limit=10, max_security_level=1)
-            high_routes = retrieve_bm25_routes(session, kb.id, ["reimbursement policy"], route_limit=10, max_security_level=4)
+            low_routes = retrieve_bm25_route(session, kb.id, "reimbursement policy", route_limit=10, max_security_level=1)
+            high_routes = retrieve_bm25_route(session, kb.id, "reimbursement policy", route_limit=10, max_security_level=4)
 
-            low_bm25 = low_routes["bm25_original"]
-            high_bm25 = high_routes["bm25_original"]
+            low_bm25 = low_routes["bm25"]
+            high_bm25 = high_routes["bm25"]
 
             self.assertEqual({item.chunk.file_name for item in low_bm25}, {"public-policy.md"})
             self.assertEqual({item.chunk.file_name for item in high_bm25}, {"public-policy.md", "secret-policy.md"})
@@ -194,10 +176,9 @@ class SecurityLevelTests(unittest.TestCase):
                 security_level=2,
             )
             retrieval = SimpleNamespace(
-                question="policy",
-                rewritten_query="policy",
-                sub_questions=[],
-                expanded_queries=["policy"],
+                query="policy",
+                scope_type="single",
+                searched_knowledge_base_ids=[kb.id],
                 retrieval_routes=["dense"],
                 candidates=[{"chunk_id": "chunk-1"}],
                 selected_chunks=[chunk],
@@ -206,14 +187,11 @@ class SecurityLevelTests(unittest.TestCase):
                 compression_chars_saved=0,
             )
 
-            with (
-                patch("app.services.qa_service.retrieve_advanced_chunks", return_value=retrieval),
-                patch("app.rag.answering.get_llm_provider", return_value=FakeRagLlmProvider()),
-            ):
-                answer = build_rag_answer(session, user.id, kb.id, "policy")
+            with patch("app.services.qa_service.retrieve_advanced_chunks", return_value=retrieval):
+                evidence = retrieve_rag_evidence(session, user.id, kb.id, "policy")
 
             audit_log = session.query(AuditLog).filter(AuditLog.action == "rag.retrieve").one()
-            self.assertEqual(answer.retrieval_log_id, audit_log.extra_metadata["retrieval_log_id"])
+            self.assertEqual(evidence.retrieval_log_id, audit_log.extra_metadata["retrieval_log_id"])
             self.assertEqual(audit_log.security_level, 5)
             self.assertEqual(audit_log.extra_metadata["selected_count"], 1)
 
@@ -239,10 +217,9 @@ class SecurityLevelTests(unittest.TestCase):
                 security_level=5,
             )
             retrieval = SimpleNamespace(
-                question="policy",
-                rewritten_query="policy",
-                sub_questions=[],
-                expanded_queries=["policy"],
+                query="policy",
+                scope_type="single",
+                searched_knowledge_base_ids=[kb.id],
                 retrieval_routes=["dense"],
                 candidates=[{"chunk_id": "chunk-private"}],
                 selected_chunks=[chunk],
@@ -251,11 +228,8 @@ class SecurityLevelTests(unittest.TestCase):
                 compression_chars_saved=0,
             )
 
-            with (
-                patch("app.services.qa_service.retrieve_advanced_chunks", return_value=retrieval) as retrieve,
-                patch("app.rag.answering.get_llm_provider", return_value=FakeRagLlmProvider()),
-            ):
-                build_rag_answer(session, user.id, kb.id, "policy")
+            with patch("app.services.qa_service.retrieve_advanced_chunks", return_value=retrieval) as retrieve:
+                retrieve_rag_evidence(session, user.id, kb.id, "policy")
 
             self.assertEqual(retrieve.call_args.kwargs["max_security_level"], 5)
 

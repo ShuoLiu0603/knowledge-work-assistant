@@ -6,29 +6,55 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-INTENTS = {"rag", "memory", "chat", "summary", "writing"}
 MEMORY_ACTIONS = {"create", "update", "supersede", "pending", "ignore"}
 MEMORY_KINDS = {"preference", "profile", "instruction"}
+MEMORY_CATEGORIES = {
+    "general",
+    "name",
+    "preferred_address",
+    "current_role",
+    "language",
+    "response_detail",
+    "format",
+    "tone",
+    "accessibility",
+    "global_instruction",
+    "company",
+    "team",
+    "role",
+    "profile",
+    "background",
+    "current_project",
+    "current_stack",
+    "backend_framework",
+    "frontend_framework",
+    "architecture",
+    "tooling",
+    "decision",
+    "event",
+    "task",
+    "workflow",
+    "task_instruction",
+    "domain_rule",
+}
 IMPORTANCE_LEVELS = {"low", "medium", "high"}
 SENSITIVITY_LEVELS = {"low", "medium", "high"}
 
 
-class IntentOutput(BaseModel):
-    intent: Literal["rag", "memory", "chat", "summary", "writing"] = "rag"
+class MemoryClassificationOutput(BaseModel):
+    kind: Literal["preference", "profile", "instruction"] = "preference"
+    category: str = Field(default="general", max_length=80)
 
-    @field_validator("intent", mode="before")
+    @field_validator("kind", mode="before")
     @classmethod
-    def normalize_intent(cls, value: object) -> str:
-        text = str(value or "").strip().lower()
-        if any(marker in text for marker in ("summary", "summarize", "recap", "总结", "摘要", "概括", "归纳")):
-            return "summary"
-        if any(marker in text for marker in ("writing", "write", "draft", "compose", "写作", "撰写", "起草")):
-            return "writing"
-        if any(marker in text for marker in ("memory_answer", "memory", "记忆")):
-            return "memory"
-        if any(marker in text for marker in ("chat", "small", "聊天", "闲聊", "寒暄", "问候")):
-            return "chat"
-        return "rag"
+    def normalize_kind(cls, value: object) -> str:
+        return normalize_allowed(value, MEMORY_KINDS, "preference")
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def normalize_category(cls, value: object) -> str:
+        normalized = normalize_whitespace(str(value or "")).lower()
+        return normalized if normalized in MEMORY_CATEGORIES else "general"
 
 
 class MemoryOperationOutput(BaseModel):

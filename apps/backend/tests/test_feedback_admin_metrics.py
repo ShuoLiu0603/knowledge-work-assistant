@@ -69,8 +69,7 @@ class FeedbackAndAdminMetricTests(unittest.TestCase):
                     knowledge_base_id=kb.id,
                     conversation_id=conversation.id,
                     message_id=assistant_message.id,
-                    question="question",
-                    rewritten_query="question",
+                    query="question",
                     selected_chunks=[{"chunk_id": "chunk-1"}, {"chunk_id": "chunk-2"}],
                 )
             )

@@ -89,7 +89,7 @@ class RetentionServiceTests(unittest.TestCase):
             self.assertEqual(result["deleted_counts"]["external_cleanup_jobs"], 1)
 
             self.assertEqual([row.model_name for row in session.query(LlmCallLog).all()], ["new-model"])
-            self.assertEqual([row.question for row in session.query(RetrievalLog).all()], ["new retrieval"])
+            self.assertEqual([row.query for row in session.query(RetrievalLog).all()], ["new retrieval"])
             self.assertEqual([row.input for row in session.query(AgentRun).all()], ["new agent run"])
             self.assertEqual([row.query for row in session.query(UserMemoryRecallLog).all()], ["new recall"])
 
@@ -169,26 +169,22 @@ def seed_retention_rows(session, user_id: str, now: datetime) -> None:
             ),
             RetrievalLog(
                 user_id=user_id,
-                question="old retrieval",
-                rewritten_query="old retrieval",
+                query="old retrieval",
                 created_at=old_100,
             ),
             RetrievalLog(
                 user_id=user_id,
-                question="new retrieval",
-                rewritten_query="new retrieval",
+                query="new retrieval",
                 created_at=new_10,
             ),
             AgentRun(
                 user_id=user_id,
                 input="old agent run",
-                intent="rag",
                 created_at=old_100,
             ),
             AgentRun(
                 user_id=user_id,
                 input="new agent run",
-                intent="rag",
                 created_at=new_10,
             ),
             UserMemoryRecallLog(

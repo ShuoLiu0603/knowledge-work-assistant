@@ -22,17 +22,15 @@ class UserMemory(Base):
             sqlite_where=text(
                 "status = 'active' AND memory_layer = 'profile' "
                 "AND profile_slot IN ("
-                "'response_detail', 'language', 'format', 'name', 'company', "
-                "'team', 'current_role', 'current_project', 'current_stack', "
-                "'backend_framework', 'frontend_framework'"
+                "'response_detail', 'language', 'format', 'name', 'preferred_address', "
+                "'current_role', 'tone', 'accessibility'"
                 ")"
             ),
             postgresql_where=text(
                 "status = 'active' AND memory_layer = 'profile' "
                 "AND profile_slot IN ("
-                "'response_detail', 'language', 'format', 'name', 'company', "
-                "'team', 'current_role', 'current_project', 'current_stack', "
-                "'backend_framework', 'frontend_framework'"
+                "'response_detail', 'language', 'format', 'name', 'preferred_address', "
+                "'current_role', 'tone', 'accessibility'"
                 ")"
             ),
         ),

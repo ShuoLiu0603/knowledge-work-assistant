@@ -1,20 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
-
 from app.core.config import get_settings
-from app.llm.provider import LlmCompletion
-from app.llm.provider import get_llm_provider
 from app.llm.token_counter import count_tokens
 from app.rag.retrieval import RetrievedChunk
-
-
-@dataclass(frozen=True)
-class GeneratedAnswer:
-    answer: str
-    completion: LlmCompletion
-    used_chunks: list[RetrievedChunk]
 
 
 def select_answer_context_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
@@ -29,25 +17,6 @@ def select_answer_context_chunks(chunks: list[RetrievedChunk]) -> list[Retrieved
         selected.append(chunk)
         used_tokens += row_tokens
     return selected
-
-
-def generate_grounded_answer(
-    question: str,
-    chunks: list[RetrievedChunk],
-    memory_context: str = "",
-    on_token: Callable[[str], None] | None = None,
-) -> GeneratedAnswer:
-    used_chunks = select_answer_context_chunks(chunks)
-    completion = get_llm_provider().answer_question_with_metadata(
-        question,
-        format_answer_context(used_chunks),
-        memory_context=memory_context,
-        on_token=on_token,
-    )
-    answer = completion.content.strip()
-    if not answer:
-        raise RuntimeError("LLM provider returned an empty answer.")
-    return GeneratedAnswer(answer, completion, used_chunks)
 
 
 def format_answer_context(chunks: list[RetrievedChunk]) -> str:

@@ -130,6 +130,21 @@ class StructuredFakeLlmProvider:
         return MemoryReview(operations=[operation], completion=fake_completion())
 
 
+class FakeMemoryClassificationProvider:
+    def __init__(self, kind: str, category: str):
+        self.kind = kind
+        self.category = category
+
+    def classify_memory_with_metadata(self, _content: str):
+        from app.llm.provider import MemoryClassification
+
+        return MemoryClassification(
+            kind=self.kind,
+            category=self.category,
+            completion=fake_completion(),
+        )
+
+
 class PromotingFakeLlmProvider(StructuredFakeLlmProvider):
     def review_memory_operations(self, user_message: str, assistant_message: str, existing_memories: list[dict]):
         from app.llm.provider import MemoryOperation, MemoryReview
@@ -555,12 +570,35 @@ class MemoryServiceTests(unittest.TestCase):
                 category="language",
             )
 
-            with patch.object(memory_service, "retrieve_relevant_memories", return_value=[]) as retrieve:
+            with patch.object(memory_service, "retrieve_relevant_memories") as retrieve:
                 context = memory_service.build_memory_context_for_question(session, user.id, "unrelated question")
 
             self.assertIn(profile.content, context)
             self.assertIn("Stable preferences", context)
-            self.assertEqual(retrieve.call_args.kwargs["include_profile"], False)
+            retrieve.assert_not_called()
+
+    def test_account_username_is_profile_fallback_but_saved_name_takes_priority(self) -> None:
+        with (
+            isolated_session() as session,
+            patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+        ):
+            user = create_user(session, "memory-name-fallback@example.com", "Account Name")
+
+            fallback = memory_service.list_core_profile_context(session, user.id)
+            self.assertEqual([memory["id"] for memory in fallback], ["account:username"])
+            self.assertIn("Account Name", fallback[0]["content"])
+
+            saved = memory_service.create_manual_memory(
+                session,
+                user.id,
+                "User prefers to be called Alice",
+                category="name",
+                kind="profile",
+            )
+            profile = memory_service.list_core_profile_context(session, user.id)
+
+            self.assertEqual([memory["id"] for memory in profile], [saved.id])
+            self.assertNotIn("account:username", [memory["id"] for memory in profile])
 
     def test_memory_governance_fields_are_persisted_and_updated(self) -> None:
         with (
@@ -597,7 +635,7 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertFalse(updated.pinned)
             self.assertEqual(updated.revision, 2)
 
-    def test_identity_and_current_project_slots_are_sticky_singletons(self) -> None:
+    def test_identity_is_core_profile_while_current_project_is_on_demand(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
@@ -634,15 +672,15 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertEqual(new_name.profile_slot, "name")
             self.assertEqual(new_name.canonical_key, "profile:name")
             self.assertTrue(new_name.pinned)
-            self.assertEqual(project.memory_layer, "profile")
-            self.assertEqual(project.profile_slot, "current_project")
+            self.assertEqual(project.memory_layer, "semantic")
+            self.assertEqual(project.profile_slot, "")
             self.assertEqual(project.canonical_key, "project:current_project")
 
             with patch.object(memory_service, "retrieve_relevant_memories", return_value=[]):
                 context = memory_service.build_memory_context_for_question(session, user.id, "unrelated question")
 
             self.assertIn(new_name.content, context)
-            self.assertIn(project.content, context)
+            self.assertNotIn(project.content, context)
 
     def test_memory_vector_payload_contains_governance_fields(self) -> None:
         from app.memory import vector_index
@@ -900,7 +938,7 @@ class MemoryServiceTests(unittest.TestCase):
             session.refresh(first)
             self.assertEqual(first.status, "active")
 
-    def test_non_singleton_profile_slots_can_have_multiple_active_memories(self) -> None:
+    def test_on_demand_role_memories_can_have_multiple_active_rows(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
@@ -934,8 +972,10 @@ class MemoryServiceTests(unittest.TestCase):
 
             self.assertEqual(first.status, "active")
             self.assertEqual(second.status, "active")
-            self.assertEqual(first.profile_slot, "role")
-            self.assertEqual(second.profile_slot, "role")
+            self.assertEqual(first.memory_layer, "semantic")
+            self.assertEqual(second.memory_layer, "semantic")
+            self.assertEqual(first.profile_slot, "")
+            self.assertEqual(second.profile_slot, "")
 
     def test_memory_reconcile_dry_run_reports_without_applying(self) -> None:
         with (
@@ -1801,6 +1841,83 @@ class MemoryServiceTests(unittest.TestCase):
 
             self.assertEqual(create_error.exception.status_code, 400)
 
+    def test_manual_memory_auto_classifies_without_user_supplied_category(self) -> None:
+        with (
+            isolated_session() as session,
+            patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+            patch(
+                "app.services.memory_service.get_llm_provider",
+                return_value=FakeMemoryClassificationProvider("profile", "current_project"),
+            ),
+        ):
+            user = create_user(session, "auto-classified-memory@example.com", "Auto Classified Memory")
+
+            memory = memory_service.create_manual_memory(
+                session,
+                user.id,
+                "User is building an Agentic RAG project",
+                auto_classify=True,
+            )
+
+            self.assertEqual(memory.kind, "profile")
+            self.assertEqual(memory.category, "current_project")
+            self.assertEqual(memory.memory_layer, "semantic")
+            self.assertFalse(memory.pinned)
+            classifier_log = session.scalar(
+                select(LlmCallLog).where(
+                    LlmCallLog.user_id == user.id,
+                    LlmCallLog.agent_name == "memory_classifier",
+                )
+            )
+            self.assertIsNotNone(classifier_log)
+
+    def test_manual_memory_content_edit_is_reclassified(self) -> None:
+        with (
+            isolated_session() as session,
+            patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+        ):
+            user = create_user(session, "reclassified-memory@example.com", "Reclassified Memory")
+            memory = memory_service.create_manual_memory(session, user.id, "User works on a temporary project")
+
+            with patch(
+                "app.services.memory_service.get_llm_provider",
+                return_value=FakeMemoryClassificationProvider("profile", "name"),
+            ):
+                updated = memory_service.update_user_memory(
+                    session,
+                    user.id,
+                    memory.id,
+                    content="User prefers to be called Alice",
+                    auto_classify=True,
+                )
+
+            self.assertEqual(updated.category, "name")
+            self.assertEqual(updated.memory_layer, "profile")
+            self.assertEqual(updated.profile_slot, "name")
+            self.assertTrue(updated.pinned)
+
+    def test_global_instruction_requires_explicit_global_scope(self) -> None:
+        with (
+            isolated_session() as session,
+            patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+            patch(
+                "app.services.memory_service.get_llm_provider",
+                return_value=FakeMemoryClassificationProvider("instruction", "global_instruction"),
+            ),
+        ):
+            user = create_user(session, "scoped-instruction@example.com", "Scoped Instruction")
+
+            memory = memory_service.create_manual_memory(
+                session,
+                user.id,
+                "Use citations when answering policy questions",
+                auto_classify=True,
+            )
+
+            self.assertEqual(memory.category, "task_instruction")
+            self.assertEqual(memory.memory_layer, "procedural")
+            self.assertFalse(memory.pinned)
+
     def test_manual_memory_requires_confirmation_for_sensitive_content(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "manual-sensitive-memory@example.com", "Manual Sensitive Memory")
@@ -2207,7 +2324,6 @@ class MemoryServiceTests(unittest.TestCase):
             run = AgentRun(
                 user_id=user.id,
                 input="What do you remember?",
-                intent="memory",
                 status="completed",
                 answer="",
                 citations=[],

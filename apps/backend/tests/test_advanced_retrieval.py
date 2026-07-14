@@ -9,11 +9,9 @@ from app.rag.advanced_retrieval import (
     RetrievalCandidate,
     fuse_candidates,
     hydrate_retrieved_chunks,
-    plan_retrieval_queries,
     retrieve_advanced_chunks,
-    retrieve_bm25_routes,
+    retrieve_bm25_route,
 )
-from app.rag.query_rewrite import QueryRewritePlan
 from app.rag.retrieval import RetrievedChunk
 from app.schemas.knowledge_base import KnowledgeBaseCreate
 from app.services.knowledge_base_service import create_knowledge_base
@@ -21,58 +19,25 @@ from helpers import create_user, isolated_session
 
 
 class AdvancedRetrievalTests(unittest.TestCase):
-    def test_plan_uses_llm_rewrite_and_limited_sub_queries(self) -> None:
-        rewrite_plan = QueryRewritePlan(
-            rewritten_query="RAG retrieval and long-term memory answer flow",
-            sub_questions=["RAG retrieval flow", "long-term memory answer flow"],
-        )
-
-        with patch("app.rag.advanced_retrieval.rewrite_query", return_value=rewrite_plan):
-            rewritten, sub_queries, retrieval_queries = plan_retrieval_queries(
-                "How do RAG and long-term memory participate in answering?"
-            )
-
-        self.assertEqual(rewritten, "RAG retrieval and long-term memory answer flow")
-        self.assertEqual(sub_queries, ["RAG retrieval flow", "long-term memory answer flow"])
-        self.assertEqual(
-            retrieval_queries,
-            [
-                "How do RAG and long-term memory participate in answering?",
-                "RAG retrieval and long-term memory answer flow",
-                "RAG retrieval flow",
-                "long-term memory answer flow",
-            ],
-        )
-
-    def test_plan_falls_back_when_llm_rewrite_is_unavailable(self) -> None:
-        rewrite_plan = QueryRewritePlan(rewritten_query="RAG fallback behavior", sub_questions=[])
-
-        with patch("app.rag.advanced_retrieval.rewrite_query", return_value=rewrite_plan):
-            rewritten, sub_queries, retrieval_queries = plan_retrieval_queries("Please explain RAG?")
-
-        self.assertEqual(rewritten, "RAG fallback behavior")
-        self.assertEqual(sub_queries, [])
-        self.assertEqual(retrieval_queries, ["Please explain RAG?", "RAG fallback behavior"])
-
     def test_rrf_dedupes_chunks_and_rewards_multi_route_hits(self) -> None:
         chunk_a = make_chunk("a", score=0.3)
         chunk_b = make_chunk("b", score=0.9)
 
         fused = fuse_candidates(
             {
-                "dense_original": [
-                    make_candidate(chunk_b, "dense_original", rank=1, score=0.9, weight=1.2),
-                    make_candidate(chunk_a, "dense_original", rank=2, score=0.3, weight=1.2),
+                "dense": [
+                    make_candidate(chunk_b, "dense", rank=1, score=0.9),
+                    make_candidate(chunk_a, "dense", rank=2, score=0.3),
                 ],
-                "bm25_subquery_1": [
-                    make_candidate(chunk_a, "bm25_subquery_1", rank=1, score=2.0, weight=1.0),
+                "bm25": [
+                    make_candidate(chunk_a, "bm25", rank=1, score=2.0),
                 ],
             },
             rrf_k=60,
         )
 
         self.assertEqual([item.chunk.chunk_id for item in fused], ["a", "b"])
-        self.assertEqual(fused[0].routes, ["dense_original", "bm25_subquery_1"])
+        self.assertEqual(fused[0].routes, ["dense", "bm25"])
         self.assertGreater(fused[0].rrf_score, fused[1].rrf_score)
 
     def test_selected_chunks_preserve_full_content_without_keyword_compression(self) -> None:
@@ -83,24 +48,21 @@ class AdvancedRetrievalTests(unittest.TestCase):
         chunk = make_chunk("full-content", score=0.9, content=content)
         fused = FusedCandidate(
             chunk=chunk,
-            routes=["dense_original"],
+            routes=["dense"],
             rrf_score=0.12345678,
             best_score=0.9,
             matched_terms=["fraud"],
         )
-        rewrite_plan = QueryRewritePlan(rewritten_query="fraud", sub_questions=[])
-
         with (
-            patch("app.rag.advanced_retrieval.rewrite_query", return_value=rewrite_plan),
-            patch("app.rag.advanced_retrieval.retrieve_dense_routes", return_value={}),
-            patch("app.rag.advanced_retrieval.retrieve_bm25_routes", return_value={}),
+            patch("app.rag.advanced_retrieval.retrieve_dense_route", return_value={}),
+            patch("app.rag.advanced_retrieval.retrieve_bm25_route", return_value={}),
             patch("app.rag.advanced_retrieval.fuse_candidates", return_value=[fused]),
         ):
             result = retrieve_advanced_chunks(None, "owner", "kb", "Who committed fraud?")
 
         self.assertEqual(result.selected_chunks[0].content, content)
         self.assertEqual(result.selected_chunks[0].rrf_score, 0.123457)
-        self.assertEqual(result.selected_chunks[0].retrieval_routes, ["dense_original"])
+        self.assertEqual(result.selected_chunks[0].retrieval_routes, ["dense"])
         self.assertEqual(result.compression_chars_saved, 0)
 
     def test_dense_hits_are_hydrated_from_indexed_database_chunks(self) -> None:
@@ -147,15 +109,15 @@ class AdvancedRetrievalTests(unittest.TestCase):
             )
             session.commit()
 
-            routes = retrieve_bm25_routes(
+            routes = retrieve_bm25_route(
                 session,
                 kb.id,
-                ["expense policy reimbursement"],
+                "expense policy reimbursement",
                 route_limit=10,
                 max_security_level=1,
             )
 
-            self.assertEqual({item.chunk.file_name for item in routes["bm25_original"]}, {"indexed.md"})
+            self.assertEqual({item.chunk.file_name for item in routes["bm25"]}, {"indexed.md"})
 
     def test_bm25_can_search_multiple_authorized_knowledge_bases(self) -> None:
         with isolated_session() as session:
@@ -177,15 +139,15 @@ class AdvancedRetrievalTests(unittest.TestCase):
             )
             session.commit()
 
-            routes = retrieve_bm25_routes(
+            routes = retrieve_bm25_route(
                 session,
                 [first_kb.id, second_kb.id],
-                ["expense policy"],
+                "expense policy",
                 route_limit=10,
                 max_security_level=1,
             )
 
-            self.assertEqual({item.chunk.file_name for item in routes["bm25_original"]}, {"first.md", "second.md"})
+            self.assertEqual({item.chunk.file_name for item in routes["bm25"]}, {"first.md", "second.md"})
 
     def test_bm25_can_match_file_and_section_metadata(self) -> None:
         with isolated_session() as session:
@@ -200,15 +162,15 @@ class AdvancedRetrievalTests(unittest.TestCase):
             session.add(chunk)
             session.commit()
 
-            routes = retrieve_bm25_routes(
+            routes = retrieve_bm25_route(
                 session,
                 kb.id,
-                ["travel rules"],
+                "travel rules",
                 route_limit=10,
                 max_security_level=1,
             )
 
-            self.assertEqual([item.chunk.file_name for item in routes["bm25_original"]], ["travel-policy.md"])
+            self.assertEqual([item.chunk.file_name for item in routes["bm25"]], ["travel-policy.md"])
 
 def make_chunk(chunk_id: str, score: float, content: str | None = None) -> RetrievedChunk:
     return RetrievedChunk(
@@ -231,16 +193,13 @@ def make_candidate(
     route: str,
     rank: int,
     score: float,
-    weight: float,
 ) -> RetrievalCandidate:
     return RetrievalCandidate(
         chunk=chunk,
         route=route,
         query="query",
-        query_index=0,
         rank=rank,
         score=score,
-        weight=weight,
         matched_terms=[],
     )
 

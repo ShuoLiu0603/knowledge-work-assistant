@@ -485,8 +485,7 @@ class WorkerReliabilityTests(unittest.TestCase):
                 conversation_id=conversation.id,
                 scope_type="accessible",
                 searched_knowledge_base_ids=[],
-                question=source.content,
-                rewritten_query=source.content,
+                query=source.content,
             )
             session.add_all([source, assistant, retrieval_log])
             session.commit()
@@ -496,7 +495,6 @@ class WorkerReliabilityTests(unittest.TestCase):
                 message_id=source.id,
                 retrieval_log_id=retrieval_log.id,
                 input=source.content,
-                intent="chat",
                 status="completed",
                 answer=assistant.content,
                 state={

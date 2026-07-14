@@ -17,18 +17,19 @@
 
 当前检索包含：
 
-- Query Planning：保留原始问题，生成 rewritten query，并在复杂问题下拆出 sub-queries；去重后按 `RETRIEVAL_MAX_ROUTE_QUERIES` 截断。
-- Dense Retrieval：原始、rewrite 和保留的 subquery route 都从 Qdrant 召回语义相近 chunk。
-- BM25 Retrieval：同一组 route 从 PostgreSQL chunk 正文召回词项匹配候选。
-- RRF 融合：按 chunk id 去重，并用加权 RRF 合并不同路线的候选排名。
+- Agent Query：外层 Agent 每次向 `rag(query)` 提交一条针对当前缺口的独立 query；检索层不再二次改写或拆子问题。
+- Dense Retrieval：从 Qdrant 召回语义相近 chunk，并回 PostgreSQL hydration 再校验状态、范围和密级。
+- BM25 Retrieval：用同一条 query 从 PostgreSQL chunk 正文与标题元数据召回词项匹配候选。
+- RRF 融合：按 chunk id 去重，并用无权重 RRF 合并 Dense 与 BM25 排名。
 - Context Compression：压缩过长 chunk，保留更相关片段。
 
 ## 3. 回答阶段
 
-1. 选中的 chunk 组成带编号的上下文。
-2. LLM Provider 基于上下文生成答案。
-3. 有检索证据的回答附带 citations；无可用证据时明确说明依据不足，citations 为空。
-4. `retrieval_logs` 保存 normalized query、sub-queries、routes、candidates、selected chunks 和 RRF 分数。
+1. 单次工具调用把选中的 chunk 与 RetrievalLog 返回 Agent。
+2. Agent 可以换一条实质不同的 query 再次调用 RAG，也可以基于累计证据回答。
+3. 多批证据使用稳定编号；企业事实回答必须保留 `[1]`、`[2]` 等引用。
+4. 无可用证据时明确说明依据不足，citations 为空。
+5. 每条 `retrieval_logs` 保存实际 query、routes、candidates、selected chunks 和 RRF 分数；一次回答可以关联多条日志。
 
 ## 4. 评估指标
 
@@ -41,4 +42,4 @@
 
 - 评估脚本只做轻量自动评估，不替代人工验收。
 - 当前主链路不启用 metadata route 或 reranker。
-- RAG Agent 复用已有 RAG service，不重写检索逻辑。
+- 多次检索由 Agent 总工具预算和 RAG 分预算共同限制，默认单轮最多调用 RAG 3 次。

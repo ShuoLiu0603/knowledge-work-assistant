@@ -57,8 +57,8 @@ def create_item(
         db,
         current_user.id,
         payload.content.strip(),
-        kind=payload.kind,
         allow_sensitive=payload.confirm_sensitive,
+        auto_classify=True,
     )
     return to_memory_read(memory)
 
@@ -139,8 +139,8 @@ def update_item(
         expected_revision=payload.expected_revision,
         content=payload.content.strip() if payload.content is not None else None,
         status=payload.status,
-        kind=payload.kind,
         allow_sensitive=payload.confirm_sensitive,
+        auto_classify=payload.content is not None,
     )
     return to_memory_read(memory)
 
@@ -218,7 +218,12 @@ def to_memory_read(memory: UserMemory) -> UserMemoryRead:
         merge_count=memory.merge_count,
         touched_count=memory.touched_count,
         superseded_by_id=memory.superseded_by_id,
-        metadata=memory.extra_metadata,
+        metadata={
+            **(memory.extra_metadata or {}),
+            "canonical_key": memory.canonical_key,
+            "memory_layer": memory.memory_layer,
+            "profile_slot": memory.profile_slot,
+        },
         valid_at=memory.valid_at,
         invalid_at=memory.invalid_at,
         created_at=memory.created_at,

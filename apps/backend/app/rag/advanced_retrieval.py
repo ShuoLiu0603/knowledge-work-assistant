@@ -11,26 +11,14 @@ from app.core.config import get_settings
 from app.db.models.document import Document, DocumentChunk
 from app.db.models.knowledge_base import KnowledgeBase
 from app.rag.answering import compact_snippet
-from app.rag.query_rewrite import normalize_whitespace, rewrite_query
 from app.rag.retrieval import RetrievedChunk, retrieve_dense_chunks
 
 TERM_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
 
 _SETTINGS = get_settings()
-MAX_ROUTE_QUERIES = _SETTINGS.retrieval_max_route_queries
-ORIGINAL_QUERY_WEIGHT = _SETTINGS.retrieval_original_query_weight
-REWRITE_QUERY_WEIGHT = _SETTINGS.retrieval_rewrite_query_weight
-SUB_QUERY_WEIGHT = _SETTINGS.retrieval_subquery_weight
 DENSE_PREFILTER_MULTIPLIER = _SETTINGS.retrieval_dense_prefilter_multiplier
 BM25_PREFILTER_TERMS = _SETTINGS.retrieval_bm25_prefilter_terms
 MAX_MATCHED_TERMS = _SETTINGS.retrieval_max_matched_terms
-
-
-@dataclass(frozen=True)
-class RetrievalQuery:
-    text: str
-    route_suffix: str
-    weight: float
 
 
 @dataclass(frozen=True)
@@ -38,10 +26,8 @@ class RetrievalCandidate:
     chunk: RetrievedChunk
     route: str
     query: str
-    query_index: int
     rank: int
     score: float
-    weight: float
     matched_terms: list[str]
 
 
@@ -56,12 +42,9 @@ class FusedCandidate:
 
 @dataclass(frozen=True)
 class AdvancedRetrievalResult:
-    question: str
+    query: str
     scope_type: str
     searched_knowledge_base_ids: list[str]
-    rewritten_query: str
-    sub_questions: list[str]
-    expanded_queries: list[str]
     retrieval_routes: list[str]
     candidates: list[dict]
     selected_chunks: list[RetrievedChunk]
@@ -83,25 +66,24 @@ def retrieve_advanced_chunks(
     settings = get_settings()
     limit = top_k or settings.retrieval_top_k
     knowledge_base_ids = normalize_kb_ids(kb_ids)
-    rewritten_query, sub_queries, planned_queries = plan_retrieval_query_routes(question)
-    retrieval_queries = [query.text for query in planned_queries]
+    query = normalize_query(question)
 
     route_candidates: dict[str, list[RetrievalCandidate]] = {}
     route_candidates.update(
-        retrieve_dense_routes(
+        retrieve_dense_route(
             db,
             owner_id,
             knowledge_base_ids,
-            planned_queries,
+            query,
             settings.retrieval_route_limit,
             max_security_level=max_security_level,
         )
     )
     route_candidates.update(
-        retrieve_bm25_routes(
+        retrieve_bm25_route(
             db,
             knowledge_base_ids,
-            planned_queries,
+            query,
             settings.retrieval_route_limit,
             max_security_level=max_security_level,
         )
@@ -119,12 +101,9 @@ def retrieve_advanced_chunks(
     ]
 
     return AdvancedRetrievalResult(
-        question=question,
+        query=query,
         scope_type=scope_type,
         searched_knowledge_base_ids=knowledge_base_ids,
-        rewritten_query=rewritten_query,
-        sub_questions=sub_queries,
-        expanded_queries=retrieval_queries,
         retrieval_routes=list(route_candidates.keys()),
         candidates=candidates_to_log(route_candidates),
         selected_chunks=selected_chunks,
@@ -135,106 +114,61 @@ def retrieve_advanced_chunks(
     )
 
 
-def plan_retrieval_queries(question: str) -> tuple[str, list[str], list[str]]:
-    rewritten_query, sub_questions, planned_queries = plan_retrieval_query_routes(question)
-    return rewritten_query, sub_questions, [query.text for query in planned_queries]
+def normalize_query(value: str) -> str:
+    return " ".join(value.strip().split())
 
 
-def plan_retrieval_query_routes(question: str) -> tuple[str, list[str], list[RetrievalQuery]]:
-    original_query = normalize_whitespace(question)
-    rewrite_plan = rewrite_query(original_query)
-    rewritten_query = rewrite_plan.rewritten_query
-    sub_questions = rewrite_plan.sub_questions
-
-    planned_queries: list[RetrievalQuery] = []
-    add_planned_query(planned_queries, original_query, "original", ORIGINAL_QUERY_WEIGHT)
-    add_planned_query(planned_queries, rewritten_query, "rewrite", REWRITE_QUERY_WEIGHT)
-    for index, sub_question in enumerate(sub_questions, start=1):
-        add_planned_query(planned_queries, sub_question, f"subquery_{index}", SUB_QUERY_WEIGHT)
-
-    return rewritten_query, sub_questions, planned_queries[:MAX_ROUTE_QUERIES]
-
-
-def add_planned_query(planned_queries: list[RetrievalQuery], text: str, route_suffix: str, weight: float) -> None:
-    normalized = normalize_whitespace(text)
-    if not normalized:
-        return
-    if any(query.text == normalized for query in planned_queries):
-        return
-    planned_queries.append(RetrievalQuery(text=normalized, route_suffix=route_suffix, weight=weight))
-
-
-def normalize_retrieval_queries(queries: list[str | RetrievalQuery]) -> list[RetrievalQuery]:
-    normalized: list[RetrievalQuery] = []
-    for index, query in enumerate(queries[:MAX_ROUTE_QUERIES]):
-        if isinstance(query, RetrievalQuery):
-            add_planned_query(normalized, query.text, query.route_suffix, query.weight)
-            continue
-        route_suffix = legacy_route_suffix(index)
-        weight = ORIGINAL_QUERY_WEIGHT if index == 0 else SUB_QUERY_WEIGHT
-        add_planned_query(normalized, query, route_suffix, weight)
-    return normalized
-
-
-def legacy_route_suffix(query_index: int) -> str:
-    return "original" if query_index == 0 else f"subquery_{query_index}"
-
-
-def retrieve_dense_routes(
+def retrieve_dense_route(
     db: Session,
     owner_id: str | None,
     kb_ids: str | list[str],
-    queries: list[str | RetrievalQuery],
+    query: str,
     route_limit: int,
     max_security_level: int,
 ) -> dict[str, list[RetrievalCandidate]]:
     knowledge_base_ids = normalize_kb_ids(kb_ids)
-    if not knowledge_base_ids:
+    if not knowledge_base_ids or not query:
         return {}
 
     owner_by_kb_id = load_knowledge_base_owners(db, knowledge_base_ids)
     if owner_id and len(knowledge_base_ids) == 1:
         owner_by_kb_id.setdefault(knowledge_base_ids[0], owner_id)
 
-    routes: dict[str, list[RetrievalCandidate]] = {}
-    for index, query_plan in enumerate(normalize_retrieval_queries(queries)):
-        raw_chunks: list[RetrievedChunk] = []
-        prefilter_limit = max(route_limit * DENSE_PREFILTER_MULTIPLIER, route_limit)
-        for kb_id in knowledge_base_ids:
-            owner = owner_by_kb_id.get(kb_id)
-            if not owner:
-                continue
-            raw_chunks.extend(
-                retrieve_dense_chunks(
-                    owner,
-                    kb_id,
-                    query_plan.text,
-                    top_k=prefilter_limit,
-                    max_security_level=max_security_level,
-                )
-            )
-        chunks = sorted(
-            hydrate_retrieved_chunks(db, raw_chunks, knowledge_base_ids, max_security_level),
-            key=lambda chunk: chunk.score,
-            reverse=True,
-        )[:route_limit]
-        if not chunks:
+    raw_chunks: list[RetrievedChunk] = []
+    prefilter_limit = max(route_limit * DENSE_PREFILTER_MULTIPLIER, route_limit)
+    for kb_id in knowledge_base_ids:
+        owner = owner_by_kb_id.get(kb_id)
+        if not owner:
             continue
-        route = route_name("dense", query_plan.route_suffix)
-        routes[route] = [
+        raw_chunks.extend(
+            retrieve_dense_chunks(
+                owner,
+                kb_id,
+                query,
+                top_k=prefilter_limit,
+                max_security_level=max_security_level,
+            )
+        )
+    chunks = sorted(
+        hydrate_retrieved_chunks(db, raw_chunks, knowledge_base_ids, max_security_level),
+        key=lambda chunk: chunk.score,
+        reverse=True,
+    )[:route_limit]
+    if not chunks:
+        return {}
+    return {
+        "dense": [
             RetrievalCandidate(
-                chunk=replace(chunk, retrieval_routes=[route]),
-                route=route,
-                query=query_plan.text,
-                query_index=index,
+                chunk=replace(chunk, retrieval_routes=["dense"]),
+                route="dense",
+                query=query,
                 rank=rank,
                 score=chunk.score,
-                weight=query_plan.weight,
-                matched_terms=matched_terms(query_plan.text, chunk.content),
+                matched_terms=matched_terms(query, chunk.content),
             )
             for rank, chunk in enumerate(chunks, start=1)
         ]
-    return routes
+    }
 
 
 def hydrate_retrieved_chunks(
@@ -266,33 +200,26 @@ def hydrate_retrieved_chunks(
     return [by_id[chunk_id] for chunk_id in scores if chunk_id in by_id]
 
 
-def retrieve_bm25_routes(
+def retrieve_bm25_route(
     db: Session,
     kb_ids: str | list[str],
-    queries: list[str | RetrievalQuery],
+    query: str,
     route_limit: int,
     max_security_level: int,
 ) -> dict[str, list[RetrievalCandidate]]:
     knowledge_base_ids = normalize_kb_ids(kb_ids)
-    if not knowledge_base_ids:
+    if not knowledge_base_ids or not query:
         return {}
 
-    routes: dict[str, list[RetrievalCandidate]] = {}
-    for index, query_plan in enumerate(normalize_retrieval_queries(queries)):
-        route = route_name("bm25", query_plan.route_suffix)
-        candidates = retrieve_bm25_chunks(
-            db,
-            knowledge_base_ids,
-            query_plan.text,
-            route=route,
-            query_index=index,
-            weight=query_plan.weight,
-            limit=route_limit,
-            max_security_level=max_security_level,
-        )
-        if candidates:
-            routes[route] = candidates
-    return routes
+    candidates = retrieve_bm25_chunks(
+        db,
+        knowledge_base_ids,
+        query,
+        route="bm25",
+        limit=route_limit,
+        max_security_level=max_security_level,
+    )
+    return {"bm25": candidates} if candidates else {}
 
 
 def retrieve_bm25_chunks(
@@ -300,8 +227,6 @@ def retrieve_bm25_chunks(
     kb_ids: str | list[str],
     query: str,
     route: str,
-    query_index: int,
-    weight: float,
     limit: int,
     max_security_level: int,
 ) -> list[RetrievalCandidate]:
@@ -318,10 +243,8 @@ def retrieve_bm25_chunks(
             chunk=chunk_to_retrieved(chunk, document, score, [route]),
             route=route,
             query=query,
-            query_index=query_index,
             rank=rank,
             score=score,
-            weight=weight,
             matched_terms=matched_terms(query, keyword_search_text(chunk, document)),
         )
         for rank, (chunk, document, score) in enumerate(ranked_rows[:limit], start=1)
@@ -379,7 +302,7 @@ def fuse_candidates(route_candidates: dict[str, list[RetrievalCandidate]], rrf_k
 
     fused: list[FusedCandidate] = []
     for candidates in grouped.values():
-        rrf_score = sum(candidate.weight / (rrf_k + candidate.rank) for candidate in candidates)
+        rrf_score = sum(1 / (rrf_k + candidate.rank) for candidate in candidates)
         representative = max(candidates, key=lambda item: item.score)
         routes = dedupe_preserve_order(candidate.route for candidate in candidates)
         matches = dedupe_preserve_order(term for candidate in candidates for term in candidate.matched_terms)
@@ -403,10 +326,8 @@ def candidates_to_log(route_candidates: dict[str, list[RetrievalCandidate]]) -> 
                 {
                     "route": route,
                     "query": candidate.query,
-                    "query_index": candidate.query_index,
                     "rank": candidate.rank,
                     "score": round(candidate.score, 6),
-                    "route_weight": candidate.weight,
                     "chunk_id": candidate.chunk.chunk_id,
                     "document_id": candidate.chunk.document_id,
                     "knowledge_base_id": candidate.chunk.knowledge_base_id,
@@ -504,10 +425,6 @@ def matched_terms(query: str, text: str) -> list[str]:
 
 def has_term_overlap(query_terms: list[str], content_terms: list[str]) -> bool:
     return bool(set(query_terms) & set(content_terms))
-
-
-def route_name(prefix: str, route_suffix: str) -> str:
-    return f"{prefix}_{route_suffix}"
 
 
 def contains_term_in_search_fields(term: str):

@@ -15,13 +15,10 @@ class RetrievalLogServiceTests(unittest.TestCase):
             user = create_user(session, "retrieval-log@example.com", "Retrieval Log")
             kb = create_knowledge_base(session, user.id, KnowledgeBaseCreate(name="Retrieval Log KB"))
             result = SimpleNamespace(
-                question="policy",
+                query="policy",
                 scope_type="single",
                 searched_knowledge_base_ids=[kb.id],
-                rewritten_query="policy",
-                sub_questions=[],
-                expanded_queries=["policy"],
-                retrieval_routes=["dense_original"],
+                retrieval_routes=["dense"],
                 candidates=[],
                 selected_chunk_logs=[],
                 rrf_k=60,

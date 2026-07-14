@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models.agent_run import AgentRun
 from app.db.models.conversation import Conversation, Message
+from app.db.models.user import User
 from app.db.models.user_memory import UserMemory, UserMemoryEvent, UserMemoryRecallLog, UserMemoryUpdateJob
 from app.llm.provider import MemoryCandidate, MemoryOperation, get_llm_provider
 from app.llm.context_compression import compress_memory_context
@@ -750,6 +751,38 @@ def list_profile_memories(db: Session, user_id: str, limit: int = PROFILE_MEMORY
     return memory_repository.list_active_profile_memories(db, user_id, limit=limit)
 
 
+def list_core_profile_context(db: Session, user_id: str, limit: int = PROFILE_MEMORY_LIMIT) -> list[dict]:
+    profiles = [
+        memory_to_context_dict(memory, section="profile")
+        for memory in list_profile_memories(db, user_id, limit=limit)
+    ]
+    if any(memory.get("category") == "name" for memory in profiles):
+        return profiles
+    user = db.get(User, user_id)
+    if user is None or not user.username.strip():
+        return profiles
+    return [*profiles, account_name_memory(user)]
+
+
+def account_name_memory(user: User) -> dict:
+    return {
+        "id": "account:username",
+        "content": f"User account name: {user.username.strip()}",
+        "category": "name",
+        "kind": "profile",
+        "status": "active",
+        "canonical_key": "profile:name",
+        "memory_layer": "profile",
+        "profile_slot": "name",
+        "scope_type": "user",
+        "scope_id": user.id,
+        "pinned": True,
+        "revision": 1,
+        "section": "profile",
+        "metadata": {"source": "user_account"},
+    }
+
+
 def is_memory_recall_query(query: str) -> bool:
     return memory_policy.is_memory_recall_query(query)
 
@@ -793,53 +826,9 @@ def build_memory_context_for_question(
         profile_memories, preloaded_long_memories = memory_contexts.split_profile_memories(preloaded_long_memories)
 
     if profile_memories is None:
-        profile_memories = [
-            {
-                "id": memory.id,
-                "content": memory.content,
-                "category": memory.category,
-                "kind": memory.kind,
-                "status": memory.status,
-                "canonical_key": memory.canonical_key,
-                "memory_layer": memory.memory_layer,
-                "profile_slot": memory.profile_slot,
-                "scope_type": memory.scope_type,
-                "scope_id": memory.scope_id,
-                "pinned": memory.pinned,
-                "revision": memory.revision,
-                "metadata": memory.extra_metadata or {},
-            }
-            for memory in list_profile_memories(db, user_id)
-        ]
+        profile_memories = list_core_profile_context(db, user_id)
 
-    if preloaded_long_memories is None:
-        memories = retrieve_relevant_memories(
-            db,
-            user_id,
-            query,
-            conversation_id=conversation_id,
-            include_profile=False,
-        )
-        long_memories = [
-            {
-                "id": memory.id,
-                "content": memory.content,
-                "category": memory.category,
-                "kind": memory.kind,
-                "status": memory.status,
-                "canonical_key": memory.canonical_key,
-                "memory_layer": memory.memory_layer,
-                "profile_slot": memory.profile_slot,
-                "scope_type": memory.scope_type,
-                "scope_id": memory.scope_id,
-                "pinned": memory.pinned,
-                "revision": memory.revision,
-                "metadata": memory.extra_metadata or {},
-            }
-            for memory in memories
-        ]
-    else:
-        long_memories = preloaded_long_memories
+    long_memories = preloaded_long_memories or []
 
     summary = conversation_summary
     if summary is None and conversation:
@@ -1617,11 +1606,14 @@ def create_manual_memory(
     profile_slot: str | None = None,
     pinned: bool | None = None,
     allow_sensitive: bool = False,
+    auto_classify: bool = False,
 ) -> UserMemory:
     normalized = normalize_memory_content(content)
     if not normalized:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Memory content cannot be empty")
     validate_manual_memory_content(content, allow_sensitive=allow_sensitive)
+    if auto_classify:
+        kind, category = classify_manual_memory(db, user_id, content)
     action = upsert_memory_candidate(
         db,
         user_id,
@@ -1731,6 +1723,7 @@ def update_user_memory(
     profile_slot: str | None = None,
     pinned: bool | None = None,
     allow_sensitive: bool = False,
+    auto_classify: bool = False,
 ) -> UserMemory:
     memory = get_user_memory_or_404(db, user_id, memory_id)
     if expected_revision is not None and memory.revision != expected_revision:
@@ -1747,6 +1740,8 @@ def update_user_memory(
         if not normalized:
             raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Memory content cannot be empty")
         validate_manual_memory_content(content, allow_sensitive=allow_sensitive)
+        if auto_classify and category is None and kind is None:
+            kind, category = classify_manual_memory(db, user_id, content)
         embedding = embed_memory_text(normalized)
         memory.content = content.strip()
         memory.normalized_content = normalized
@@ -1863,6 +1858,27 @@ def update_user_memory(
         },
     )
     return memory
+
+
+def classify_manual_memory(db: Session, user_id: str, content: str) -> tuple[str, str]:
+    fallback = ("preference", infer_memory_category(normalize_memory_content(content)))
+    try:
+        classification = get_llm_provider().classify_memory_with_metadata(content)
+        create_llm_call_log(
+            db,
+            classification.completion,
+            user_id=user_id,
+            agent_name="memory_classifier",
+        )
+    except Exception:
+        db.rollback()
+        return fallback
+
+    kind = classification.kind
+    category = classification.category
+    if category == "global_instruction" and not memory_policy.is_explicit_global_instruction(content):
+        return "instruction", "task_instruction"
+    return kind, category
 
 
 def validate_manual_memory_content(content: str, *, allow_sensitive: bool) -> None:

@@ -79,7 +79,6 @@ def compress_rag_evidence(
     question: str,
     chunks: list[RetrievedChunk],
     max_tokens: int,
-    sub_questions: list[str] | None = None,
     provider: LlmProvider | None = None,
 ) -> ContextCompressionResult:
     raw_context = format_answer_context(chunks)
@@ -87,27 +86,18 @@ def compress_rag_evidence(
     provider = provider or get_llm_provider()
     completions: list[LlmCompletion] = []
     by_id = {chunk.chunk_id: chunk for chunk in chunks}
-    required_route_suffixes = {
-        f"subquery_{index}"
-        for index in range(1, len(sub_questions or []) + 1)
-        if any(
-            any(str(route).endswith(f"subquery_{index}") for route in (chunk.retrieval_routes or []))
-            for chunk in chunks
-        )
-    }
     target = compression_target(max_tokens)
     retries = get_settings().context_compression_retry_limit
 
     for attempt in range(retries + 1):
         try:
             output, completion = provider.complete_structured_with_metadata(
-                rag_compression_messages(question, sub_questions or [], chunks, target),
+                rag_compression_messages(question, chunks, target),
                 RagEvidenceCompressionOutput,
                 temperature=get_settings().llm_context_compression_temperature,
             )
             completions.append(completion)
             compressed = validate_and_build_evidence(output, by_id)
-            validate_subquery_coverage(compressed, required_route_suffixes)
             actual = count_tokens(format_answer_context(compressed))
             if compressed and actual <= max_tokens:
                 return ContextCompressionResult(
@@ -159,14 +149,12 @@ def memory_compression_messages(question: str, source_text: str, target_tokens: 
 
 def rag_compression_messages(
     question: str,
-    sub_questions: list[str],
     chunks: list[RetrievedChunk],
     target_tokens: int,
 ) -> list[LlmMessage]:
     rows = []
     for chunk in chunks:
         rows.append(f"[chunk_id={chunk.chunk_id}]\n{chunk.content}")
-    sub_question_text = "\n".join(f"- {value}" for value in sub_questions) or "- None"
     return [
         LlmMessage(
             "system",
@@ -176,7 +164,7 @@ def rag_compression_messages(
                 f"The complete formatted evidence must stay within {target_tokens} tokens. Copy only verbatim "
                 "quotes from the supplied chunks; never paraphrase. Preserve complete conditions, exceptions, "
                 "dates, quantities, scope, and sentences required to resolve pronouns. For comparison or "
-                "multi-hop questions, retain evidence for every supplied sub-question. Use only supplied "
+                "multi-hop questions, retain evidence for every part of the user question. Use only supplied "
                 "chunk_id values and return only the structured output."
             ),
         ),
@@ -184,7 +172,7 @@ def rag_compression_messages(
             "user",
             (
                 f"Target token budget: {target_tokens}\n\nQuestion:\n{question}\n\n"
-                f"Sub-questions:\n{sub_question_text}\n\nChunks:\n" + "\n\n".join(rows)
+                "Chunks:\n" + "\n\n".join(rows)
             ),
         ),
     ]
@@ -231,19 +219,6 @@ def validate_and_build_evidence(
         compressed.append(replace(chunk, content="\n".join(quotes)))
         seen.add(chunk.chunk_id)
     return compressed
-
-
-def validate_subquery_coverage(chunks: list[RetrievedChunk], required_suffixes: set[str]) -> None:
-    covered = {
-        suffix
-        for suffix in required_suffixes
-        if any(
-            any(str(route).endswith(suffix) for route in (chunk.retrieval_routes or []))
-            for chunk in chunks
-        )
-    }
-    if covered != required_suffixes:
-        raise ValueError("Compressed evidence omitted a required sub-query route")
 
 
 def format_memory_sources(sources: list[dict[str, Any]]) -> str:

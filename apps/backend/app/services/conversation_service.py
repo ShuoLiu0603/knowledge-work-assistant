@@ -333,7 +333,7 @@ def stream_message_response(
                 },
             )
 
-        yield sse_event("trace", {"node": "agent_graph", "status": "started"})
+        yield sse_event("trace", {"node": "agent_runtime", "status": "started"})
         agent_run = None
         token_emitted = False
         for stream_event in run_agent_streaming(
@@ -358,12 +358,12 @@ def stream_message_response(
                 token_emitted = bool(stream_event["token_emitted"])
         if agent_run is None:
             raise RuntimeError("Agent run did not complete")
-        yield sse_event("trace", {"node": "agent_graph", "status": agent_run.status})
+        yield sse_event("trace", {"node": "agent_runtime", "status": agent_run.status})
         citations = [CitationRead(**citation) for citation in agent_run.citations]
         answer = agent_run.answer
         yield sse_event("agent_run", to_agent_run_read(agent_run).model_dump(mode="json"))
-        retrieval_log = get_run_retrieval_log(db, agent_run)
-        if retrieval_log:
+        retrieval_logs = get_run_retrieval_logs(db, agent_run)
+        for retrieval_log in retrieval_logs:
             yield sse_event("retrieval_log", to_retrieval_log_read(retrieval_log).model_dump(mode="json"))
         yield sse_event("citations", {"citations": [citation.model_dump(mode="json") for citation in citations]})
 
@@ -388,8 +388,10 @@ def stream_message_response(
         db.commit()
         db.refresh(assistant_message)
         agent_run = attach_agent_run_to_message(db, agent_run, assistant_message.id)
-        if retrieval_log:
-            retrieval_log = attach_retrieval_log_to_message(db, retrieval_log, assistant_message.id)
+        retrieval_logs = [
+            attach_retrieval_log_to_message(db, retrieval_log, assistant_message.id)
+            for retrieval_log in retrieval_logs
+        ]
         try:
             agent_run = apply_deferred_memory_update(
                 db,
@@ -404,7 +406,7 @@ def stream_message_response(
 
         yield sse_event("assistant_message", to_message_read(assistant_message).model_dump(mode="json"))
         yield sse_event("agent_run", to_agent_run_read(agent_run).model_dump(mode="json"))
-        if retrieval_log:
+        for retrieval_log in retrieval_logs:
             yield sse_event("retrieval_log", to_retrieval_log_read(retrieval_log).model_dump(mode="json"))
         yield sse_event("done", {"conversation_id": conversation.id, "message_id": assistant_message.id})
     except AgentRunCancelled:
@@ -752,10 +754,15 @@ def summary_dispatch_loop() -> None:
             _SUMMARY_DISPATCH_QUEUE.task_done()
 
 
-def get_run_retrieval_log(db: Session, run: AgentRun) -> RetrievalLog | None:
-    if not run.retrieval_log_id:
-        return None
-    return db.get(RetrievalLog, run.retrieval_log_id)
+def get_run_retrieval_logs(db: Session, run: AgentRun) -> list[RetrievalLog]:
+    retrieval_log_ids = list((run.state or {}).get("retrieval_log_ids") or [])
+    if run.retrieval_log_id:
+        retrieval_log_ids.append(run.retrieval_log_id)
+    return [
+        log
+        for log_id in dict.fromkeys(retrieval_log_ids)
+        if isinstance(log_id, str) and (log := db.get(RetrievalLog, log_id)) is not None
+    ]
 
 
 def message_token_usage(db: Session, run: AgentRun) -> dict:

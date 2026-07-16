@@ -41,6 +41,7 @@ def reconcile_user_memories(
     apply: bool = False,
     now: datetime | None = None,
     max_semantic_pairs: int | None = None,
+    include_semantic_candidates: bool = False,
 ) -> MemoryReconcileReport:
     max_semantic_pairs = max_semantic_pairs or get_settings().memory_reconcile_max_semantic_pairs
     now = now or datetime.now(timezone.utc)
@@ -79,7 +80,8 @@ def reconcile_user_memories(
     ]
     findings.extend(reconcile_exact_duplicates(db, active_or_pending, apply=apply, changed=changed, now=now))
     findings.extend(reconcile_profile_singletons(db, active_or_pending, apply=apply, changed=changed, now=now))
-    findings.extend(find_semantic_duplicate_candidates(active_or_pending, max_pairs=max_semantic_pairs))
+    if include_semantic_candidates:
+        findings.extend(find_semantic_relation_candidates(active_or_pending, max_pairs=max_semantic_pairs))
 
     if apply and changed:
         db.commit()
@@ -353,7 +355,7 @@ def reconcile_profile_singletons(
     return findings
 
 
-def find_semantic_duplicate_candidates(memories: list[UserMemory], *, max_pairs: int) -> list[MemoryReconcileFinding]:
+def find_semantic_relation_candidates(memories: list[UserMemory], *, max_pairs: int) -> list[MemoryReconcileFinding]:
     semantic = [
         memory
         for memory in memories
@@ -362,9 +364,8 @@ def find_semantic_duplicate_candidates(memories: list[UserMemory], *, max_pairs:
         and memory.embedding
         and memory.category
     ]
-    findings: list[MemoryReconcileFinding] = []
+    scored_pairs: list[tuple[float, UserMemory, UserMemory]] = []
     checked = 0
-    threshold = policy.semantic_similarity_threshold()
     for left, right in combinations(semantic, 2):
         if checked >= max_pairs:
             break
@@ -372,20 +373,23 @@ def find_semantic_duplicate_candidates(memories: list[UserMemory], *, max_pairs:
             continue
         checked += 1
         score = retrieval.cosine_similarity(left.embedding or [], right.embedding or [])
-        if score < threshold:
-            continue
+        scored_pairs.append((score, left, right))
+
+    scored_pairs.sort(key=lambda item: item[0], reverse=True)
+    findings: list[MemoryReconcileFinding] = []
+    for score, left, right in scored_pairs:
         winner = choose_memory_winner([left, right])
-        duplicate = right if winner.id == left.id else left
+        candidate = right if winner.id == left.id else left
         findings.append(
             MemoryReconcileFinding(
-                finding_type="possible_semantic_duplicate",
+                finding_type="semantic_relation_candidate",
                 severity="low",
-                memory_id=duplicate.id,
+                memory_id=candidate.id,
                 related_memory_id=winner.id,
-                proposed_action="review_merge",
-                reason="semantic similarity is above the configured threshold; manual or LLM review is recommended",
+                proposed_action="llm_review",
+                reason="ranked candidate pair requires LLM relation review",
                 applied=False,
-                metadata={"score": round(score, 6), "threshold": threshold, "category": left.category},
+                metadata={"score": round(score, 6), "category": left.category},
             )
         )
     return findings

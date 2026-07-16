@@ -70,7 +70,6 @@ class ConfigTests(unittest.TestCase):
                 "memory_context_summary_weight": 0,
                 "memory_context_recent_weight": 0,
             },
-            {"memory_recall_threshold_min": 0.6, "memory_recall_threshold_max": 0.5},
             {"celery_task_retry_backoff_seconds": 10, "celery_task_retry_backoff_max_seconds": 5},
             {"conversation_summary_min_messages": 31, "conversation_summary_max_unprocessed": 30},
         )
@@ -98,6 +97,7 @@ class ConfigTests(unittest.TestCase):
         settings = Settings(app_env="development")
 
         validate_runtime_settings(settings)
+        self.assertTrue(Settings.model_fields["memory_vector_index_enabled"].default)
 
     def test_production_rejects_insecure_defaults(self) -> None:
         settings = Settings(

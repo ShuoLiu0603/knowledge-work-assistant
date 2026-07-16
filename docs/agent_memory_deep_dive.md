@@ -9,11 +9,11 @@
 本项目使用有边界的 Agentic 工具循环：
 
 - LLM 可以直接回答，也可以多次调用 `memory(query)` 和 `rag(query)`；不存在独立意图分类器。
-- LLM 不能增加工具、扩大检索范围或绕过服务层；每轮调用次数由后端预算控制。
+- LLM 不能增加工具、扩大检索范围或绕过服务层；模型调用有硬上限，工具总预算与分预算在每次模型调用前通过解绑工具实施。工具执行入口尚无第二道硬预算校验，这是当前已知边界。
 - 知识库范围、成员权限、文档密级和历史 provenance 由后端校验。
 - PostgreSQL 是业务数据和长期记忆的权威来源。
 - Redis 用于短期缓存、Celery broker、会话协调租约和任务状态。
-- Qdrant 用于文档向量检索，也可作为长期记忆的可选加速索引。
+- Qdrant 用于文档向量检索；长期记忆向量索引在当前模板中默认启用，但可通过配置关闭，且始终只是可重建的加速索引。
 - MinIO 保存上传的原始文档。
 - Celery Worker 执行文档、记忆、摘要、清理和保留任务；Celery Beat 负责周期恢复。
 
@@ -58,7 +58,7 @@ flowchart TB
     MEMORY --> PG
     MEMORY --> REDIS
     MEMORY --> EMB
-    MEMORY -. optional .-> QD
+    MEMORY -. default-enabled, rebuildable .-> QD
     API --> PG
     API --> REDIS
     WORKER --> PG
@@ -74,7 +74,7 @@ flowchart TB
 | PostgreSQL | 权威 | 用户、会话、消息、知识库、chunk、AgentRun、日志、长期记忆、任务 | 核心路径失败 |
 | Redis | 非权威缓存 + 协调 | 短期记忆、Celery、会话租约、摘要租约 | 开发可部分降级；生产会话协调 fail-closed |
 | Qdrant 文档 collection | 检索索引 | Dense 文档召回 | RAG 无法正常执行 Dense 路线 |
-| Qdrant memory collection | 可选索引 | 长期记忆向量加速 | 回退 PostgreSQL 候选和本地排序 |
+| Qdrant memory collection | 默认启用的可重建索引 | 回答召回与更新前相关记忆召回 | 回退 PostgreSQL 候选和本地排序 |
 | MinIO | 原文存储 | 上传文档与删除清理 | 文档入库或原文操作失败 |
 
 ## 3. Agent 模块
@@ -103,7 +103,7 @@ flowchart TB
 | 检索 | `retrieval_log_id`、`retrieval_log_ids`、`rag_chunks`、`rag_queries`、`searched_knowledge_base_ids` | 多次 RAG 的证据、日志和来源库 |
 | LLM | `llm_log_id`、`llm_log_ids` | 本轮可计入的 LLM 日志 |
 | 记忆输入 | `short_term_memory`、`profile_memories`、`long_term_memories`、`conversation_summary` | 四类记忆来源 |
-| Prompt 上下文 | `memory_context` | 预算裁剪后的文本 |
+| Prompt 上下文 | `short_term_memory`、`memory_context` | 前者转换为带角色的历史消息；后者是预算裁剪后的画像、摘要与按需长期记忆文本 |
 | 循环 | `model_call_count`、`tool_call_count`、`memory_tool_call_count`、`rag_tool_call_count` | 总预算与分工具预算计数 |
 | 工具历史 | `memory_queries`、`rag_queries`、`tool_observations`、`executed_tool_calls` | 防重复、审计和动态 Prompt 输入 |
 | 记忆输出 | `memory_actions`、`defer_memory_update`、`memory_enabled` | 本轮记忆决定 |
@@ -148,20 +148,23 @@ flowchart TD
 - 工具调用不是必经步骤；模型文本且没有 tool call 时即为最终回答。
 - 每个模型回合最多保留一个 tool call，并设置 `parallel_tool_calls=false`。
 - 同一工具的同一标准化 query 不会再次执行，但仍消耗总工具预算，防止坏循环。
-- 默认最多 6 次模型调用、4 次工具调用，其中 Memory 最多 2 次、RAG 最多 3 次。
-- 最后一次模型调用以及总工具预算耗尽后的模型调用会移除全部工具，并要求基于已有上下文收口。
+- 默认配置为 6 次模型调用、4 次总工具调用，其中 Memory 2 次、RAG 3 次。模型调用是硬上限；工具预算在下一次模型调用前通过解绑工具实施。
+- 最后一次模型调用以及检测到总工具预算耗尽后的下一次模型调用会移除全部工具，并要求基于已有上下文收口。兼容模型若重复发出历史 tool call，当前执行入口缺少二次硬校验，可能越过声明的工具分预算。
 
 ### 3.4 模型如何选择工具
 
-没有独立 intent 标签、分类 Prompt 或路由器。动态 system Prompt 每一轮都会给模型：
+没有独立 intent 标签、分类 Prompt 或路由器。每一轮模型调用都会获得：
 
 - 原始用户请求；
-- 固定核心画像、会话摘要与最近对话；
+- 作为真实 user/assistant 消息传入的最近对话；
+- 动态 system Prompt 中的固定核心画像与会话摘要；
 - 已按需召回的普通长期记忆；
 - 所有 RAG 调用累计的企业证据与稳定引用编号；
 - 前序 Memory/RAG query；
 - 当前剩余的模型、总工具和分工具预算；
 - 当前真正可用的工具集合。
+
+工具执行后的完整结果保存在本轮 `AgentRunState` 中，并进入下一轮动态上下文；原生 `ToolMessage` 只返回 query、状态、结果数量、重复数量、错误和日志 ID 等轻量回执，避免与动态上下文重复携带正文。
 
 Prompt 明确要求：画像或当前上下文已经足够时直接回答；个人事实缺失才调用 Memory；企业事实缺失才调用 RAG；Memory miss 不能成为搜索个人信息到 RAG 的理由。模型对检索结果不满意时可以用实质不同的 query 再查，但不能做只有同义词变化的无效重试。
 
@@ -286,7 +289,7 @@ max(AGENT_STREAM_MIN_TIMEOUT_SECONDS,
 4. 发送 SSE `conversation`。
 5. 发送 SSE `user_message`。
 6. 如果本轮允许记忆，把 user 文本 best-effort 写入 Redis 短期缓存。
-7. 发送粗粒度 SSE trace：`agent_graph started`。
+7. 发送粗粒度 SSE trace：`agent_runtime started`。
 
 user Message 在模型调用前提交。这样后续 Agent 失败仍能留下可审计的用户请求，但取消或断连也可能留下单独 user Message。
 
@@ -321,9 +324,9 @@ run_agent(
 
 ### 4.5 Agent 内执行
 
-#### 第一步：load_memory
+#### 第一步：加载核心记忆上下文
 
-Memory Agent：
+`load_core_memory_context()`：
 
 1. 读取 Conversation.summary。
 2. 从 PostgreSQL 读取 summary cursor 之后的消息，并至少覆盖最近 `SHORT_MEMORY_MAX_MESSAGES`。
@@ -331,7 +334,7 @@ Memory Agent：
 4. 过滤 private/no-memory user + assistant 整轮。
 5. 删除当前已提交的 user Message，避免同时出现在 `input` 和 history。
 6. 只加载核心 Profile；普通长期记忆保持为空。
-7. 按 token/char 预算组成初始 `memory_context`。
+7. 将过滤后的最近对话保留为带角色的消息，并按 token/char 预算组成不含最近对话正文的初始 `memory_context`。
 
 #### 第二步：模型与工具循环
 
@@ -375,9 +378,7 @@ Memory Agent：
 - `error` -> 记录错误；
 - `done` -> worker 已退出。
 
-只有 RAG 最终回答当前使用 provider 的真实 streaming。Chat 和 Memory Answer 先获得完整 completion，再在本地拆分为 token；Summary/Writing 当前通常把完整结果作为一次 callback。
-
-如果 provider 没有产生 token，conversation service 会把完整 answer 本地拆分，并以很短的间隔模拟流式显示。该模拟只影响传输体验，不改变持久化内容。
+当前 Agent 通过非流式模型调用获得完整最终回答，再由 `emit_final_answer()` 和 conversation service 将文本分块发送为 SSE `token`。因此这里的“流式”是传输层渐进展示，不是 provider 原生 token streaming；它不改变最终持久化内容。
 
 ### 4.7 保存 assistant Message 与补齐关联
 
@@ -416,7 +417,7 @@ assistant Message 与 AgentRun/RetrievalLog 关联提交后，`apply_deferred_me
 
 部署级模式：
 
-- `sync`：当前请求内直接执行 Memory Editor 和数据库变更。
+- `sync`：当前请求内直接执行 Candidate Extractor、逐候选 Memory Judge 和数据库变更。
 - `async`：创建 durable UserMemoryUpdateJob，再发送 Celery。
 - `disabled`：写入 ignore action，不修改长期记忆。
 
@@ -461,7 +462,7 @@ done
 user Message commit
 -> RetrievalLog commit
 -> retrieval audit commit
--> Supervisor/final LLM log commits
+-> agent_runtime LLM log commits
 -> AgentRun commit
 -> assistant Message commit
 -> AgentRun association commit
@@ -507,7 +508,7 @@ user Message commit
 Working memory       Redis recent messages + PostgreSQL fallback
 Conversation state   Conversation.summary + summary_message_count
 Long-term memory     PostgreSQL UserMemory
-Recall index         optional Qdrant memory collection
+Recall index         default-enabled Qdrant memory collection
 Governance           events, recall logs, update jobs, audit, retention
 ```
 
@@ -515,7 +516,7 @@ Governance           events, recall logs, update jobs, audit, retention
 
 | 模块 | 职责 |
 |---|---|
-| `memory/policy.py` | 状态、层、marker、分类、敏感检测、grounding、安全阈值 |
+| `memory/policy.py` | 状态、层、marker、分类、敏感检测和 grounding 安全规则 |
 | `memory/short_term.py` | Redis 短期消息与 PostgreSQL fallback |
 | `memory/context.py` | token/char 预算和四段上下文格式化 |
 | `memory/retrieval.py` | sticky、semantic、lexical、vector 召回与去重 |
@@ -524,7 +525,7 @@ Governance           events, recall logs, update jobs, audit, retention
 | `memory/commands.py` | 原子 memory row 变更和事件记录 |
 | `memory/events.py` | append-only UserMemoryEvent |
 | `memory/jobs.py` | durable job 创建、dispatch claim、失败记录 |
-| `memory/vector_index.py` | 可选 Qdrant memory point 增删查 |
+| `memory/vector_index.py` | 默认启用、可重建的 Qdrant memory point 增删查 |
 | `memory/reconcile.py` | 过期、重复、冲突和向量漂移检查/修复 |
 | `services/memory_service.py` | 兼容门面、跨模块事务和 API 用例 |
 | `workers/memory_tasks.py` | job worker、summary worker、Beat recovery |
@@ -545,12 +546,12 @@ Governance           events, recall logs, update jobs, audit, retention
 | `memory_layer` | profile/semantic/episodic/procedural |
 | `profile_slot` | language、response_detail、current_role 等唯一槽 |
 | `scope_type/scope_id` | 预留的作用域字段 |
-| `pinned` | 是否按 sticky profile 对待 |
+| `pinned` | 核心 Profile 的治理标记；本身不能把按需记忆提升为固定注入 |
 | `revision` | 乐观并发版本 |
 | `expires_at` | 可选过期时间 |
 | `source_conversation_id/source_message_id/source_text` | 来源 provenance |
 | `embedding/embedding_model/embedding_dimension` | PostgreSQL 中的语义向量及元数据 |
-| `merge_count/touched_count` | 合并和重复确认计数 |
+| `merge_count/touched_count` | 原位更新和重复确认计数（字段名保留历史兼容） |
 | `superseded_by_id` | 替代该记忆的新 memory |
 | `valid_at/invalid_at/created_at/updated_at/last_touched_at` | 生命周期时间 |
 | `extra_metadata` | importance、reason 和治理扩展 |
@@ -569,7 +570,7 @@ Governance           events, recall logs, update jobs, audit, retention
 - recall mode；
 - requested/actual limit；
 - active/selected count；
-- threshold；
+- threshold 兼容字段；当前无阈值召回固定为 null；
 - 所有 candidate 的 route、score、selected；
 - selected memory ids；
 - conversation 和 source message provenance。
@@ -717,8 +718,9 @@ Conversation 保存：
 - private/no-memory 整轮不进入摘要。
 - 如果一批消息全部被过滤，保留旧 summary，但 cursor 可以前进，避免反复扫描。
 - delta 按 `MEMORY_SUMMARY_DELTA_MAX_CHARS` 分批。
-- 每批把 previous summary 与新 delta 交给 summarizer，形成滚动摘要。
-- summarizer 提示词明确要求输出到 `CONVERSATION_SUMMARY_MAX_TOKENS` 以内；程序复核 token，超限重试后才做边界安全收口。
+- 每批把 previous summary 与新 delta 交给 summarizer，形成结构化工作状态摘要：当前目标、有效约束与决策、已确认事实与完成项、重要产物、未决问题或阻塞。
+- Prompt 不要求模型估算或命中某个 token 数；程序在输出后计算实际 token。超限时使用独立的“压紧现有摘要”提示词重试，最终再按保护优先级执行确定性安全收口。
+- 最终保险优先级是：有效约束与纠正、当前目标、未决问题/阻塞、下一步、已确认事实与完成项、重要产物。程序先尽量保留每个非空区段的一条完整信息，再按同一优先级装入其余完整单元，不从句子中间截断。
 - `summary_message_count` 使用条件更新，旧任务不能覆盖新 cursor。
 
 摘要投递有两层可靠性：
@@ -732,57 +734,36 @@ Conversation 保存：
 
 Agent 目标召回：
 
-- Profile/sticky：最多 `MEMORY_PROFILE_LIMIT`；
-- 非 Profile semantic：目标 `MEMORY_SEMANTIC_LIMIT`；
+- 核心 Profile：最多 `MEMORY_PROFILE_LIMIT`；
+- 按需长期记忆：目标 `MEMORY_SEMANTIC_LIMIT`；
 - 本地 fallback 候选池：最多 `MEMORY_RECALL_CANDIDATE_LIMIT`。
 
-#### Sticky/Profile 判定
+#### 核心 Profile 判定
 
-满足任一条件即按 Profile/sticky 处理：
+当前行满足任一条件即按核心 Profile 处理：
 
 - `memory_layer=profile`；
-- `pinned=true`；
-- 存在 profile_slot；
-- category 属于语言、格式、详略、身份、当前项目等 sticky 集合；
-- kind 为 profile 或 instruction。
+- category 属于姓名、称呼、当前角色、语言、格式、详略、语气、无障碍或全局指令等核心集合（兼容旧数据）。
 
-这些记忆优先进入上下文，不依赖当前 query 的相似度。
+`pinned`、importance、kind 或普通 `profile_slot` 不能把按需记忆提升为固定注入；项目、技术栈、兴趣、事件和工作流仍通过 `memory(query)` 召回。核心 Profile 不依赖当前 query 的相似度。
 
-#### 默认语义阈值
+#### 无阈值语义排序
 
-写入合并阈值：
-
-```text
-MEMORY_SEMANTIC_THRESHOLD = 0.82
-```
-
-召回阈值：
-
-```text
-clamp(
-  MEMORY_SEMANTIC_THRESHOLD * MEMORY_RECALL_THRESHOLD_FACTOR,
-  MEMORY_RECALL_THRESHOLD_MIN,
-  MEMORY_RECALL_THRESHOLD_MAX
-)
-```
-
-默认结果为 `clamp(0.82 * 0.35, 0.20, 0.45) = 0.287`。
-
-合并阈值高于召回阈值：召回可以容忍相关但不相同的内容；自动 merge 必须更保守。
+Embedding 和 Qdrant 只负责对 bounded candidates 排序，不以相似度分数直接判断记忆是否相关、重复、补充或冲突。回答链路把 top-K 候选交给 Agent，更新链路把 top-K 候选交给 Memory Judge；语义关系由 LLM 在结构化契约内判断。
 
 #### Qdrant 关闭或无命中
 
 1. PostgreSQL 读取 Profile 与 bounded recent active candidates。
 2. 计算 query embedding。
 3. 对 memory.embedding 做 cosine similarity。
-4. 选择高于 recall threshold 的非 Profile memory。
-5. sticky 在前，semantic 在后，按 recall limit 截断。
+4. 按 cosine similarity 排序非 Profile memory。
+5. sticky 在前，ranked candidates 在后，按 recall limit 截断。
 
 #### Qdrant 开启
 
 1. query embedding。
 2. Qdrant 按 `user_id + status=active` 过滤。
-3. 只返回超过 threshold 的 point。
+3. 返回 bounded top-K point，不设置 score threshold。
 4. PostgreSQL 按 id 再校验 owner、status 和 expiry。
 5. vector 结果与 bounded semantic 结果合并为 `hybrid`。
 
@@ -790,14 +771,14 @@ clamp(
 
 - Qdrant 失败 -> 本地 semantic。
 - query embedding 失败 -> lexical ranking。
-- lexical 无关 -> 只保留 sticky。
-- 不会因为失败而把全部最近记忆无条件注入 Prompt。
+- lexical ranking 保留 bounded top-K，由后续 LLM 判断是否相关。
+- 候选数量仍受 recall limit 和 candidate limit 约束。
 
 #### Full recall
 
 “你记得我什么”等 full recall marker：
 
-- 跳过相关性阈值；
+- 不做语义关系裁决；
 - sticky 优先；
 - 最终 limit 至少 `MEMORY_FULL_RECALL_LIMIT`；
 - 仍只返回 active、未过期、属于当前用户的记录。
@@ -850,18 +831,20 @@ Recent conversation
 ```mermaid
 flowchart TD
     TURN[Committed user + assistant turn]
-    CTX[Build editor context]
-    LLM[LLM Memory Editor]
-    OPS[Structured operations]
+    EXTRACT[LLM Candidate Extractor]
+    CAND[Structured candidates]
+    RELATED[Exact/key + Qdrant + PG fallback]
+    JUDGE[Mandatory LLM Memory Judge]
+    OPS[One final operation per candidate]
     EVID[Evidence and sensitivity guards]
     EXACT{Exact hash?}
     CONFLICT{Slot/key conflict?}
-    SEM{Semantic duplicate?}
     WRITE[Atomic commands + events]
     PENDING[Pending for review]
     IGNORE[Ignore]
 
-    TURN --> CTX --> LLM --> OPS --> EVID
+    TURN --> EXTRACT --> CAND
+    CAND -->|each non-ignore candidate| RELATED --> JUDGE --> OPS --> EVID
     EVID -->|unsafe| IGNORE
     EVID -->|uncertain grounding| PENDING
     EVID -->|safe| EXACT
@@ -869,31 +852,46 @@ flowchart TD
     EXACT -->|no| CONFLICT
     CONFLICT -->|needs review| PENDING
     CONFLICT -->|safe update/supersede| WRITE
-    CONFLICT -->|none| SEM
-    SEM -->|similar| WRITE
-    SEM -->|new| WRITE
+    CONFLICT -->|none| WRITE
 ```
 
-#### Editor 输入
+#### 第一阶段：Candidate Extractor
 
-LLM 收到：
+Extractor 只收到：
 
 - 当前 user Message；
 - 当前 assistant answer；
-- Profile memories；
-- 相关 active candidates；
-- pending memories；
-- backward-compatible existing union。
+- 强制为空的现有记忆区段。
 
-允许 action：
+它不得指定 target memory id，也不得决定 update/supersede；每条潜在长期事实用 `create` 表示“提交候选”，`ignore` 或空 operations 表示不提交。服务最多接收 `MEMORY_MAX_OPERATIONS` 条候选。
+
+#### 候选相关记忆召回
+
+每条候选使用候选的独立 content，而不是整段用户消息，组合：
+
+- PostgreSQL exact content hash；
+- PostgreSQL canonical key、category 与 pending；
+- Qdrant 当前用户 active memory 全量语义近邻；
+- 最近 PostgreSQL Editor candidates 作为有界回退。
+
+结果按 memory id 去重，exact、canonical 和 Qdrant 命中优先，最终最多 `MEMORY_EDITOR_CONTEXT_LIMIT` 条。
+
+#### 第二阶段：Memory Judge
+
+每条非 ignore 候选都必须进入 Judge，即使相关记忆为空。Judge 收到候选、相关记忆、当前 user/assistant turn，并返回恰好一个抽象关系：
 
 ```text
-create
-update
-supersede
-pending
-ignore
+independent
+equivalent
+refinement
+replacement
+uncertain
+discard
 ```
+
+服务层机械映射为 `create/ignore/update/supersede/pending/ignore`。`equivalent/refinement/replacement` 的 target id 必须来自本次相关记忆集合；`independent/discard` 不允许携带 target。首次返回空或非法结构时带校验反馈重试一次，仍失败则 fail-closed 为 ignore，不允许第一阶段候选直接写库。
+
+存储层是独立于关系判断的注入策略：`independent` 根据候选分类创建核心 Profile 或按需长期记忆；`refinement/replacement` 绑定已有事实身份，继承目标的 category、kind、`memory_layer`、`profile_slot`、scope、pinned 与 canonical key，避免一次分类波动改变后续注入方式。带目标的 `uncertain` 若进入 pending，也继承同一存储身份。
 
 允许 kind：
 
@@ -904,7 +902,7 @@ project
 instruction
 ```
 
-LLM schema 可以返回多个 operation，但服务最多执行 `MEMORY_MAX_OPERATIONS`。
+Judge 通过后仍需经过后端确定性校验；它没有物理删除或 purge 权限。
 
 ### 5.13 后端确定性安全校验
 
@@ -922,9 +920,7 @@ LLM schema 可以返回多个 operation，但服务最多执行 `MEMORY_MAX_OPER
 
 - content 包含 evidence；或
 - evidence 包含 content；或
-- 归一化英文词项/CJK bigram 的共享比例达到 `MEMORY_GROUNDING_OVERLAP_THRESHOLD`。
-
-默认阈值为 `1/3`。
+- 归一化英文词项/CJK bigram 至少存在一个可归因的共享实义词项。
 
 #### Sensitivity 必须为 low
 
@@ -952,9 +948,9 @@ Marker/regex 拦截：
 | evidence 不在 user Message | ignore |
 | low、evidence 真实、content grounding 不足 | pending |
 | medium/high 或命中敏感规则 | ignore |
-| low、evidence 与 content 均 grounded | 进入去重/冲突流程 |
+| low、evidence 与 content 均 grounded | 进入 exact/冲突与一致性校验 |
 
-### 5.14 去重、touch、merge 与 supersede
+### 5.14 去重、touch 与 supersede
 
 #### Exact hash
 
@@ -969,26 +965,11 @@ Marker/regex 拦截：
 
 同 canonical key 或同 profile singleton slot 表示可能属于同一事实槽。
 
-系统可以调用第二次 LLM conflict review，但 reviewer 只能：
+这些候选在第二阶段 Judge 前已经通过 PostgreSQL 精确槽位查询加载。Judge 只能引用提供给它的 target id；如果裁决后出现新的并发冲突，后端 conflict gate 降级 pending，而不是覆盖未审阅的新状态。
 
-```text
-update
-supersede
-pending
-ignore
-```
+#### Semantic relation
 
-它只能引用提供给它的 target id，不能 create 或猜测 id。review 失败、target 不合法或结论不安全时降级 pending。
-
-#### Semantic merge
-
-同 category 且 cosine similarity >= `MEMORY_SEMANTIC_THRESHOLD`，或属于同方向的语言/回复详略偏好时，可以 merge：
-
-- 合并 content；
-- 重新 embedding；
-- `merge_count += 1`；
-- `revision += 1`；
-- 写 event。
+相似度不会触发 merge。向量近邻、同 category、canonical key 和最近候选只构成 Judge 上下文；是否为独立事实、等价事实、补充或替换完全由结构化关系判断。Judge 之后服务层不会再通过相似度覆盖裁决。
 
 #### Supersede
 
@@ -1003,7 +984,7 @@ ignore
 
 ### 5.15 乐观并发控制
 
-Memory Editor 上下文包含每条 memory 的 revision。
+Memory Judge 的相关记忆上下文包含每条 memory 的 revision。
 
 - 自动 update/supersede 在执行前校验 expected revision；陈旧操作不覆盖新状态。
 - 手工 PATCH 必须携带 `expected_revision`。
@@ -1021,7 +1002,7 @@ create/return idempotent job
 -> atomic dispatch claim
 -> broker delay(job_id)
 -> worker atomic lease claim
--> Memory Editor transaction
+-> Candidate Extractor + per-candidate Memory Judge transaction
 -> complete/fail with matching lease token
 ```
 
@@ -1058,7 +1039,7 @@ MEMORY_UPDATE_JOB_LEASE_SECONDS
 >= (1 + MEMORY_MAX_OPERATIONS) * LLM_TIMEOUT_SECONDS
 ```
 
-`1` 是首轮 Memory Editor，后续每个 operation 最坏可能触发一次 conflict review。
+`1` 是首轮 Candidate Extractor，后续每个候选固定触发一次 Memory Judge。
 
 #### Beat 恢复
 
@@ -1077,13 +1058,13 @@ dispatch claim 和 lease 防止连续扫描造成投递风暴。
 
 ### 5.17 Qdrant memory index 与 reconcile
 
-Qdrant memory index 默认关闭：
+Qdrant memory index 在代码、开发模板和生产模板中均默认开启：
 
 ```dotenv
-MEMORY_VECTOR_INDEX_ENABLED=false
+MEMORY_VECTOR_INDEX_ENABLED=true
 ```
 
-这是代码和开发模板的默认值；生产模板默认开启该索引，但 PostgreSQL 在两种模式下都是权威数据源。
+PostgreSQL 始终是权威数据源；Qdrant 只保存可重建 active memory point。回答阶段的 `memory(query)` 与更新阶段的候选相关记忆召回都会优先使用该索引，失败时回退 PostgreSQL 有界候选。
 
 开启后 point payload 至少包含 user_id、memory_id、status、category、kind、canonical_key、layer、scope 和 revision。
 
@@ -1099,11 +1080,11 @@ MEMORY_VECTOR_INDEX_ENABLED=false
 - 检查 stale revision/content；
 - 检查 unexpected point；
 - 检查过期 memory；
-- 检查 exact/profile/semantic duplicate；
+- 检查 exact/profile duplicate 与 semantic relation candidate；
 - dry-run 只报告；
 - apply 执行修复并写 vector_sync/vector_delete event/audit。
 
-当前 reconcile 不是 Beat 定时任务，需要用户或管理员显式调用。
+Celery Beat 每日在 operational retention 之后执行一次仅针对向量索引的全用户 reconcile，自动回填 missing point 并修复 stale/unexpected point，不自动合并或删除 PostgreSQL 记忆。用户或管理员仍可显式调用完整 reconcile 检查过期、exact/profile duplicate 和待 LLM 审阅的 semantic relation candidate。
 
 ### 5.18 删除、恢复与 purge
 
@@ -1216,8 +1197,8 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 | Memory Qdrant 失败 | 继续 | PostgreSQL semantic/lexical |
 | Embedding 失败 | 继续或写入失败 | Recall 保留 sticky/lexical；写入按 sync/async 语义记录失败 |
 | Recall log 写失败 | 继续 | rollback 日志事务，不丢回答 |
-| Memory Editor LLM 失败 | 继续 | sync 写 ignore/trace；async retry 后 failed |
-| Conflict reviewer 失败 | 继续 | 降 pending，不冒险 active |
+| Candidate Extractor / Memory Judge 失败 | 继续 | Judge fail-closed ignore；async job 异常按 worker 策略重试 |
+| Memory Judge 返回不确定关系 | 继续 | 可裁决 pending；Judge 异常或非法目标则 fail-closed ignore |
 | Memory DB transaction 失败 | 继续回答 | 整批 operation 回滚 |
 | Qdrant memory sync 失败 | 继续 | PostgreSQL 保持成功；手工 reconcile |
 | Summary dispatch 失败 | 继续 | Beat 按 cursor 恢复 |
@@ -1232,9 +1213,11 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 
 完整可复制值见项目根目录 `.env.example` 和 `.env.production.example`。Pydantic 会在启动时验证数值范围和跨参数关系。
 
+下表的“默认值”指 `apps/backend/app/core/config.py` 在没有环境变量时使用的代码 fallback。实际 Compose 会读取配置模板；当前两份模板把 `RETRIEVAL_TOP_K`、`SHORT_MEMORY_MAX_MESSAGES`、`MEMORY_CONTEXT_MAX_CHARS`、`MEMORY_CONTEXT_MAX_LONG_MEMORIES`、`MEMORY_SEMANTIC_LIMIT` 分别设为 `6、16、6000、10、6`，并为开发/生产选择不同的 Embedding 维度和 Memory 更新模式。排查运行值时应以进程实际环境为准。
+
 ### 7.1 应用、数据库和基础设施
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `APP_ENV_FILE` | ../.env | Compose service `env_file` 路径，相对 `infra/*.yml` |
 | `APP_ENV` | development | development/production 行为 |
@@ -1260,7 +1243,7 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 | `QDRANT_URL` | localhost:6333 | Qdrant 地址 |
 | `QDRANT_COLLECTION` | knowledge_chunks | 文档向量 collection |
 | `MEMORY_QDRANT_COLLECTION` | user_memories | 记忆向量 collection |
-| `MEMORY_VECTOR_INDEX_ENABLED` | false | 是否启用记忆 Qdrant 索引 |
+| `MEMORY_VECTOR_INDEX_ENABLED` | true | 是否启用记忆 Qdrant 索引；回答召回与更新前相关记忆召回共用 |
 | `QDRANT_TIMEOUT_SECONDS` | 10 | Qdrant SDK 超时 |
 | `HEALTHCHECK_TIMEOUT_SECONDS` | 3 | readiness 外部依赖超时 |
 | `MINIO_ENDPOINT` | localhost:9000 | MinIO 地址 |
@@ -1274,7 +1257,7 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 
 ### 7.2 LLM 与 Embedding
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `LLM_PROVIDER` | openai_compatible | LLM adapter |
 | `LLM_BASE_URL` | OpenAI API | 兼容端点 |
@@ -1283,7 +1266,7 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 | `LLM_TIMEOUT_SECONDS` | 30 | 单次 LLM 请求超时 |
 | `LLM_DEFAULT_TEMPERATURE` | 0.1 | 未指定任务温度 |
 | `LLM_SUMMARY_TEMPERATURE` | 0.2 | 摘要 |
-| `LLM_MEMORY_EDITOR_TEMPERATURE` | 0.0 | Memory Editor/conflict/reconcile |
+| `LLM_MEMORY_EDITOR_TEMPERATURE` | 0.0 | Candidate Extractor/Memory Judge/reconcile |
 | `LLM_CONTEXT_COMPRESSION_TEMPERATURE` | 0.0 | Memory/RAG 抽取式压缩 |
 | `EMBEDDING_PROVIDER` | openai_compatible | Embedding adapter |
 | `EMBEDDING_BASE_URL` | OpenAI API | Embedding 兼容端点 |
@@ -1297,12 +1280,12 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 
 ### 7.3 Agent 编排与流式运行
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `AGENT_MAX_MODEL_CALLS` | 6 | 单轮模型调用上限；最后一次移除工具 |
-| `AGENT_MAX_TOOL_CALLS` | 4 | 单轮 Memory/RAG 工具调用总上限 |
-| `AGENT_MAX_MEMORY_CALLS` | 2 | 单轮 Memory 工具调用上限 |
-| `AGENT_MAX_RAG_CALLS` | 3 | 单轮 RAG 工具调用上限 |
+| `AGENT_MAX_TOOL_CALLS` | 4 | 声明的单轮 Memory/RAG 总预算；模型调用前解绑工具 |
+| `AGENT_MAX_MEMORY_CALLS` | 2 | 声明的 Memory 分预算；执行入口二次硬校验待补充 |
+| `AGENT_MAX_RAG_CALLS` | 3 | 声明的 RAG 分预算；执行入口二次硬校验待补充 |
 | `AGENT_TOOL_OBSERVATION_MAX_CHARS` | 2400 | 单次工具观察回传模型的字符上限 |
 | `AGENT_STREAM_MAX_CONCURRENCY` | 8 | 每个 Uvicorn 进程的同时流式 Agent 上限 |
 | `AGENT_STREAM_QUEUE_MAXSIZE` | 128 | worker thread 到 SSE 主线程的单请求事件队列 |
@@ -1324,10 +1307,10 @@ max(
 
 ### 7.4 Hybrid Retrieval 与上下文
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `RETRIEVAL_TOP_K` | 5 | 请求未指定 top_k 时的最终 chunk 数 |
-| `RETRIEVAL_ROUTE_LIMIT` | 8 | 每条 retrieval route 进入融合的候选数 |
+| `RETRIEVAL_ROUTE_LIMIT` | 15 | 每条 retrieval route 进入融合的候选数 |
 | `RETRIEVAL_DENSE_PREFILTER_MULTIPLIER` | 4 | Dense 预取规模相对 route limit 的倍数 |
 | `RETRIEVAL_BM25_PREFILTER_TERMS` | 12 | BM25 预过滤使用的 query term 上限 |
 | `RETRIEVAL_MAX_MATCHED_TERMS` | 32 | 候选日志保留的 matched term 上限 |
@@ -1341,7 +1324,7 @@ max(
 
 ### 7.5 记忆、召回和上下文预算
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `SHORT_MEMORY_MAX_MESSAGES` | 12 | Redis working memory 的最近消息数 |
 | `SHORT_MEMORY_TTL_SECONDS` | 86400 | Redis working memory TTL |
@@ -1357,14 +1340,9 @@ max(
 | `MEMORY_CONTEXT_MIN_SECTION_TOKENS` | 24 | token 预算下非空区段最小配额 |
 | `MEMORY_CONTEXT_MIN_SECTION_CHARS` | 80 | 显式关闭 token budget 时的字符模式最小配额 |
 | `MEMORY_UPDATE_MODE` | sync | `sync` / `async` / `disabled` |
-| `MEMORY_SEMANTIC_THRESHOLD` | 0.82 | 语义去重与冲突判定基准 |
-| `MEMORY_RECALL_THRESHOLD_FACTOR` | 0.35 | 从 semantic threshold 推导 recall threshold 的系数 |
-| `MEMORY_RECALL_THRESHOLD_MIN` | 0.20 | recall threshold 下限 |
-| `MEMORY_RECALL_THRESHOLD_MAX` | 0.45 | recall threshold 上限 |
-| `MEMORY_GROUNDING_OVERLAP_THRESHOLD` | 1/3 | 来源文本 lexical grounding 最小重叠比例 |
-| `MEMORY_MAX_OPERATIONS` | 3 | 一次 memory review 允许的操作数 |
-| `MEMORY_EDITOR_CONTEXT_LIMIT` | 30 | Memory Editor prompt 中的现有记忆上限 |
-| `MEMORY_EDITOR_CANDIDATE_LIMIT` | 80 | Editor 候选扫描上限 |
+| `MEMORY_MAX_OPERATIONS` | 3 | 一次候选提取允许的候选数；每条候选固定触发 Judge |
+| `MEMORY_EDITOR_CONTEXT_LIMIT` | 30 | 每条候选提供给 Memory Judge 的相关记忆上限 |
+| `MEMORY_EDITOR_CANDIDATE_LIMIT` | 80 | Qdrant 不可用时更新链路的 PostgreSQL 最近候选池上限 |
 | `MEMORY_RECALL_CANDIDATE_LIMIT` | 120 | bounded semantic fallback 候选上限 |
 | `MEMORY_SOURCE_MAX_CHARS` | 700 | 记忆来源文本保留上限 |
 | `MEMORY_SUMMARY_DELTA_MAX_CHARS` | 12000 | 送入 memory review 的摘要增量上限 |
@@ -1374,34 +1352,24 @@ max(
 | `MEMORY_PENDING_LIMIT` | 10 | pending 治理数据加载上限 |
 | `MEMORY_RECONCILE_MAX_SEMANTIC_PAIRS` | 2000 | 单次 reconcile 语义 pair 检查上限 |
 
-实际 recall threshold 为：
-
-```text
-clamp(
-  MEMORY_SEMANTIC_THRESHOLD * MEMORY_RECALL_THRESHOLD_FACTOR,
-  MEMORY_RECALL_THRESHOLD_MIN,
-  MEMORY_RECALL_THRESHOLD_MAX
-)
-```
-
 `MEMORY_UPDATE_MODE=async` 依赖 worker 和唯一 Beat 调度器。`disabled` 只停止自动长期写入，不会自动关闭记忆读取；请求级 `memory_mode=off` 才是单轮完整 no-memory 语义。
 
 ### 7.6 增量会话摘要
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `CONVERSATION_SUMMARY_TRIGGER_TOKENS` | 2000 | 触发摘要的未处理 token 估算值 |
 | `CONVERSATION_SUMMARY_MIN_TOKENS` | 500 | 普通摘要的最小 token 门槛 |
-| `CONVERSATION_SUMMARY_MIN_MESSAGES` | 8 | 普通摘要的最小消息数 |
+| `CONVERSATION_SUMMARY_MIN_MESSAGES` | 16 | 普通摘要的最小消息数，与默认最近消息窗口对齐 |
 | `CONVERSATION_SUMMARY_MAX_UNPROCESSED` | 30 | 单次 worker 处理的未摘要消息上限 |
-| `CONVERSATION_SUMMARY_MAX_TOKENS` | 1200 | 持久化摘要独立 token 上限和模型压缩目标依据 |
+| `CONVERSATION_SUMMARY_MAX_TOKENS` | 1200 | 持久化摘要的程序侧独立 token 上限；不会作为精确 token 目标写进 Prompt |
 | `CONVERSATION_SUMMARY_LEASE_MIN_SECONDS` | 60 | 摘要租约最小时长 |
 
 `MIN_TOKENS` 不能大于 `TRIGGER_TOKENS`，`MIN_MESSAGES` 不能大于 `MAX_UNPROCESSED`。摘要实际租约会在最小值与 LLM 最坏时间预算之间取较大值。
 
 ### 7.7 Celery、恢复与运营保留
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `CELERY_TASK_MAX_RETRIES` | 3 | 普通 Celery task 最大重试数 |
 | `CELERY_TASK_RETRY_BACKOFF_SECONDS` | 5 | 指数退避初始秒数 |
@@ -1434,7 +1402,7 @@ broker visibility timeout 取“显式下限”与“memory lease x multiplier�
 
 ### 7.8 文档入库与认证
 
-| 变量 | 默认值 | 作用 |
+| 变量 | `config.py` fallback | 作用 |
 |---|---:|---|
 | `DEFAULT_CHUNK_SIZE` | 800 | 默认 chunk 字符数 |
 | `DEFAULT_CHUNK_OVERLAP` | 120 | 相邻 chunk 字符重叠 |
@@ -1445,12 +1413,12 @@ broker visibility timeout 取“显式下限”与“memory lease x multiplier�
 | `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | 60 | access token 有效分钟 |
 | `JWT_REFRESH_TOKEN_EXPIRE_DAYS` | 14 | refresh token 有效天数 |
 
-`DEFAULT_CHUNK_OVERLAP` 必须小于 `DEFAULT_CHUNK_SIZE`。Embedding model 或 dimension 变更后，必须重建知识 chunk 与可选 memory collection，系统不会自动迁移旧向量。
+`DEFAULT_CHUNK_OVERLAP` 必须小于 `DEFAULT_CHUNK_SIZE`。Embedding model 或 dimension 变更后，必须重建知识 chunk collection，并重新生成启用中的 memory collection 向量；系统不会自动迁移旧维度向量。
 
 ### 7.9 配置加载与 fail-fast
 
-- `.env.example`、`.env.production.example` 和本地 `.env` 保持 140 个有效键的同一顺序。每个键都有紧邻注释。
-- Pydantic 在应用进程启动时验证后端数值范围、枚举值和跨参数关系。未知 `APP_ENV`、Agent backend、memory mode、provider 或 JWT algorithm 会直接失败，不会静默回退。
+- `.env.example` 与 `.env.production.example` 当前包含 133 个有效键，键集和顺序一致，每个键都有紧邻注释。本地 `.env` 是被忽略的运行覆盖文件，不要求提交或保持同序。
+- Pydantic 在应用进程启动时验证后端数值范围、枚举值和跨参数关系。未知 `APP_ENV`、memory mode、provider 或 JWT algorithm 会直接失败，不会静默回退。
 - `APP_ENV=production` 时额外拒绝 SQLite、自动建表、默认/占位凭据、弱 JWT、通配 CORS 和占位 origin。
 - backend、Celery worker 和 Beat 都执行生产配置校验。
 - `VITE_API_BASE_URL` 在前端构建时固化；修改后必须重建镜像。`API_PREFIX`、`NGINX_MAX_BODY_SIZE_MB` 和 `NGINX_PROXY_TIMEOUT_SECONDS` 在生产 Nginx 启动时渲染。
@@ -1481,9 +1449,9 @@ broker visibility timeout 取“显式下限”与“memory lease x multiplier�
 - RAG 记忆上下文隔离、RetrievalLog provenance 与 fail-closed；
 - SSE 提交顺序、并发槽、deadline、取消和会话租约；
 - short memory DB fallback、token budget 和 no-memory turn；
-- 记忆 create/touch/update/merge/supersede/ignore/pending 语义；
+- 记忆 create/touch/update/supersede/ignore/pending 语义及关系操作的存储层继承；
 - sensitive-data guard、grounding、OCC revision 和批量事务回滚；
-- vector/SQL recall threshold 一致性、召回日志和 reconcile；
+- vector/SQL top-K 排序一致性、召回日志和 LLM reconcile；
 - durable job 幂等、同用户顺序、dispatch claim、lease fencing、Beat 恢复和用户重试；
 - summary cursor、私密消息过滤、租约和恢复；
 - soft delete、restore、purge、external cleanup 与 retention；

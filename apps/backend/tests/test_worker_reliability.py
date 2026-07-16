@@ -59,6 +59,10 @@ class WorkerReliabilityTests(unittest.TestCase):
             schedules["recover-stale-conversation-summaries"]["task"],
             "recover_stale_conversation_summaries",
         )
+        self.assertEqual(
+            schedules["reconcile-memory-vector-indexes-daily"]["task"],
+            "reconcile_memory_vector_indexes",
+        )
         self.assertFalse(schedules["apply-operational-retention-daily"]["kwargs"]["dry_run"])
 
     def test_claim_preserves_per_user_job_order(self) -> None:

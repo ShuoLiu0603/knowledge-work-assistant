@@ -7,6 +7,8 @@ from app.db.models.document import Document, DocumentChunk
 from app.rag.advanced_retrieval import (
     FusedCandidate,
     RetrievalCandidate,
+    bm25_document_terms,
+    bm25_query_terms,
     fuse_candidates,
     hydrate_retrieved_chunks,
     retrieve_advanced_chunks,
@@ -171,6 +173,32 @@ class AdvancedRetrievalTests(unittest.TestCase):
             )
 
             self.assertEqual([item.chunk.file_name for item in routes["bm25"]], ["travel-policy.md"])
+
+    def test_bm25_uses_terms_beyond_the_matched_term_log_limit(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "bm25-full-document@example.com", "BM25 Full Document")
+            kb = create_knowledge_base(session, user.id, KnowledgeBaseCreate(name="Full Document BM25 KB"))
+            document = make_document_row(kb.id, "long-policy.md", "long-bm25", status="indexed")
+            session.add(document)
+            session.flush()
+            prefix = " ".join(f"filler{index}" for index in range(40))
+            session.add(make_chunk_row(document, f"{prefix} needleterm"))
+            session.commit()
+
+            routes = retrieve_bm25_route(
+                session,
+                kb.id,
+                "needleterm",
+                route_limit=10,
+                max_security_level=1,
+            )
+
+            self.assertEqual([item.chunk.file_name for item in routes["bm25"]], ["long-policy.md"])
+
+    def test_bm25_terms_remove_english_stop_words_and_preserve_document_frequency(self) -> None:
+        self.assertEqual(bm25_query_terms("the fibrosis is in the lungs"), ["fibrosis", "lungs"])
+        self.assertEqual(bm25_document_terms("fibrosis fibrosis in lungs"), ["fibrosis", "fibrosis", "lungs"])
+
 
 def make_chunk(chunk_id: str, score: float, content: str | None = None) -> RetrievedChunk:
     return RetrievedChunk(

@@ -76,7 +76,17 @@ def process_memory_operation(
         return create_pending_memory_from_operation(db, user_id, operation, normalized, source, autocommit=autocommit)
 
     if operation.action == "pending":
-        return create_pending_memory_from_operation(db, user_id, operation, normalized, source, autocommit=autocommit)
+        target = get_operation_target(db, user_id, operation.target_memory_id)
+        storage_source = storage_source_for_relation(operation, target)
+        return create_pending_memory_from_operation(
+            db,
+            user_id,
+            operation,
+            normalized,
+            source,
+            storage_source=storage_source,
+            autocommit=autocommit,
+        )
 
     target = get_operation_target(db, user_id, operation.target_memory_id)
     if target is None:
@@ -124,21 +134,29 @@ def update_memory_from_operation(
     autocommit: bool = True,
     user_message: str | None = None,
 ) -> MemoryAction:
+    storage_source = storage_source_for_relation(operation, target)
     if not policy.can_auto_update(operation, user_message=user_message):
-        return create_pending_memory_from_operation(db, target.user_id, operation, normalized, source, autocommit=autocommit)
+        return create_pending_memory_from_operation(
+            db,
+            target.user_id,
+            operation,
+            normalized,
+            source,
+            storage_source=storage_source,
+            autocommit=autocommit,
+        )
 
     memory_embedding = embedding.embed_memory_text(normalized)
     previous_status = target.status
-    category = policy.resolve_operation_category(operation)
-    canonical_key = policy.canonical_key_for_operation(operation, category, normalized)
-    operation_metadata = policy.memory_operation_metadata(operation, decision="auto_update")
+    operation_metadata = memory_operation_metadata_for_storage(operation, "auto_update", storage_source)
     target.content = operation.content
     target.normalized_content = normalized
     target.content_hash = policy.hash_content(normalized)
-    target.category = category
-    target.kind = operation.kind
-    target.canonical_key = canonical_key
-    apply_memory_classification(target, operation.kind, target.category, operation_metadata)
+    if storage_source is None:
+        target.category = policy.resolve_operation_category(operation)
+        target.kind = operation.kind
+        target.canonical_key = policy.canonical_key_for_operation(operation, target.category, normalized)
+        apply_memory_classification(target, operation.kind, target.category, operation_metadata)
     target.source_text = source.text
     target.source_conversation_id = source.conversation_id
     target.source_message_id = source.message_id
@@ -195,9 +213,19 @@ def supersede_memory_from_operation(
     autocommit: bool = True,
     user_message: str | None = None,
 ) -> MemoryAction:
+    storage_source = storage_source_for_relation(operation, target)
     if not policy.can_auto_supersede(operation, target.status, user_message=user_message):
-        return create_pending_memory_from_operation(db, user_id, operation, normalized, source, autocommit=autocommit)
+        return create_pending_memory_from_operation(
+            db,
+            user_id,
+            operation,
+            normalized,
+            source,
+            storage_source=storage_source,
+            autocommit=autocommit,
+        )
 
+    operation_metadata = memory_operation_metadata_for_storage(operation, "auto_supersede", storage_source)
     previous_status = stage_memory_for_replacement(db, target)
     memory = create_memory_from_operation(
         db,
@@ -206,6 +234,7 @@ def supersede_memory_from_operation(
         normalized,
         source,
         status="active",
+        storage_source=storage_source,
         autocommit=autocommit,
     )
     target.superseded_by_id = memory.id
@@ -220,7 +249,7 @@ def supersede_memory_from_operation(
         new_status=target.status,
         payload={
             "superseded_by_id": memory.id,
-            "operation": policy.memory_operation_metadata(operation, decision="auto_supersede"),
+            "operation": operation_metadata,
         },
     )
     if not autocommit:
@@ -240,27 +269,42 @@ def create_memory_from_operation(
     source: MemorySource,
     status: str,
     decision: str | None = None,
+    storage_source: UserMemory | None = None,
     enforce_profile_singleton: bool = True,
     enforce_canonical_key_conflicts: bool = True,
     autocommit: bool = True,
 ) -> UserMemory:
+    category = storage_source.category if storage_source is not None else policy.resolve_operation_category(operation)
+    kind = storage_source.kind if storage_source is not None else operation.kind
+    metadata = memory_operation_metadata_for_storage(
+        operation,
+        decision or f"auto_{operation.action}",
+        storage_source,
+    )
+    canonical_key = (
+        storage_source.canonical_key
+        if storage_source is not None
+        else policy.canonical_key_for_operation(operation, category, normalized)
+    )
     return commands.create_memory_row(
         db,
         user_id,
         operation.content,
         normalized,
         policy.hash_content(normalized),
-        policy.resolve_operation_category(operation),
+        category,
         source,
         embedding.embed_memory_text(normalized),
         status=status,
-        kind=operation.kind,
-        extra_metadata=policy.memory_operation_metadata(operation, decision=decision or f"auto_{operation.action}"),
-        canonical_key=policy.canonical_key_for_operation(
-            operation,
-            policy.resolve_operation_category(operation),
-            normalized,
-        ),
+        kind=kind,
+        extra_metadata=metadata,
+        canonical_key=canonical_key,
+        memory_layer=storage_source.memory_layer if storage_source is not None else None,
+        profile_slot=storage_source.profile_slot if storage_source is not None else None,
+        scope_type=storage_source.scope_type if storage_source is not None else "user",
+        scope_id=storage_source.scope_id if storage_source is not None else None,
+        pinned=storage_source.pinned if storage_source is not None else None,
+        expires_at=storage_source.expires_at if storage_source is not None else None,
         enforce_profile_singleton=enforce_profile_singleton,
         enforce_canonical_key_conflicts=enforce_canonical_key_conflicts,
         event_reason=operation.reason or f"memory editor {operation.action}",
@@ -313,10 +357,6 @@ def create_memory_from_operation_with_conflict_gate(
             autocommit=autocommit,
         )
 
-    similar = find_similar_memory(active_candidates, memory_embedding.vector, normalized)
-    if similar:
-        return merge_similar_memory_from_operation(db, operation, source, similar, autocommit=autocommit)
-
     memory = commands.create_memory_row(
         db,
         user_id,
@@ -366,7 +406,20 @@ def review_and_apply_conflict_decision(
         )
 
     if decision.action == "pending":
-        return create_pending_memory_from_operation(db, user_id, decision, normalized, source, autocommit=autocommit)
+        target = next(
+            (memory for memory in conflict_candidates if memory.id == decision.target_memory_id),
+            None,
+        )
+        storage_source = storage_source_for_relation(decision, target)
+        return create_pending_memory_from_operation(
+            db,
+            user_id,
+            decision,
+            normalized,
+            source,
+            storage_source=storage_source,
+            autocommit=autocommit,
+        )
 
     candidate_ids = {memory.id for memory in conflict_candidates}
     if decision.target_memory_id not in candidate_ids:
@@ -421,6 +474,7 @@ def create_pending_memory_from_operation(
     operation: MemoryOperation,
     normalized: str,
     source: MemorySource,
+    storage_source: UserMemory | None = None,
     autocommit: bool = True,
 ) -> MemoryAction:
     if (
@@ -433,23 +487,33 @@ def create_pending_memory_from_operation(
             operation.content,
             "sensitive memory requires explicit manual save",
         )
+    category = storage_source.category if storage_source is not None else policy.resolve_operation_category(operation)
+    kind = storage_source.kind if storage_source is not None else operation.kind
+    metadata = memory_operation_metadata_for_storage(operation, "pending_user_review", storage_source)
+    canonical_key = (
+        storage_source.canonical_key
+        if storage_source is not None
+        else policy.canonical_key_for_operation(operation, category, normalized)
+    )
     memory = commands.create_memory_row(
         db,
         user_id,
         operation.content,
         normalized,
         policy.hash_content(normalized),
-        policy.resolve_operation_category(operation),
+        category,
         source,
         embedding.embed_memory_text(normalized),
         status="pending",
-        kind=operation.kind,
-        extra_metadata=policy.memory_operation_metadata(operation, decision="pending_user_review"),
-        canonical_key=policy.canonical_key_for_operation(
-            operation,
-            policy.resolve_operation_category(operation),
-            normalized,
-        ),
+        kind=kind,
+        extra_metadata=metadata,
+        canonical_key=canonical_key,
+        memory_layer=storage_source.memory_layer if storage_source is not None else None,
+        profile_slot=storage_source.profile_slot if storage_source is not None else None,
+        scope_type=storage_source.scope_type if storage_source is not None else "user",
+        scope_id=storage_source.scope_id if storage_source is not None else None,
+        pinned=storage_source.pinned if storage_source is not None else None,
+        expires_at=storage_source.expires_at if storage_source is not None else None,
         event_type="pending",
         event_reason=operation.reason or "memory operation requires user review",
         autocommit=autocommit,
@@ -511,10 +575,6 @@ def upsert_memory_candidate(db: Session, user_id: str, content: str | MemoryCand
             memory_embedding,
             canonical_conflict,
         )
-
-    similar = find_similar_memory(active_same_category, memory_embedding.vector, normalized)
-    if similar:
-        return merge_similar_memory(db, candidate, similar)
 
     if canonical_conflict:
         return supersede_conflicting_memory(
@@ -653,144 +713,6 @@ def supersede_conflicting_memory_from_operation(
     )
 
 
-def merge_similar_memory(db: Session, candidate: MemoryCandidate, similar: UserMemory) -> MemoryAction:
-    previous_status = similar.status
-    previous_content_hash = similar.content_hash
-    similar.content = merge_memory_content(similar.content, candidate.content)
-    similar.normalized_content = policy.normalize_memory_content(similar.content)
-    similar.content_hash = policy.hash_content(similar.normalized_content)
-    merged_embedding = embedding.embed_memory_text(similar.normalized_content)
-    similar.embedding = merged_embedding.vector
-    similar.embedding_model = merged_embedding.model
-    similar.embedding_dimension = merged_embedding.dimension
-    similar.merge_count += 1
-    similar.revision += 1
-    similar.last_touched_at = datetime.now(timezone.utc)
-    apply_memory_classification(
-        similar,
-        candidate.kind,
-        similar.category,
-        {
-            **(similar.extra_metadata or {}),
-            "sensitivity": candidate.sensitivity,
-            "canonical_key": policy.canonical_key_for_candidate(
-                candidate,
-                similar.category,
-                similar.normalized_content,
-            ),
-        },
-    )
-    similar.extra_metadata = {
-        **(similar.extra_metadata or {}),
-        "sensitivity": candidate.sensitivity,
-        "canonical_key": similar.canonical_key,
-        "memory_layer": policy.memory_layer_for_fields(candidate.kind, similar.category),
-        "profile_slot": policy.profile_slot_for_fields(candidate.kind, similar.category),
-    }
-    activation_conflicts: list[UserMemory] = []
-    if similar.status == "active":
-        activation_conflicts = commands.supersede_activation_conflicts(
-            db,
-            similar,
-            reason="memory merge superseded conflicting active memory",
-            payload={"previous_content_hash": previous_content_hash},
-        )
-    db.add(similar)
-    db.flush()
-    events.record_memory_event(
-        db,
-        similar,
-        "merge",
-        reason="semantic similarity above threshold",
-        previous_status=previous_status,
-        new_status=similar.status,
-        payload={
-            "previous_content_hash": previous_content_hash,
-            "superseded_conflict_ids": [conflict.id for conflict in activation_conflicts],
-        },
-    )
-    db.commit()
-    db.refresh(similar)
-    for conflict in activation_conflicts:
-        vector_index.try_sync_memory_vector(conflict)
-    vector_index.try_sync_memory_vector(similar)
-    return MemoryAction("merge", similar.id, similar.content, "semantic similarity above threshold")
-
-
-def merge_similar_memory_from_operation(
-    db: Session,
-    operation: MemoryOperation,
-    source: MemorySource,
-    similar: UserMemory,
-    autocommit: bool = True,
-) -> MemoryAction:
-    previous_status = similar.status
-    previous_content_hash = similar.content_hash
-    operation_metadata = policy.memory_operation_metadata(operation, decision="auto_merge")
-    similar.content = merge_memory_content(similar.content, operation.content)
-    similar.normalized_content = policy.normalize_memory_content(similar.content)
-    similar.content_hash = policy.hash_content(similar.normalized_content)
-    merged_embedding = embedding.embed_memory_text(similar.normalized_content)
-    similar.category = policy.resolve_operation_category(operation)
-    similar.kind = operation.kind
-    apply_memory_classification(similar, operation.kind, similar.category, operation_metadata)
-    similar.source_text = source.text
-    similar.source_conversation_id = source.conversation_id
-    similar.source_message_id = source.message_id
-    similar.embedding = merged_embedding.vector
-    similar.embedding_model = merged_embedding.model
-    similar.embedding_dimension = merged_embedding.dimension
-    similar.merge_count += 1
-    similar.revision += 1
-    similar.last_touched_at = datetime.now(timezone.utc)
-    similar.extra_metadata = {
-        **(similar.extra_metadata or {}),
-        **operation_metadata,
-    }
-    activation_conflicts: list[UserMemory] = []
-    if similar.status == "active":
-        activation_conflicts = commands.supersede_activation_conflicts(
-            db,
-            similar,
-            reason=operation.reason or "memory editor merge superseded conflicting active memory",
-            payload={"operation": operation_metadata},
-        )
-    db.add(similar)
-    db.flush()
-    events.record_memory_event(
-        db,
-        similar,
-        "merge",
-        reason=operation.reason or "memory editor create merged with similar active memory",
-        previous_status=previous_status,
-        new_status=similar.status,
-        payload={
-            "previous_content_hash": previous_content_hash,
-            "operation": operation_metadata,
-            "superseded_conflict_ids": [conflict.id for conflict in activation_conflicts],
-        },
-    )
-    if not autocommit:
-        commands.queue_memory_vector_sync(db, similar, *activation_conflicts)
-        return MemoryAction(
-            "merge",
-            similar.id,
-            similar.content,
-            operation.reason or "memory editor create merged with similar active memory",
-        )
-    db.commit()
-    db.refresh(similar)
-    for conflict in activation_conflicts:
-        vector_index.try_sync_memory_vector(conflict)
-    vector_index.try_sync_memory_vector(similar)
-    return MemoryAction(
-        "merge",
-        similar.id,
-        similar.content,
-        operation.reason or "memory editor create merged with similar active memory",
-    )
-
-
 def get_operation_target(db: Session, user_id: str, memory_id: str | None) -> UserMemory | None:
     if not memory_id:
         return None
@@ -835,6 +757,31 @@ def apply_memory_classification(memory: UserMemory, kind: str, category: str, me
         memory.scope_type = "user"
     if not memory.scope_id:
         memory.scope_id = memory.user_id
+
+
+def memory_operation_metadata_for_storage(
+    operation: MemoryOperation,
+    decision: str,
+    storage_source: UserMemory | None = None,
+) -> dict:
+    metadata = policy.memory_operation_metadata(operation, decision=decision)
+    if storage_source is None:
+        return metadata
+    return {
+        **metadata,
+        "canonical_key": storage_source.canonical_key,
+        "memory_layer": storage_source.memory_layer,
+        "profile_slot": storage_source.profile_slot,
+    }
+
+
+def storage_source_for_relation(
+    operation: MemoryOperation,
+    target: UserMemory | None,
+) -> UserMemory | None:
+    if operation.relation not in {"refinement", "replacement", "uncertain"}:
+        return None
+    return target
 
 
 def list_conflict_candidates(
@@ -901,34 +848,6 @@ def find_canonical_key_conflict(memories: list[UserMemory], canonical_key: str) 
     return None
 
 
-def find_similar_memory(memories: list[UserMemory], memory_embedding: list[float], normalized: str = "") -> UserMemory | None:
-    if normalized:
-        same_direction = find_same_direction_preference(memories, normalized)
-        if same_direction:
-            return same_direction
-    return retrieval.find_similar_memory(
-        memories,
-        memory_embedding,
-        threshold=policy.semantic_similarity_threshold(),
-    )
-
-
-def find_same_direction_preference(memories: list[UserMemory], normalized: str) -> UserMemory | None:
-    wants_brief = has_brief_direction(normalized)
-    wants_detail = has_detailed_direction(normalized)
-    wanted_language = language_direction(normalized)
-    for memory in memories:
-        old = memory.normalized_content
-        old_brief = has_brief_direction(old)
-        old_detail = has_detailed_direction(old)
-        old_language = language_direction(old)
-        if (wants_brief and old_brief) or (wants_detail and old_detail):
-            return memory
-        if wanted_language and old_language and wanted_language == old_language:
-            return memory
-    return None
-
-
 def has_brief_direction(text: str) -> bool:
     return any(marker in text for marker in policy.RESPONSE_BRIEF_MARKERS)
 
@@ -943,9 +862,3 @@ def language_direction(text: str) -> str:
     if any(marker in text for marker in ("\u82f1\u6587", "\u82f1\u8bed", "english")):
         return "english"
     return ""
-
-
-def merge_memory_content(existing: str, incoming: str) -> str:
-    if incoming in existing:
-        return existing
-    return f"{existing}; {incoming}"

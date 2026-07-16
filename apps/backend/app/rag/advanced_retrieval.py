@@ -14,6 +14,43 @@ from app.rag.answering import compact_snippet
 from app.rag.retrieval import RetrievedChunk, retrieve_dense_chunks
 
 TERM_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
+ENGLISH_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "by",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "no",
+        "not",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "their",
+        "this",
+        "to",
+        "was",
+        "were",
+        "with",
+        "without",
+    }
+)
 
 _SETTINGS = get_settings()
 DENSE_PREFILTER_MULTIPLIER = _SETTINGS.retrieval_dense_prefilter_multiplier
@@ -231,7 +268,7 @@ def retrieve_bm25_chunks(
     max_security_level: int,
 ) -> list[RetrievalCandidate]:
     knowledge_base_ids = normalize_kb_ids(kb_ids)
-    query_terms = searchable_terms(query)
+    query_terms = bm25_query_terms(query)
     if not knowledge_base_ids or not query_terms:
         return []
 
@@ -277,7 +314,7 @@ def rank_bm25_rows(
     rows: list[tuple[DocumentChunk, Document]],
 ) -> list[tuple[DocumentChunk, Document, float]]:
     tokenized_rows = [
-        (chunk, document, searchable_terms(keyword_search_text(chunk, document)))
+        (chunk, document, bm25_document_terms(keyword_search_text(chunk, document)))
         for chunk, document in rows
     ]
     tokenized_rows = [row for row in tokenized_rows if row[2]]
@@ -398,6 +435,14 @@ def searchable_terms(text: str) -> list[str]:
     return dedupe_preserve_order(text_terms(text))[:MAX_MATCHED_TERMS]
 
 
+def bm25_query_terms(text: str) -> list[str]:
+    return dedupe_preserve_order(bm25_document_terms(text))[:MAX_MATCHED_TERMS]
+
+
+def bm25_document_terms(text: str) -> list[str]:
+    return [term for term in text_terms(text) if is_cjk(term) or term not in ENGLISH_STOP_WORDS]
+
+
 def text_terms(text: str) -> list[str]:
     terms: list[str] = []
     for token in TERM_RE.findall(text.lower()):
@@ -420,7 +465,7 @@ def is_cjk(value: str) -> bool:
 
 def matched_terms(query: str, text: str) -> list[str]:
     content_terms = set(text_terms(text))
-    return [term for term in searchable_terms(query) if term in content_terms]
+    return [term for term in bm25_query_terms(query) if term in content_terms]
 
 
 def has_term_overlap(query_terms: list[str], content_terms: list[str]) -> bool:

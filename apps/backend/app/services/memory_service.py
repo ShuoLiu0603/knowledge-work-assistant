@@ -18,7 +18,7 @@ from app.db.models.user import User
 from app.db.models.user_memory import UserMemory, UserMemoryEvent, UserMemoryRecallLog, UserMemoryUpdateJob
 from app.llm.provider import MemoryCandidate, MemoryOperation, get_llm_provider
 from app.llm.context_compression import compress_memory_context
-from app.llm.token_counter import count_tokens, tokenizer_for_model
+from app.llm.token_counter import count_tokens
 from app.memory import commands as memory_commands
 from app.memory import context as memory_contexts
 from app.memory import editor as memory_editor
@@ -52,6 +52,22 @@ PENDING_MEMORY_LIMIT = get_settings().memory_pending_limit
 ALLOWED_MEMORY_UPDATE_JOB_STATUSES = {"queued", "processing", "completed", "failed"}
 PURGED_MEMORY_REDACTION_TEXT = "[redacted after memory purge]"
 SENSITIVE_MEMORY_CONFIRMATION_REQUIRED = "Sensitive memory content requires explicit confirmation"
+CONVERSATION_SUMMARY_SECTION_ORDER = (
+    "CURRENT GOAL",
+    "ACTIVE CONSTRAINTS AND DECISIONS",
+    "ESTABLISHED FACTS AND COMPLETED WORK",
+    "IMPORTANT ARTIFACTS",
+    "OPEN QUESTIONS OR BLOCKERS",
+    "NEXT STEP",
+)
+CONVERSATION_SUMMARY_SECTION_PRIORITY = (
+    "ACTIVE CONSTRAINTS AND DECISIONS",
+    "CURRENT GOAL",
+    "OPEN QUESTIONS OR BLOCKERS",
+    "NEXT STEP",
+    "ESTABLISHED FACTS AND COMPLETED WORK",
+    "IMPORTANT ARTIFACTS",
+)
 
 
 def get_redis_client():
@@ -214,52 +230,88 @@ def process_user_memory(
         return [MemoryAction("ignore", None, "", "user requested no memory for this turn")]
 
     provider = get_llm_provider()
-    if hasattr(provider, "review_memory_operations"):
-        operations = review_memory_operations_with_logging(db, provider, user_id, text, assistant_text, conversation_id)
-        actions = []
-        batch_state = {"needs_commit": False}
-        memory_commands.pop_queued_memory_vector_sync_ids(db)
-        try:
-            for operation in operations[:MAX_MEMORY_OPERATIONS]:
+    if not hasattr(provider, "review_memory_operations"):
+        return [MemoryAction("ignore", None, "", "memory review is not supported by the configured provider")]
+
+    proposals = extract_memory_candidates_with_logging(db, provider, user_id, text, assistant_text, conversation_id)
+    actions: list[MemoryAction] = []
+    judge_was_called = False
+    memory_commands.pop_queued_memory_vector_sync_ids(db)
+    try:
+        for proposal in proposals[:MAX_MEMORY_OPERATIONS]:
+            if proposal.action == "ignore" or not proposal.content.strip():
                 actions.append(
-                    process_memory_operation(
-                        db,
-                        user_id,
-                        operation,
-                        source=memory_source_from_turn(
-                            db,
-                            conversation_id,
-                            text,
-                            evidence=(
-                                operation.evidence
-                                if memory_policy.is_evidence_grounded(operation.evidence, text)
-                                else text
-                            ),
-                            message_id=message_id,
-                        ),
-                        conflict_reviewer=build_memory_conflict_reviewer(db, provider, user_id, conversation_id, batch_state),
-                        user_message=text,
-                        autocommit=False,
+                    MemoryAction(
+                        "ignore",
+                        None,
+                        proposal.content,
+                        proposal.reason or "memory candidate extractor ignored the turn",
                     )
                 )
-            if autocommit:
-                sync_memory_ids = memory_commands.pop_queued_memory_vector_sync_ids(db)
-                if sync_memory_ids or batch_state["needs_commit"]:
-                    db.commit()
-                if sync_memory_ids:
-                    sync_memory_vectors_by_ids(db, sync_memory_ids)
-            else:
-                db.flush()
-        except Exception:
-            db.rollback()
-            memory_commands.pop_queued_memory_vector_sync_ids(db)
-            raise
-        return actions or [MemoryAction("ignore", None, "", "no durable memory operation")]
+                continue
 
-    return [MemoryAction("ignore", None, "", "memory review is not supported by the configured provider")]
+            candidate = replace(proposal, action="create", target_memory_id=None, expected_revision=None)
+            related_memories = load_related_memories_for_candidate(db, user_id, candidate)
+            decision = judge_memory_candidate_with_logging(
+                db,
+                provider,
+                user_id,
+                candidate,
+                related_memories,
+                text,
+                assistant_text,
+                conversation_id,
+            )
+            judge_was_called = True
+            if decision is None:
+                actions.append(
+                    MemoryAction(
+                        "ignore",
+                        None,
+                        candidate.content,
+                        "mandatory memory judge rejected the candidate or was unavailable",
+                    )
+                )
+                continue
+
+            actions.append(
+                process_memory_operation(
+                    db,
+                    user_id,
+                    decision,
+                    source=memory_source_from_turn(
+                        db,
+                        conversation_id,
+                        text,
+                        evidence=(
+                            decision.evidence
+                            if memory_policy.is_evidence_grounded(decision.evidence, text)
+                            else text
+                        ),
+                        message_id=message_id,
+                    ),
+                    conflict_reviewer=None,
+                    user_message=text,
+                    autocommit=False,
+                )
+            )
+
+        if autocommit:
+            sync_memory_ids = memory_commands.pop_queued_memory_vector_sync_ids(db)
+            if sync_memory_ids or judge_was_called:
+                db.commit()
+            if sync_memory_ids:
+                sync_memory_vectors_by_ids(db, sync_memory_ids)
+        else:
+            db.flush()
+    except Exception:
+        db.rollback()
+        memory_commands.pop_queued_memory_vector_sync_ids(db)
+        raise
+    return actions or [MemoryAction("ignore", None, "", "no durable memory candidate")]
 
 
-def review_memory_operations_with_logging(
+def extract_memory_candidates_with_logging(
     db: Session,
     provider,
     user_id: str,
@@ -267,33 +319,53 @@ def review_memory_operations_with_logging(
     assistant_message: str,
     conversation_id: str | None,
 ) -> list[MemoryOperation]:
-    editor_context = build_memory_editor_context(db, user_id, user_message)
-    review = call_memory_review(provider, user_message, assistant_message, editor_context)
-    create_llm_call_log(
-        db,
-        review.completion,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        agent_name="memory_editor",
-    )
-    revisions = {
-        item["id"]: item["revision"]
-        for section in ("existing_memories", "profile_memories", "candidate_memories", "pending_memories")
-        for item in editor_context[section]
-        if isinstance(item.get("id"), str) and isinstance(item.get("revision"), int)
-    }
-    return [
-        replace(
-            operation,
-            expected_revision=revisions.get(operation.target_memory_id),
+    retry_reason = ""
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            review = call_memory_review(
+                provider,
+                user_message,
+                assistant_message,
+                empty_memory_editor_context(),
+                retry_reason=retry_reason,
+            )
+        except Exception as exc:
+            last_error = exc
+            retry_reason = (
+                "The previous extractor output violated the candidate schema. Return a candidates array with "
+                "verbatim non-empty evidence for every candidate."
+            )
+            continue
+        create_llm_call_log(
+            db,
+            review.completion,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            agent_name="memory_candidate_extractor" if attempt == 0 else "memory_candidate_extractor_retry",
         )
-        if operation.target_memory_id
-        else operation
-        for operation in review.operations
-    ]
+        return review.operations
+    if last_error is not None:
+        raise last_error
+    return []
 
 
-def call_memory_review(provider, user_message: str, assistant_message: str, editor_context: dict):
+def empty_memory_editor_context() -> dict[str, list[dict]]:
+    return {
+        "existing_memories": [],
+        "profile_memories": [],
+        "candidate_memories": [],
+        "pending_memories": [],
+    }
+
+
+def call_memory_review(
+    provider,
+    user_message: str,
+    assistant_message: str,
+    editor_context: dict,
+    retry_reason: str = "",
+):
     method = provider.review_memory_operations
     parameters = inspect.signature(method).parameters
     accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
@@ -306,11 +378,211 @@ def call_memory_review(provider, user_message: str, assistant_message: str, edit
         "profile_memories": editor_context["profile_memories"],
         "candidate_memories": editor_context["candidate_memories"],
         "pending_memories": editor_context["pending_memories"],
+        "retry_reason": retry_reason,
     }
     for name, value in optional_payload.items():
         if accepts_kwargs or name in parameters:
             kwargs[name] = value
     return method(**kwargs)
+
+
+def load_related_memories_for_candidate(
+    db: Session,
+    user_id: str,
+    candidate: MemoryOperation,
+) -> list[UserMemory]:
+    """Build a bounded judge context using deterministic keys, Qdrant, and a local fallback."""
+    normalized = memory_policy.normalize_memory_content(candidate.content)
+    if not normalized:
+        return []
+
+    category = memory_policy.resolve_operation_category(candidate)
+    canonical_key = memory_policy.canonical_key_for_operation(candidate, category, normalized)
+    exact = memory_repository.find_exact_memory(
+        db,
+        user_id,
+        memory_policy.hash_content(normalized),
+        statuses={"active", "pending"},
+    )
+    conflict_candidates = memory_editor.list_conflict_candidates(db, user_id, category, canonical_key)
+    canonical_matches = [
+        memory
+        for memory in conflict_candidates
+        if canonical_key and memory.canonical_key == canonical_key
+    ]
+
+    recent_candidates = memory_repository.list_memory_editor_candidates(
+        db,
+        user_id,
+        MEMORY_EDITOR_CANDIDATE_LIMIT,
+    )
+    recent_candidates = [
+        memory
+        for memory in recent_candidates
+        if (
+            not memory_policy.is_profile_memory(memory)
+            or memory.category == category
+            or (canonical_key and memory.canonical_key == canonical_key)
+        )
+    ]
+
+    query_vector: list[float] | None = None
+    vector_memories: list[UserMemory] = []
+    try:
+        query_vector = memory_embedding.embed_memory_text(candidate.content).vector
+        vector_hits = memory_vector_index.search_active_memories(
+            user_id,
+            query_vector,
+            limit=MEMORY_EDITOR_CONTEXT_LIMIT,
+        )
+        vector_memories = memory_repository.list_active_memories_by_ids(
+            db,
+            user_id,
+            [hit.memory_id for hit in vector_hits],
+            include_profile=True,
+        )
+    except Exception:
+        query_vector = None
+        vector_memories = []
+
+    combined = memory_retrieval.dedupe_memories(
+        [
+            *([exact] if exact is not None else []),
+            *conflict_candidates,
+            *vector_memories,
+            *recent_candidates,
+        ]
+    )
+    ranked = memory_retrieval.rank_editor_context(
+        combined,
+        candidate.content,
+        embed=(lambda _text: query_vector or []),
+    )
+    return memory_retrieval.dedupe_memories(
+        [
+            *([exact] if exact is not None else []),
+            *canonical_matches,
+            *vector_memories,
+            *ranked,
+        ]
+    )[:MEMORY_EDITOR_CONTEXT_LIMIT]
+
+
+def judge_memory_candidate_with_logging(
+    db: Session,
+    provider,
+    user_id: str,
+    candidate: MemoryOperation,
+    related_memories: list[UserMemory],
+    user_message: str,
+    assistant_message: str,
+    conversation_id: str | None,
+) -> MemoryOperation | None:
+    if not hasattr(provider, "review_memory_conflict_candidates"):
+        return None
+    retry_reason = ""
+    for attempt in range(2):
+        try:
+            review = call_memory_judge(
+                provider,
+                candidate,
+                related_memories,
+                user_message,
+                assistant_message,
+                retry_reason=retry_reason,
+            )
+        except Exception:
+            retry_reason = "The previous judge call failed. Return one valid structured decision."
+            continue
+
+        create_llm_call_log(
+            db,
+            review.completion,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            agent_name="memory_judge" if attempt == 0 else "memory_judge_retry",
+            autocommit=False,
+        )
+        decision = select_memory_judge_decision(review.operations, candidate, related_memories)
+        if decision is not None:
+            return decision
+        retry_reason = (
+            "The previous decision was missing or violated the relation and target-id contract. "
+            "Return one valid structured decision using only supplied memory IDs."
+        )
+    return None
+
+
+def call_memory_judge(
+    provider,
+    candidate: MemoryOperation,
+    related_memories: list[UserMemory],
+    user_message: str,
+    assistant_message: str,
+    retry_reason: str = "",
+):
+    method = provider.review_memory_conflict_candidates
+    parameters = inspect.signature(method).parameters
+    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    kwargs = {
+        "operation": memory_operation_to_context_dict(candidate),
+        "conflict_memories": [
+            memory_to_context_dict(memory, section="related")
+            for memory in related_memories
+        ],
+    }
+    optional_payload = {
+        "user_message": user_message,
+        "assistant_message": assistant_message,
+        "retry_reason": retry_reason,
+    }
+    for name, value in optional_payload.items():
+        if accepts_kwargs or name in parameters:
+            kwargs[name] = value
+    return method(**kwargs)
+
+
+def select_memory_judge_decision(
+    operations: list[MemoryOperation],
+    candidate: MemoryOperation,
+    related_memories: list[UserMemory],
+) -> MemoryOperation | None:
+    allowed_actions = {"create", "update", "supersede", "pending", "ignore"}
+    candidate_ids = {memory.id for memory in related_memories}
+    candidate_content = memory_policy.normalize_memory_content(candidate.content)
+    matching = [
+        operation
+        for operation in operations[:MAX_MEMORY_OPERATIONS]
+        if memory_policy.normalize_memory_content(operation.content) == candidate_content
+    ]
+    ordered = [*matching, *(operation for operation in operations[:MAX_MEMORY_OPERATIONS] if operation not in matching)]
+    for operation in ordered:
+        if operation.action not in allowed_actions:
+            continue
+        if operation.relation in {"equivalent", "refinement", "replacement"} and not operation.target_memory_id:
+            continue
+        if operation.relation in {"independent", "discard"} and operation.target_memory_id:
+            continue
+        if operation.action != "ignore" and operation.sensitivity != "low":
+            continue
+        if operation.target_memory_id and operation.target_memory_id not in candidate_ids:
+            continue
+        if operation.action in {"update", "supersede"} and operation.target_memory_id not in candidate_ids:
+            continue
+        if operation.action == "create":
+            operation = replace(operation, target_memory_id=None)
+        if operation.target_memory_id:
+            target_revision = next(
+                (
+                    memory.revision
+                    for memory in related_memories
+                    if memory.id == operation.target_memory_id
+                ),
+                None,
+            )
+            operation = replace(operation, expected_revision=target_revision)
+        return operation
+    return None
 
 
 def process_memory_operation(
@@ -342,69 +614,6 @@ def sync_memory_vectors_by_ids(db: Session, memory_ids: set[str]) -> None:
         memory_vector_index.try_sync_memory_vector(memory)
 
 
-def build_memory_conflict_reviewer(
-    db: Session,
-    provider,
-    user_id: str,
-    conversation_id: str | None,
-    batch_state: dict | None = None,
-) -> memory_editor.ConflictReviewer | None:
-    if not hasattr(provider, "review_memory_conflict_candidates"):
-        return None
-
-    def review(operation: MemoryOperation, conflict_candidates: list[UserMemory]) -> MemoryOperation | None:
-        try:
-            conflict_review = provider.review_memory_conflict_candidates(
-                operation=memory_operation_to_context_dict(operation),
-                conflict_memories=[
-                    memory_to_context_dict(memory, section="conflict")
-                    for memory in conflict_candidates[:MEMORY_EDITOR_CONTEXT_LIMIT]
-                ],
-            )
-            create_llm_call_log(
-                db,
-                conflict_review.completion,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                agent_name="memory_conflict_editor",
-                autocommit=False,
-            )
-            if batch_state is not None:
-                batch_state["needs_commit"] = True
-            decision = first_safe_conflict_decision(conflict_review.operations, conflict_candidates)
-            if decision is None or not decision.target_memory_id:
-                return decision
-            target_revision = next(
-                (
-                    memory.revision
-                    for memory in conflict_candidates
-                    if memory.id == decision.target_memory_id
-                ),
-                None,
-            )
-            return replace(decision, expected_revision=target_revision)
-        except Exception:
-            return None
-
-    return review
-
-
-def first_safe_conflict_decision(
-    operations: list[MemoryOperation],
-    conflict_candidates: list[UserMemory],
-) -> MemoryOperation | None:
-    candidate_ids = {memory.id for memory in conflict_candidates}
-    for operation in operations[:MAX_MEMORY_OPERATIONS]:
-        if operation.action not in {"update", "supersede", "pending", "ignore"}:
-            continue
-        if operation.sensitivity != "low" and operation.action != "ignore":
-            continue
-        if operation.action in {"update", "supersede"} and operation.target_memory_id not in candidate_ids:
-            continue
-        return operation
-    return None
-
-
 def memory_operation_to_context_dict(operation: MemoryOperation) -> dict:
     return {
         "action": operation.action,
@@ -418,6 +627,7 @@ def memory_operation_to_context_dict(operation: MemoryOperation) -> dict:
         "evidence": operation.evidence,
         "reason": operation.reason,
         "expected_revision": operation.expected_revision,
+        "relation": operation.relation,
     }
 
 
@@ -639,12 +849,10 @@ def retrieve_relevant_memories(
     elif active_count:
         try:
             query_vector = embed_memory_text(query).vector
-            threshold = memory_policy.retrieval_similarity_threshold()
             vector_hits = memory_vector_index.search_active_memories(
                 user_id,
                 query_vector,
                 limit=max(limit, FULL_MEMORY_RECALL_LIMIT),
-                score_threshold=threshold,
             )
             if vector_hits:
                 hit_memories = memory_repository.list_active_memories_by_ids(
@@ -658,7 +866,6 @@ def retrieve_relevant_memories(
                     query,
                     limit,
                     vector_hits,
-                    threshold=threshold,
                     active_count=active_count,
                 )
                 semantic_result = memory_retrieval.retrieve_relevant_memories_with_metadata(
@@ -742,7 +949,7 @@ def merge_memory_recall_results(
         requested_limit=semantic_result.requested_limit,
         recall_limit=recall_limit,
         active_count=max(vector_result.active_count, semantic_result.active_count),
-        threshold=semantic_result.threshold or vector_result.threshold,
+        threshold=None,
         embedding_error=semantic_result.embedding_error or vector_result.embedding_error,
     )
 
@@ -802,6 +1009,7 @@ def build_memory_context_for_question(
     conversation_id: str | None = None,
     preloaded_short_memory: list[dict] | None = None,
     preloaded_long_memories: list[dict] | None = None,
+    preloaded_memory_batches: list[list[str]] | None = None,
     preloaded_profile_memories: list[dict] | None = None,
     conversation_summary: str | None = None,
 ) -> str:
@@ -839,6 +1047,12 @@ def build_memory_context_for_question(
         if is_full_memory_recall_query(query)
         else get_settings().memory_context_max_long_memories
     )
+    if preloaded_memory_batches:
+        long_memories = memory_contexts.select_memories_by_batches(
+            long_memories,
+            preloaded_memory_batches,
+            max_long_memories,
+        )
     settings = get_settings()
     sources = memory_contexts.build_memory_compression_sources(
         long_memories,
@@ -934,18 +1148,8 @@ def update_conversation_summary(
     provider = get_llm_provider()
     summary = conversation.summary or ""
     for delta in batches:
-        text = build_conversation_summary_prompt_from_delta(summary, delta)
         if hasattr(provider, "summarize_with_metadata"):
-            summary_max_tokens = get_settings().conversation_summary_max_tokens
-            summary_target_tokens = max(
-                1,
-                int(summary_max_tokens * get_settings().context_compression_target_ratio),
-            )
-            completion = call_summary_with_target(
-                provider,
-                text,
-                summary_target_tokens,
-            )
+            completion = call_conversation_summary_update(provider, summary, delta)
             create_llm_call_log(
                 db,
                 completion,
@@ -956,6 +1160,7 @@ def update_conversation_summary(
             )
             summary = completion.content.strip()
         else:
+            text = build_conversation_summary_prompt_from_delta(summary, delta)
             summary = provider.summarize(text).strip()
         if not summary:
             raise RuntimeError("Conversation summary provider returned an empty summary")
@@ -964,16 +1169,7 @@ def update_conversation_summary(
                 actual_tokens = count_tokens(summary)
                 if actual_tokens <= get_settings().conversation_summary_max_tokens:
                     break
-                retry_target = max(
-                    1,
-                    int(
-                        summary_target_tokens
-                        * get_settings().conversation_summary_max_tokens
-                        / actual_tokens
-                        * 0.9
-                    ),
-                )
-                completion = call_summary_with_target(provider, summary, retry_target)
+                completion = call_conversation_summary_compaction(provider, summary)
                 create_llm_call_log(
                     db,
                     completion,
@@ -1025,13 +1221,20 @@ def commit_conversation_summary(
     return current.summary or ""
 
 
-def call_summary_with_target(provider, text: str, target_tokens: int):
-    method = provider.summarize_with_metadata
-    parameters = inspect.signature(method).parameters
-    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    if "target_tokens" in parameters or accepts_kwargs:
-        return method(text, target_tokens=target_tokens)
-    return method(text)
+def call_conversation_summary_update(provider, existing_summary: str, new_messages: str):
+    method = getattr(provider, "update_conversation_summary_with_metadata", None)
+    if callable(method):
+        return method(existing_summary, new_messages)
+    return provider.summarize_with_metadata(
+        build_conversation_summary_prompt_from_delta(existing_summary, new_messages)
+    )
+
+
+def call_conversation_summary_compaction(provider, summary: str):
+    method = getattr(provider, "compact_conversation_summary_with_metadata", None)
+    if callable(method):
+        return method(summary)
+    return provider.summarize_with_metadata(build_conversation_summary_compaction_prompt(summary))
 
 
 def trim_conversation_summary_tokens(summary: str, max_tokens: int) -> str:
@@ -1041,28 +1244,103 @@ def trim_conversation_summary_tokens(summary: str, max_tokens: int) -> str:
     if count_tokens(text) <= max_tokens:
         return text
 
-    sentences = [part.strip() for part in re.split(r"(?<=[。！？.!?])\s+|\n+", text) if part.strip()]
-    selected: list[str] = []
-    for sentence in sentences:
-        candidate = " ".join([*selected, sentence])
-        if count_tokens(candidate) > max_tokens:
-            break
-        selected.append(sentence)
-    if selected:
-        return " ".join(selected)
+    sections = parse_conversation_summary_sections(text)
+    if sections:
+        selected = {section: [] for section in CONVERSATION_SUMMARY_SECTION_ORDER}
+        section_units = {
+            section: split_conversation_summary_units("\n".join(sections.get(section, [])))
+            for section in CONVERSATION_SUMMARY_SECTION_ORDER
+        }
 
-    encoding = tokenizer_for_model(get_settings().llm_model)
-    token_ids = encoding.encode(text)
-    return encoding.decode(token_ids[:max_tokens]).rstrip()
+        # Preserve one complete item from every section before spending budget on extra detail.
+        for section in CONVERSATION_SUMMARY_SECTION_PRIORITY:
+            if section_units[section]:
+                try_add_conversation_summary_unit(selected, section, section_units[section][0], max_tokens)
+
+        for section in CONVERSATION_SUMMARY_SECTION_PRIORITY:
+            for unit in section_units[section][1:]:
+                try_add_conversation_summary_unit(selected, section, unit, max_tokens)
+
+        rendered = render_conversation_summary_sections(selected)
+        if rendered:
+            return rendered
+
+    units = split_conversation_summary_units(text)
+    selected_units: list[str] = []
+    for unit in units:
+        candidate = " ".join([*selected_units, unit])
+        if count_tokens(candidate) > max_tokens:
+            if selected_units:
+                break
+            continue
+        selected_units.append(unit)
+    if selected_units:
+        return " ".join(selected_units)
+    return "None" if count_tokens("None") <= max_tokens else ""
+
+
+def parse_conversation_summary_sections(summary: str) -> dict[str, list[str]]:
+    sections = {section: [] for section in CONVERSATION_SUMMARY_SECTION_ORDER}
+    current_section: str | None = None
+    found_known_section = False
+    for line in summary.splitlines():
+        heading = re.match(r"^##\s+(.+?)\s*$", line.strip())
+        if heading:
+            normalized = re.sub(r"\s+", " ", heading.group(1)).strip().upper()
+            current_section = normalized if normalized in sections else None
+            found_known_section = found_known_section or current_section is not None
+            continue
+        if current_section is not None and line.strip():
+            sections[current_section].append(line.strip())
+    return sections if found_known_section else {}
+
+
+def split_conversation_summary_units(text: str) -> list[str]:
+    units: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.casefold() == "none":
+            continue
+        if re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)", stripped):
+            units.append(stripped)
+            continue
+        units.extend(
+            part.strip()
+            for part in re.split(r"(?<=[。！？])\s*|(?<=[.!?])\s+", stripped)
+            if part.strip()
+        )
+    return units
+
+
+def try_add_conversation_summary_unit(
+    selected: dict[str, list[str]],
+    section: str,
+    unit: str,
+    max_tokens: int,
+) -> bool:
+    selected[section].append(unit)
+    if count_tokens(render_conversation_summary_sections(selected)) <= max_tokens:
+        return True
+    selected[section].pop()
+    return False
+
+
+def render_conversation_summary_sections(sections: dict[str, list[str]]) -> str:
+    rendered: list[str] = []
+    for section in CONVERSATION_SUMMARY_SECTION_ORDER:
+        units = sections.get(section) or []
+        if units:
+            rendered.append(f"## {section}\n" + "\n".join(units))
+    return "\n\n".join(rendered)
 
 
 def should_update_conversation_summary(db: Session, conversation_id: str) -> bool:
     """Return True when unprocessed messages should trigger a summary update.
 
     Triggers when any of these conditions are met:
-      1. Unprocessed message tokens >= conversation_summary_trigger_tokens (2000)
-      2. Unprocessed message tokens >= conversation_summary_min_tokens (500) and count >= 8
-      3. Unprocessed message count >= conversation_summary_max_unprocessed (30)
+      1. Unprocessed tokens reach conversation_summary_trigger_tokens.
+      2. Unprocessed tokens and message count both reach their minimum thresholds.
+      3. Unprocessed message count reaches conversation_summary_max_unprocessed.
     """
     conversation = db.get(Conversation, conversation_id)
     if conversation is None:
@@ -1189,6 +1467,15 @@ def build_conversation_summary_prompt(
 
 def build_conversation_summary_prompt_from_delta(previous_summary: str, delta: str) -> str:
     return f"Existing summary:\n{previous_summary or 'None'}\n\nNew messages since previous summary:\n{delta}"
+
+
+def build_conversation_summary_compaction_prompt(summary: str) -> str:
+    return (
+        "Rewrite this working-state summary more compactly. Preserve active user constraints, the current goal, "
+        "corrections, open questions, blockers, the next step, completed work, and important artifacts. Remove "
+        "repetition, background explanation, obsolete details, and abandoned alternatives. Keep every retained item "
+        f"complete.\n\nSummary to compact:\n{summary}"
+    )
 
 
 def build_conversation_summary_delta_batches(
@@ -1348,7 +1635,12 @@ def get_user_memory_recall_metrics(db: Session, user_id: str) -> dict:
 
 
 def reconcile_user_memories(db: Session, user_id: str, apply: bool = False, llm_review: bool = False) -> dict:
-    report = memory_reconcile.reconcile_user_memories(db, user_id, apply=apply)
+    report = memory_reconcile.reconcile_user_memories(
+        db,
+        user_id,
+        apply=apply,
+        include_semantic_candidates=llm_review,
+    )
     findings = [reconcile_finding_to_dict(finding) for finding in report.findings]
     llm_findings = review_reconcile_findings_with_llm(db, user_id, report.findings, apply=apply) if llm_review else []
     findings.extend(llm_findings)
@@ -1384,7 +1676,7 @@ def review_reconcile_findings_with_llm(
     reviewable = [
         finding
         for finding in findings
-        if finding.finding_type == "possible_semantic_duplicate"
+        if finding.finding_type == "semantic_relation_candidate"
     ]
     if not reviewable:
         return []
@@ -2362,14 +2654,6 @@ def find_conflicting_memory(memories: list[UserMemory], normalized: str, categor
     return memory_editor.find_conflicting_memory(memories, normalized, category)
 
 
-def find_similar_memory(memories: list[UserMemory], embedding: list[float], normalized: str = "") -> UserMemory | None:
-    return memory_editor.find_similar_memory(memories, embedding, normalized)
-
-
-def find_same_direction_preference(memories: list[UserMemory], normalized: str) -> UserMemory | None:
-    return memory_editor.find_same_direction_preference(memories, normalized)
-
-
 def embed_memory_text(text: str) -> MemoryEmbedding:
     return memory_embedding.embed_memory_text(text)
 
@@ -2424,10 +2708,6 @@ def create_memory_row(
     )
 
 
-def merge_memory_content(existing: str, incoming: str) -> str:
-    return memory_editor.merge_memory_content(existing, incoming)
-
-
 def find_exact_memory(
     db: Session,
     user_id: str,
@@ -2443,10 +2723,6 @@ def touch_exact_memory(db: Session, memory: UserMemory, activate_pending: bool =
 
 def resolve_memory_category(candidate: MemoryCandidate) -> str:
     return memory_policy.resolve_memory_category(candidate)
-
-
-def retrieval_similarity_threshold() -> float:
-    return memory_policy.retrieval_similarity_threshold()
 
 
 def dedupe_memories(memories: list[UserMemory]) -> list[UserMemory]:

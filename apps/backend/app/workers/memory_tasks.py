@@ -14,7 +14,7 @@ from app.db.models.agent_run import AgentRun
 from app.db.models.conversation import Conversation
 from app.db.models.conversation import Message
 from app.db.models.retrieval_log import RetrievalLog
-from app.db.models.user_memory import UserMemoryUpdateJob
+from app.db.models.user_memory import UserMemory, UserMemoryUpdateJob
 from app.db.session import SessionLocal, init_db
 from app.services.memory_service import (
     process_user_memory,
@@ -28,6 +28,7 @@ from app.services.agent_service import apply_deferred_memory_update, attach_agen
 from app.services.conversation_service import acquire_conversation_run_lease, release_conversation_run_lease
 from app.memory import commands as memory_commands
 from app.memory import jobs as memory_jobs
+from app.memory import reconcile as memory_reconcile
 from app.memory.types import MemoryAction
 from app.services.retrieval_log_service import attach_retrieval_log_to_message
 from app.workers.celery_app import (
@@ -585,6 +586,34 @@ def recover_deferred_agent_memory_updates() -> dict:
         "status": "completed",
         "recovered_count": len(recovered_ids),
         "agent_run_ids": recovered_ids,
+    }
+
+
+@celery_app.task(
+    name="reconcile_memory_vector_indexes",
+    autoretry_for=(Exception,),
+    retry_backoff=get_settings().celery_task_retry_backoff_seconds,
+    retry_backoff_max=RETRY_BACKOFF_MAX_SECONDS,
+    retry_jitter=True,
+    **RELIABLE_TASK_OPTIONS,
+)
+def reconcile_memory_vector_indexes() -> dict:
+    if not get_settings().memory_vector_index_enabled:
+        return {"status": "disabled", "user_count": 0, "finding_count": 0, "applied_count": 0}
+
+    init_db()
+    with SessionLocal() as db:
+        user_ids = list(db.scalars(select(UserMemory.user_id).distinct()).all())
+        findings = [
+            finding
+            for user_id in user_ids
+            for finding in memory_reconcile.reconcile_vector_index(db, user_id, apply=True)
+        ]
+    return {
+        "status": "completed",
+        "user_count": len(user_ids),
+        "finding_count": len(findings),
+        "applied_count": sum(1 for finding in findings if finding.applied),
     }
 
 

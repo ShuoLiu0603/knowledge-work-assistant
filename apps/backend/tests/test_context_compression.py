@@ -100,6 +100,38 @@ class ContextCompressionTests(unittest.TestCase):
         self.assertEqual(len(result.completions), 2)
         self.assertIn("Short retained fact.", result.content or "")
 
+    def test_memory_compression_can_omit_recent_conversation_section(self) -> None:
+        provider = FakeCompressionProvider(
+            [
+                MemoryContextCompressionOutput(
+                    items=[
+                        CompressedMemoryItemOutput(
+                            content="User prefers Chinese answers.",
+                            source_ids=["profile-1"],
+                            section="profile",
+                        )
+                    ]
+                )
+            ]
+        )
+
+        with patch("app.llm.context_compression.get_settings", return_value=compression_settings()):
+            result = compress_memory_context(
+                "How should you answer?",
+                [
+                    {
+                        "id": "profile-1",
+                        "section": "profile",
+                        "content": "User prefers Chinese answers.",
+                        "protected": True,
+                    }
+                ],
+                max_tokens=200,
+                provider=provider,
+            )
+
+        self.assertNotIn("Recent conversation:", result.content or "")
+
     def test_rag_compression_accepts_only_verbatim_quotes(self) -> None:
         chunk = make_chunk("The policy applies only to full-time employees.")
         valid_provider = FakeCompressionProvider(

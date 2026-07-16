@@ -1,6 +1,6 @@
 # RAG 评估说明
 
-本项目的评估目标不是替代人工验收，而是给 RAG 检索和引用质量一个可重复的弱信号。评估脚本会登录后端、逐条调用 `/api/knowledge-bases/{kb_id}/ask`，再根据返回答案和引用计算指标。
+本页描述 `scripts/run_eval.py` 的本地在线演示评估：脚本登录后端、逐条调用 `/api/knowledge-bases/{kb_id}/ask`，再根据答案和引用计算弱信号。它用于验证上传、权限、检索、生成和引用主链路，不应当作公开数据集榜单成绩。BEIR/SciFact、Agent trajectory、RGB-derived 和 LongMemEval-S 的数据范围、判分方式与结果见 [项目量化结果](resume_metrics.md)。
 
 ## 前置条件
 
@@ -76,12 +76,12 @@ python scripts/run_eval.py --token <access_token> --kb-id <knowledge_base_id>
 
 | 指标 | 含义 |
 |---|---|
-| `recall_at_k` | 前 K 个引用中是否命中任一预期来源 |
+| `recall_at_k` | 每题前 K 个引用是否命中任一预期来源，再对题目取平均；这是演示脚本的二值 source-hit 口径，不是多相关文档 qrels 下的标准 Recall@K |
 | `mrr` | 第一个正确引用的倒数排名，越高越好 |
-| `citation_hit_rate` | 每条样本是否至少有一个预期来源引用 |
+| `citation_hit_rate` | 每条样本是否至少有一个预期来源引用；在当前数据格式下与 `recall_at_k` 数值相同 |
 | `answer_keyword_hit_rate` | 答案是否包含预期关键词，只作为弱信号 |
 
-这些指标只验证“检索和引用是否大致命中”。答案是否完整、是否可直接交付，仍需结合真实业务问题、权限边界和失败场景执行人工验收。
+这些指标只验证“检索和引用是否大致命中”。答案是否完整、是否可直接交付，仍需结合真实业务问题、权限边界和失败场景执行人工验收。`expected_keywords` 使用字符包含匹配，不是 LLM-as-Judge；公开检索基准则使用 qrels 与确定性排序指标。
 
 ## 失败排查
 

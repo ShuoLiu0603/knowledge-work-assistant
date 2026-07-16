@@ -44,6 +44,41 @@ class ConversationSummaryTrimmingTests(unittest.TestCase):
         self.assertEqual(trimmed, "First complete fact. Second complete fact.")
         self.assertLessEqual(memory_service.count_tokens(trimmed), 9)
 
+    def test_structured_summary_trimming_preserves_semantic_priority(self) -> None:
+        core_summary = (
+            "## CURRENT GOAL\n"
+            "- Ship the production memory flow.\n\n"
+            "## ACTIVE CONSTRAINTS AND DECISIONS\n"
+            "- Do not modify the Agent or RAG flow.\n\n"
+            "## OPEN QUESTIONS OR BLOCKERS\n"
+            "- The overflow behavior still needs verification.\n\n"
+            "## NEXT STEP\n"
+            "- Run the focused summary tests."
+        )
+        summary = (
+            "## CURRENT GOAL\n"
+            "- Ship the production memory flow.\n\n"
+            "## ACTIVE CONSTRAINTS AND DECISIONS\n"
+            "- Do not modify the Agent or RAG flow.\n\n"
+            "## ESTABLISHED FACTS AND COMPLETED WORK\n"
+            f"- {'Low-priority historical detail. ' * 40}\n\n"
+            "## IMPORTANT ARTIFACTS\n"
+            "- An optional background document.\n\n"
+            "## OPEN QUESTIONS OR BLOCKERS\n"
+            "- The overflow behavior still needs verification.\n\n"
+            "## NEXT STEP\n"
+            "- Run the focused summary tests."
+        )
+
+        trimmed = memory_service.trim_conversation_summary_tokens(
+            summary,
+            memory_service.count_tokens(core_summary),
+        )
+
+        self.assertEqual(trimmed, core_summary)
+        self.assertNotIn("Low-priority historical detail", trimmed)
+        self.assertNotIn("optional background document", trimmed)
+
 
 def find_memory_id(existing_memories: list[dict], marker: str) -> str | None:
     marker = marker.lower()
@@ -53,7 +88,21 @@ def find_memory_id(existing_memories: list[dict], marker: str) -> str | None:
     return None
 
 
-class FakeLlmProvider:
+class SecondPassReviewMixin:
+    def review_memory_conflict_candidates(
+        self,
+        operation: dict,
+        conflict_memories: list[dict],
+        user_message: str = "",
+        assistant_message: str = "",
+    ):
+        self.judge_call_count = getattr(self, "judge_call_count", 0) + 1
+        self.seen_conflict_operation = operation
+        self.seen_conflict_memories = conflict_memories
+        return self.review_memory_operations(user_message, assistant_message, conflict_memories)
+
+
+class FakeLlmProvider(SecondPassReviewMixin):
     def review_memory_operations(self, user_message: str, assistant_message: str, existing_memories: list[dict]):
         from app.llm.provider import MemoryOperation, MemoryReview
 
@@ -105,7 +154,31 @@ class DeltaSummaryProvider:
         return fake_completion(text.split("New messages since previous summary:\n", 1)[-1])
 
 
-class StructuredFakeLlmProvider:
+class RetryingConversationSummaryProvider:
+    def __init__(self) -> None:
+        self.update_calls = 0
+        self.compaction_calls = 0
+
+    def summarize_with_metadata(self, _text: str):
+        raise AssertionError("generic summarization must not handle conversation summaries")
+
+    def update_conversation_summary_with_metadata(self, existing_summary: str, new_messages: str):
+        self.update_calls += 1
+        return fake_completion(
+            "## CURRENT GOAL\n- Continue the production summary work.\n\n"
+            "## ESTABLISHED FACTS AND COMPLETED WORK\n"
+            f"- {'Verbose background detail. ' * 80}"
+        )
+
+    def compact_conversation_summary_with_metadata(self, summary: str):
+        self.compaction_calls += 1
+        return fake_completion(
+            "## CURRENT GOAL\n- Continue the production summary work.\n\n"
+            "## NEXT STEP\n- Run focused verification."
+        )
+
+
+class StructuredFakeLlmProvider(SecondPassReviewMixin):
     def review_memory_operations(self, user_message: str, assistant_message: str, existing_memories: list[dict]):
         from app.llm.provider import MemoryOperation, MemoryReview
 
@@ -165,7 +238,7 @@ class PromotingFakeLlmProvider(StructuredFakeLlmProvider):
         )
 
 
-class ReviewFakeLlmProvider:
+class ReviewFakeLlmProvider(SecondPassReviewMixin):
     def __init__(self, operations):
         self.operations = operations
         self.seen_existing_memories = None
@@ -294,11 +367,34 @@ class ConflictReviewFakeLlmProvider:
 
         return MemoryReview(operations=self.primary_operations, completion=fake_completion())
 
-    def review_memory_conflict_candidates(self, operation: dict, conflict_memories: list[dict]):
+    def review_memory_conflict_candidates(
+        self,
+        operation: dict,
+        conflict_memories: list[dict],
+        user_message: str = "",
+        assistant_message: str = "",
+    ):
         from app.llm.provider import MemoryOperation, MemoryReview
 
         self.seen_conflict_operation = operation
         self.seen_conflict_memories = conflict_memories
+        if "fastapi" not in str(operation.get("content") or "").lower():
+            return MemoryReview(
+                operations=[
+                    MemoryOperation(
+                        action="create",
+                        content=str(operation.get("content") or ""),
+                        kind=str(operation.get("kind") or "preference"),
+                        category=str(operation.get("category") or "general"),
+                        canonical_key=str(operation.get("canonical_key") or ""),
+                        importance=str(operation.get("importance") or "low"),
+                        sensitivity=str(operation.get("sensitivity") or "low"),
+                        evidence=str(operation.get("evidence") or ""),
+                        reason="second-pass judge approved a new memory",
+                    )
+                ],
+                completion=fake_completion(),
+            )
         target_id = str(conflict_memories[0]["id"]) if conflict_memories else None
         return MemoryReview(
             operations=[
@@ -319,12 +415,30 @@ class ConflictReviewFakeLlmProvider:
 
 
 class FailingConflictReviewFakeLlmProvider(ConflictReviewFakeLlmProvider):
-    def review_memory_conflict_candidates(self, operation: dict, conflict_memories: list[dict]):
+    def review_memory_conflict_candidates(self, operation: dict, conflict_memories: list[dict], **_kwargs):
         raise RuntimeError("conflict reviewer unavailable")
 
 
 class NoMemoryReviewProvider:
     pass
+
+
+class ExtractorOnlyProvider:
+    def review_memory_operations(self, user_message: str, assistant_message: str, existing_memories: list[dict]):
+        from app.llm.provider import MemoryOperation, MemoryReview
+
+        return MemoryReview(
+            operations=[
+                MemoryOperation(
+                    action="create",
+                    content="user prefers concise answers",
+                    category="response_detail",
+                    sensitivity="low",
+                    evidence="I prefer concise answers",
+                )
+            ],
+            completion=fake_completion(),
+        )
 
 
 class MemoryServiceTests(unittest.TestCase):
@@ -398,6 +512,260 @@ class MemoryServiceTests(unittest.TestCase):
 
             self.assertEqual(action.action, "ignore")
             self.assertEqual(action.reason, "memory review is not supported by the configured provider")
+
+    def test_memory_candidate_cannot_bypass_missing_second_pass_judge(self) -> None:
+        with (
+            isolated_session() as session,
+            patch.object(memory_service, "get_llm_provider", return_value=ExtractorOnlyProvider()),
+            patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+        ):
+            user = create_user(session, "memory-no-judge@example.com", "Memory No Judge")
+
+            action = memory_service.process_user_memory(session, user.id, "I prefer concise answers")[0]
+            rows = session.scalars(select(UserMemory).where(UserMemory.user_id == user.id)).all()
+
+            self.assertEqual(action.action, "ignore")
+            self.assertIn("mandatory memory judge", action.reason)
+            self.assertEqual(rows, [])
+
+    def test_additive_hobby_preference_is_created_beside_existing_hobby(self) -> None:
+        from app.llm.provider import MemoryOperation, MemoryReview
+
+        class AdditivePreferenceProvider:
+            def __init__(self) -> None:
+                self.related_memories: list[dict] = []
+
+            def review_memory_operations(self, user_message: str, assistant_message: str, **_kwargs):
+                return MemoryReview(
+                    operations=[
+                        MemoryOperation(
+                            action="create",
+                            content="用户喜欢踢足球",
+                            kind="preference",
+                            category="general",
+                            sensitivity="low",
+                            evidence="其实我也喜欢踢足球",
+                        )
+                    ],
+                    completion=fake_completion(),
+                )
+
+            def review_memory_conflict_candidates(self, operation: dict, conflict_memories: list[dict], **_kwargs):
+                self.related_memories = conflict_memories
+                return MemoryReview(
+                    operations=[
+                        MemoryOperation(
+                            action="create",
+                            relation="independent",
+                            content=str(operation["content"]),
+                            kind=str(operation["kind"]),
+                            category=str(operation["category"]),
+                            sensitivity="low",
+                            evidence=str(operation["evidence"]),
+                        )
+                    ],
+                    completion=fake_completion(),
+                )
+
+        class SportsEmbeddingProvider(FakeEmbeddingProvider):
+            def embed_text(self, text: str) -> list[float]:
+                if "篮球" in text:
+                    return [1.0, 0.0]
+                if "足球" in text:
+                    return [0.0, 1.0]
+                return super().embed_text(text)
+
+        provider = AdditivePreferenceProvider()
+        with (
+            isolated_session() as session,
+            patch.object(memory_service, "get_llm_provider", return_value=provider),
+            patch("app.memory.embedding.get_embedding_provider", return_value=SportsEmbeddingProvider()),
+        ):
+            user = create_user(session, "memory-additive-hobbies@example.com", "Memory Additive Hobbies")
+            basketball = memory_service.create_manual_memory(session, user.id, "用户喜欢打篮球")
+
+            action = memory_service.process_user_memory(session, user.id, "其实我也喜欢踢足球")[0]
+            active = session.scalars(
+                select(UserMemory).where(UserMemory.user_id == user.id, UserMemory.status == "active")
+            ).all()
+
+            self.assertEqual(action.action, "create")
+            self.assertIn(basketball.id, {memory["id"] for memory in provider.related_memories})
+            self.assertEqual({memory.content for memory in active}, {"用户喜欢打篮球", "用户喜欢踢足球"})
+
+    def test_replacement_relation_supersedes_profile_singleton_after_invalid_judge_retry(self) -> None:
+        from app.llm.provider import MemoryOperation, MemoryReview
+
+        class NameCorrectionProvider:
+            def __init__(self) -> None:
+                self.judge_calls = 0
+                self.retry_reasons: list[str] = []
+
+            def review_memory_operations(self, user_message: str, assistant_message: str, **_kwargs):
+                return MemoryReview(
+                    operations=[
+                        MemoryOperation(
+                            action="create",
+                            content="用户的名字是刘石页",
+                            kind="profile",
+                            category="name",
+                            canonical_key="profile:name",
+                            sensitivity="low",
+                            evidence="我不叫刘硕 我叫刘石页",
+                        )
+                    ],
+                    completion=fake_completion(),
+                )
+
+            def review_memory_conflict_candidates(
+                self,
+                operation: dict,
+                conflict_memories: list[dict],
+                retry_reason: str = "",
+                **_kwargs,
+            ):
+                self.judge_calls += 1
+                self.retry_reasons.append(retry_reason)
+                if self.judge_calls == 1:
+                    return MemoryReview(operations=[], completion=fake_completion())
+                target = next(memory for memory in conflict_memories if memory["canonical_key"] == "profile:name")
+                return MemoryReview(
+                    operations=[
+                        MemoryOperation(
+                            action="supersede",
+                            relation="replacement",
+                            target_memory_id=target["id"],
+                            content="用户的名字是刘石页",
+                            kind="profile",
+                            category="name",
+                            canonical_key="profile:name",
+                            sensitivity="low",
+                            evidence="我不叫刘硕 我叫刘石页",
+                        )
+                    ],
+                    completion=fake_completion(),
+                )
+
+        provider = NameCorrectionProvider()
+        with (
+            isolated_session() as session,
+            patch.object(memory_service, "get_llm_provider", return_value=provider),
+            patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+        ):
+            user = create_user(session, "memory-name-replacement@example.com", "Memory Name Replacement")
+            old = memory_service.create_manual_memory(
+                session,
+                user.id,
+                "用户的名字是刘硕",
+                category="name",
+                kind="profile",
+                canonical_key="profile:name",
+            )
+
+            action = memory_service.process_user_memory(session, user.id, "我不叫刘硕 我叫刘石页")[0]
+            session.refresh(old)
+            new = session.get(UserMemory, action.memory_id)
+
+            self.assertEqual(provider.judge_calls, 2)
+            self.assertEqual(provider.retry_reasons[0], "")
+            self.assertIn("violated the relation and target-id contract", provider.retry_reasons[1])
+            self.assertEqual(action.action, "supersede")
+            self.assertEqual(old.status, "superseded")
+            self.assertEqual(old.superseded_by_id, new.id)
+            self.assertEqual(new.content, "用户的名字是刘石页")
+            self.assertEqual(new.status, "active")
+
+    def test_relational_changes_preserve_target_injection_policy(self) -> None:
+        from app.llm.provider import MemoryOperation
+
+        with (
+            isolated_session() as session,
+            patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+        ):
+            user = create_user(session, "memory-layer-inheritance@example.com", "Memory Layer Inheritance")
+            profile = memory_service.create_manual_memory(
+                session,
+                user.id,
+                "Persistent identity value alpha",
+                category="name",
+                kind="profile",
+            )
+            semantic = memory_service.create_manual_memory(
+                session,
+                user.id,
+                "User follows a recurring activity",
+                category="general",
+                kind="preference",
+            )
+
+            replacement_content = "Persistent identity value beta"
+            replacement_action = memory_service.process_memory_operation(
+                session,
+                user.id,
+                MemoryOperation(
+                    action="supersede",
+                    relation="replacement",
+                    target_memory_id=profile.id,
+                    content=replacement_content,
+                    kind="preference",
+                    category="general",
+                    sensitivity="low",
+                    evidence=replacement_content,
+                ),
+                memory_service.MemorySource(text=replacement_content),
+                user_message=replacement_content,
+            )
+            replacement = session.get(UserMemory, replacement_action.memory_id)
+
+            refinement_content = "User follows a recurring activity on weekends"
+            refinement_action = memory_service.process_memory_operation(
+                session,
+                user.id,
+                MemoryOperation(
+                    action="update",
+                    relation="refinement",
+                    target_memory_id=semantic.id,
+                    content=refinement_content,
+                    kind="profile",
+                    category="name",
+                    canonical_key="profile:name",
+                    sensitivity="low",
+                    evidence=refinement_content,
+                ),
+                memory_service.MemorySource(text=refinement_content),
+                user_message=refinement_content,
+            )
+            session.refresh(semantic)
+
+            self.assertEqual(replacement_action.action, "supersede")
+            self.assertEqual(replacement.category, "name")
+            self.assertEqual(replacement.kind, "profile")
+            self.assertEqual(replacement.memory_layer, "profile")
+            self.assertEqual(replacement.profile_slot, "name")
+            self.assertEqual(replacement.canonical_key, "profile:name")
+            self.assertTrue(replacement.pinned)
+
+            self.assertEqual(refinement_action.action, "update")
+            self.assertEqual(semantic.category, "general")
+            self.assertEqual(semantic.kind, "preference")
+            self.assertEqual(semantic.memory_layer, "semantic")
+            self.assertEqual(semantic.profile_slot, "")
+            self.assertEqual(semantic.canonical_key, "")
+            self.assertFalse(semantic.pinned)
+
+            profile_ids = {item["id"] for item in memory_service.list_core_profile_context(session, user.id)}
+            self.assertIn(replacement.id, profile_ids)
+            self.assertNotIn(semantic.id, profile_ids)
+
+            with patch("app.memory.vector_index.search_active_memories", return_value=[]):
+                recalled = memory_service.retrieve_relevant_memories(
+                    session,
+                    user.id,
+                    refinement_content,
+                    include_profile=False,
+                )
+            self.assertIn(semantic.id, {memory.id for memory in recalled})
+            self.assertNotIn(replacement.id, {memory.id for memory in recalled})
 
     def test_memory_recall_query_returns_saved_memories_without_embedding(self) -> None:
         provider = TrackingEmbeddingProvider()
@@ -1051,7 +1419,8 @@ class MemoryServiceTests(unittest.TestCase):
                 expires_at=datetime.now(timezone.utc) - timedelta(days=1),
             )
 
-            report = memory_service.reconcile_user_memories(session, user.id, apply=True)
+            with patch.object(memory_service, "review_reconcile_findings_with_llm", return_value=[]):
+                report = memory_service.reconcile_user_memories(session, user.id, apply=True, llm_review=True)
             session.refresh(first)
             session.refresh(duplicate)
             session.refresh(expired)
@@ -1098,12 +1467,13 @@ class MemoryServiceTests(unittest.TestCase):
                 memory_service.embed_memory_text("user works on project beta"),
             )
 
-            report = memory_service.reconcile_user_memories(session, user.id, apply=True)
+            with patch.object(memory_service, "review_reconcile_findings_with_llm", return_value=[]):
+                report = memory_service.reconcile_user_memories(session, user.id, apply=True, llm_review=True)
             session.refresh(first)
             session.refresh(second)
 
             self.assertTrue(
-                any(finding["finding_type"] == "possible_semantic_duplicate" for finding in report["findings"])
+                any(finding["finding_type"] == "semantic_relation_candidate" for finding in report["findings"])
             )
             self.assertEqual(first.status, "active")
             self.assertEqual(second.status, "active")
@@ -1272,7 +1642,7 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertEqual(provider.seen_conflict_operation["canonical_key"], "project:backend_framework")
             self.assertIn(old.id, {memory["id"] for memory in provider.seen_conflict_memories})
 
-    def test_conflict_review_failure_falls_back_to_pending(self) -> None:
+    def test_mandatory_memory_judge_failure_is_fail_closed(self) -> None:
         from app.llm.provider import MemoryOperation
 
         provider = FailingConflictReviewFakeLlmProvider(
@@ -1305,13 +1675,10 @@ class MemoryServiceTests(unittest.TestCase):
 
             action = memory_service.process_user_memory(session, user.id, "I use FastAPI backend")[0]
             session.refresh(old)
-            pending = session.get(UserMemory, action.memory_id)
 
-            self.assertEqual(action.action, "pending")
+            self.assertEqual(action.action, "ignore")
+            self.assertIsNone(action.memory_id)
             self.assertEqual(old.status, "active")
-            self.assertIsNotNone(pending)
-            self.assertEqual(pending.status, "pending")
-            self.assertEqual(pending.canonical_key, "project:backend_framework")
 
     def test_llm_reconcile_review_creates_pending_without_changing_active_memories(self) -> None:
         from app.llm.provider import MemoryOperation
@@ -1449,7 +1816,7 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertIsNotNone(recall_log)
             self.assertEqual(recall_log.recall_mode, "semantic")
             self.assertEqual(recall_log.selected_memory_ids, [memory.id])
-            self.assertEqual(recall_log.candidates[0]["route"], "semantic")
+            self.assertEqual(recall_log.candidates[0]["route"], "semantic_ranked")
             self.assertEqual(recall_log.candidates[0]["memory_layer"], "semantic")
             self.assertEqual(recall_log.candidates[0]["scope_id"], user.id)
             self.assertIsNotNone(recall_log.candidates[0]["score"])
@@ -1507,7 +1874,7 @@ class MemoryServiceTests(unittest.TestCase):
                 recalled = memory_service.retrieve_relevant_memories(session, user.id, "agentic RAG architecture")
 
             self.assertEqual([item.id for item in recalled], [memory.id])
-            self.assertIsNotNone(search.call_args.kwargs["score_threshold"])
+            self.assertNotIn("score_threshold", search.call_args.kwargs)
             recall_log = session.scalar(
                 select(UserMemoryRecallLog)
                 .where(UserMemoryRecallLog.user_id == user.id, UserMemoryRecallLog.query == "agentic RAG architecture")
@@ -1516,11 +1883,11 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertIsNotNone(recall_log)
             self.assertEqual(recall_log.recall_mode, "hybrid")
             self.assertEqual(recall_log.selected_memory_ids, [memory.id])
-            self.assertEqual(recall_log.candidates[0]["route"], "vector")
+            self.assertEqual(recall_log.candidates[0]["route"], "vector_ranked")
             self.assertEqual(recall_log.candidates[0]["score"], 0.91)
-            self.assertIsNotNone(recall_log.threshold)
+            self.assertIsNone(recall_log.threshold)
 
-    def test_vector_memory_recall_filters_low_score_hits(self) -> None:
+    def test_vector_memory_recall_keeps_low_score_hits_for_llm_review(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=ConflictEmbeddingProvider()),
@@ -1534,7 +1901,7 @@ class MemoryServiceTests(unittest.TestCase):
             ):
                 recalled = memory_service.retrieve_relevant_memories(session, user.id, "fastapi vacation policy")
 
-            self.assertEqual(recalled, [])
+            self.assertEqual([item.id for item in recalled], [memory.id])
             recall_log = session.scalar(
                 select(UserMemoryRecallLog)
                 .where(UserMemoryRecallLog.user_id == user.id, UserMemoryRecallLog.query == "fastapi vacation policy")
@@ -1542,8 +1909,9 @@ class MemoryServiceTests(unittest.TestCase):
             )
             self.assertIsNotNone(recall_log)
             self.assertEqual(recall_log.recall_mode, "hybrid")
-            self.assertEqual(recall_log.selected_memory_ids, [])
-            self.assertEqual(recall_log.candidates[0]["route"], "below_threshold")
+            self.assertEqual(recall_log.selected_memory_ids, [memory.id])
+            self.assertEqual(recall_log.candidates[0]["route"], "vector_ranked")
+            self.assertIsNone(recall_log.threshold)
 
     def test_vector_memory_recall_failure_falls_back_to_semantic(self) -> None:
         with (
@@ -2649,7 +3017,7 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertEqual(old.status, "superseded")
             self.assertEqual(old.superseded_by_id, target.id)
 
-    def test_memory_candidate_merge_supersedes_active_canonical_conflict(self) -> None:
+    def test_manual_candidate_does_not_semantically_merge_with_another_memory(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=ConflictEmbeddingProvider()),
@@ -2695,12 +3063,14 @@ class MemoryServiceTests(unittest.TestCase):
             session.refresh(old)
             session.refresh(similar)
 
-            self.assertEqual(action.action, "merge")
-            self.assertEqual(action.memory_id, similar.id)
+            replacement = session.get(UserMemory, action.memory_id)
+            self.assertEqual(action.action, "supersede")
+            self.assertNotEqual(action.memory_id, similar.id)
+            self.assertEqual(replacement.content, "user uses FastAPI backend")
             self.assertEqual(similar.status, "active")
-            self.assertEqual(similar.canonical_key, "project:backend_framework")
+            self.assertEqual(similar.canonical_key, "project:fastapi_services")
             self.assertEqual(old.status, "superseded")
-            self.assertEqual(old.superseded_by_id, similar.id)
+            self.assertEqual(old.superseded_by_id, replacement.id)
 
     def test_memory_editor_can_create_active_memory(self) -> None:
         from app.llm.provider import MemoryOperation
@@ -2741,6 +3111,60 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertIsNotNone(memory.valid_at)
             self.assertEqual(memory.extra_metadata["decision"], "auto_create")
             self.assertEqual(provider.seen_assistant_message, "Got it.")
+            self.assertEqual(provider.judge_call_count, 1)
+
+    def test_memory_judge_uses_qdrant_hit_outside_recent_editor_window(self) -> None:
+        from app.llm.provider import MemoryOperation
+
+        provider = ConflictReviewFakeLlmProvider(
+            [
+                MemoryOperation(
+                    action="create",
+                    content="user uses FastAPI backend",
+                    kind="project",
+                    category="general",
+                    sensitivity="low",
+                    evidence="I use FastAPI backend",
+                )
+            ]
+        )
+        with (
+            isolated_session() as session,
+            patch.object(memory_service, "get_llm_provider", return_value=provider),
+            patch("app.memory.embedding.get_embedding_provider", return_value=ConflictEmbeddingProvider()),
+            patch("app.memory.vector_index.try_sync_memory_vector", return_value=True),
+        ):
+            user = create_user(session, "memory-judge-qdrant@example.com", "Memory Judge Qdrant")
+            old = memory_service.create_manual_memory(
+                session,
+                user.id,
+                "user uses Django backend",
+                category="project",
+                kind="project",
+            )
+            for index in range(memory_service.MEMORY_EDITOR_CANDIDATE_LIMIT + 1):
+                content = f"unrelated recent general memory {index}"
+                normalized = memory_service.normalize_memory_content(content)
+                memory_service.create_memory_row(
+                    session,
+                    user.id,
+                    content,
+                    normalized,
+                    memory_service.hash_content(normalized),
+                    "general",
+                    memory_service.MemorySource(text="manual"),
+                    memory_service.embed_memory_text(content),
+                )
+
+            with patch(
+                "app.memory.vector_index.search_active_memories",
+                return_value=[MemoryVectorHit(memory_id=old.id, score=0.91, payload={})],
+            ) as search:
+                action = memory_service.process_user_memory(session, user.id, "I use FastAPI backend")[0]
+
+            self.assertEqual(action.action, "supersede")
+            self.assertTrue(search.called)
+            self.assertIn(old.id, {memory["id"] for memory in provider.seen_conflict_memories})
 
     def test_memory_editor_rolls_back_all_operations_when_later_operation_fails(self) -> None:
         from app.llm.provider import MemoryOperation
@@ -2881,7 +3305,7 @@ class MemoryServiceTests(unittest.TestCase):
             conflict_log = session.scalar(
                 select(LlmCallLog).where(
                     LlmCallLog.user_id == user.id,
-                    LlmCallLog.agent_name == "memory_conflict_editor",
+                    LlmCallLog.agent_name == "memory_judge",
                 )
             )
 
@@ -3061,7 +3485,7 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertEqual(pending.status, "pending")
             self.assertEqual(pending.canonical_key, "profile:response_detail")
 
-    def test_memory_editor_receives_active_and_pending_user_memories(self) -> None:
+    def test_memory_candidate_extractor_does_not_receive_existing_memories(self) -> None:
         from app.llm.provider import MemoryOperation
 
         provider = ReviewFakeLlmProvider([MemoryOperation(action="ignore", reason="nothing durable")])
@@ -3079,10 +3503,9 @@ class MemoryServiceTests(unittest.TestCase):
 
             memory_service.process_user_memory(session, user.id, "Thanks")
 
-            seen_ids = {memory["id"] for memory in provider.seen_existing_memories}
-            self.assertEqual(seen_ids, {first.id, second.id})
+            self.assertEqual(provider.seen_existing_memories, [])
 
-    def test_memory_editor_receives_grouped_memory_context_when_supported(self) -> None:
+    def test_memory_candidate_extractor_receives_empty_grouped_context(self) -> None:
         from app.llm.provider import MemoryOperation
 
         provider = GroupedReviewFakeLlmProvider([MemoryOperation(action="ignore", reason="nothing durable")])
@@ -3099,15 +3522,10 @@ class MemoryServiceTests(unittest.TestCase):
 
             memory_service.process_user_memory(session, user.id, "Thanks")
 
-            profile_ids = {memory["id"] for memory in provider.seen_profile_memories}
-            candidate_ids = {memory["id"] for memory in provider.seen_candidate_memories}
-            pending_ids = {memory["id"] for memory in provider.seen_pending_memories}
-            existing_ids = {memory["id"] for memory in provider.seen_existing_memories}
-
-            self.assertIn(profile.id, profile_ids)
-            self.assertIn(candidate.id, candidate_ids)
-            self.assertIn(pending.id, pending_ids)
-            self.assertEqual(existing_ids, {profile.id, candidate.id, pending.id})
+            self.assertEqual(provider.seen_profile_memories, [])
+            self.assertEqual(provider.seen_candidate_memories, [])
+            self.assertEqual(provider.seen_pending_memories, [])
+            self.assertEqual(provider.seen_existing_memories, [])
 
     def test_memory_editor_context_keeps_old_profile_memories_outside_recent_window(self) -> None:
         with (
@@ -3142,11 +3560,52 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertIn(profile.id, profile_ids)
             self.assertIn(profile.id, existing_ids)
 
+    def test_conversation_summary_waits_for_sixteen_messages_at_the_normal_token_floor(self) -> None:
+        summary_settings = SimpleNamespace(
+            conversation_summary_trigger_tokens=10000,
+            conversation_summary_min_tokens=1,
+            conversation_summary_min_messages=16,
+            conversation_summary_max_unprocessed=30,
+        )
+        with (
+            isolated_session() as session,
+            patch.object(memory_service, "get_settings", return_value=summary_settings),
+        ):
+            user = create_user(session, "summary-threshold@example.com", "Summary Threshold")
+            conversation = Conversation(user_id=user.id, title="Summary threshold", search_scope="public")
+            session.add(conversation)
+            session.commit()
+            session.refresh(conversation)
+
+            started_at = datetime(2026, 7, 10, tzinfo=timezone.utc)
+            for index in range(15):
+                session.add(
+                    Message(
+                        conversation_id=conversation.id,
+                        role="user" if index % 2 == 0 else "assistant",
+                        content=f"short {index}",
+                        created_at=started_at + timedelta(seconds=index),
+                    )
+                )
+            session.commit()
+            self.assertFalse(memory_service.should_update_conversation_summary(session, conversation.id))
+
+            session.add(
+                Message(
+                    conversation_id=conversation.id,
+                    role="assistant",
+                    content="short 15",
+                    created_at=started_at + timedelta(seconds=15),
+                )
+            )
+            session.commit()
+            self.assertTrue(memory_service.should_update_conversation_summary(session, conversation.id))
+
     def test_conversation_summary_uses_incremental_message_cursor(self) -> None:
         summary_settings = SimpleNamespace(
             conversation_summary_trigger_tokens=12,
             conversation_summary_min_tokens=1,
-            conversation_summary_min_messages=8,
+            conversation_summary_min_messages=16,
             conversation_summary_max_unprocessed=30,
             conversation_summary_max_tokens=1200,
             context_compression_target_ratio=0.9,
@@ -3225,6 +3684,44 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertIn("message 10", updated)
             self.assertIn("message 13", updated)
             self.assertEqual(conversation.summary_message_count, 14)
+
+    def test_conversation_summary_overflow_uses_dedicated_semantic_compaction(self) -> None:
+        provider = RetryingConversationSummaryProvider()
+        summary_settings = SimpleNamespace(
+            conversation_summary_max_tokens=80,
+            context_compression_retry_limit=1,
+        )
+        with (
+            isolated_session() as session,
+            patch.object(memory_service, "get_llm_provider", return_value=provider),
+            patch.object(memory_service, "get_settings", return_value=summary_settings),
+        ):
+            user = create_user(session, "summary-retry@example.com", "Summary Retry")
+            conversation = Conversation(user_id=user.id, title="Summary retry", search_scope="public")
+            session.add(conversation)
+            session.commit()
+            session.refresh(conversation)
+            session.add_all(
+                [
+                    Message(conversation_id=conversation.id, role="user", content="Continue the work."),
+                    Message(conversation_id=conversation.id, role="assistant", content="Understood."),
+                ]
+            )
+            session.commit()
+
+            summary = memory_service.update_conversation_summary(
+                session,
+                conversation,
+                user_message="unused user",
+                assistant_message="unused assistant",
+                user_id=user.id,
+            )
+
+        self.assertEqual(provider.update_calls, 1)
+        self.assertEqual(provider.compaction_calls, 1)
+        self.assertIn("Continue the production summary work", summary)
+        self.assertIn("Run focused verification", summary)
+        self.assertNotIn("Verbose background detail", summary)
 
 
 if __name__ == "__main__":

@@ -35,8 +35,8 @@ class AgentRunState:
     short_term_memory: list[dict] = field(default_factory=list)
     profile_memories: list[dict] = field(default_factory=list)
     long_term_memories: list[dict] = field(default_factory=list)
+    memory_batches: list[list[str]] = field(default_factory=list)
     conversation_summary: str | None = None
-    core_memory_context: str = ""
     memory_context: str = ""
     memory_actions: list[dict] = field(default_factory=list)
     defer_memory_update: bool = False

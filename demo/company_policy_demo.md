@@ -22,6 +22,6 @@
 
 ## Agent 编排约定
 
-Supervisor Agent 负责判断问题意图。普通制度问题进入 RAG Agent，总结类问题进入 Summary Agent，写作草稿类问题进入 Writing Agent。
+系统使用一个受预算约束的 Agent 循环，不设置独立 Supervisor、RAG Agent、Summary Agent 或 Writing Agent。当前上下文足够时模型直接回答；缺少用户长期信息时可调用 `memory(query)`，缺少企业文档证据时可调用 `rag(query)`，并可在预算内使用不同 query 再次检索。
 
-Memory Agent 只处理用户长期偏好和当前会话上下文，不负责新增检索算法，也不替代知识库权限校验。
+`memory(query)` 只搜索当前用户的普通长期记忆，不能作为企业制度证据；`rag(query)` 只搜索后端已经完成权限校验的知识库范围。企业制度结论必须来自 RAG 证据并保留引用，达到调用预算后应基于已有证据回答或明确说明依据不足。

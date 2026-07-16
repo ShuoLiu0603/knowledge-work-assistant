@@ -15,7 +15,6 @@ from app.memory.jobs import (
 from app.services.memory_service import (
     build_memory_context_for_question,
     filter_memory_history_messages,
-    format_memory_context,
     get_conversation_memory_context_messages,
     get_recent_db_messages,
     get_short_term_memory,
@@ -39,8 +38,8 @@ def load_core_memory_context(db: Session, state: AgentRunState) -> AgentRunState
         state.short_term_memory = []
         state.profile_memories = []
         state.long_term_memories = []
-        state.memory_context = format_memory_context([], [], None, profile_memories=[])
-        state.core_memory_context = state.memory_context
+        state.memory_batches = []
+        state.memory_context = ""
         add_trace(
             state,
             node="memory_agent",
@@ -73,17 +72,17 @@ def load_core_memory_context(db: Session, state: AgentRunState) -> AgentRunState
 
     state.profile_memories = list_core_profile_context(db, state.user_id, limit=PROFILE_MEMORY_LIMIT)
     state.long_term_memories = []
+    state.memory_batches = []
     state.memory_context = build_memory_context_for_question(
         db,
         state.user_id,
         state.input,
         conversation_id=state.conversation_id,
-        preloaded_short_memory=state.short_term_memory,
+        preloaded_short_memory=[],
         preloaded_long_memories=state.long_term_memories,
         preloaded_profile_memories=state.profile_memories,
         conversation_summary=state.conversation_summary,
     )
-    state.core_memory_context = state.memory_context
     add_trace(
         state,
         node="memory_agent",
@@ -115,19 +114,24 @@ def recall_long_term_memory(db: Session, state: AgentRunState, query: str) -> li
     )
     recalled = [memory_to_dict(memory) for memory in memories]
     existing_ids = {memory.get("id") for memory in state.long_term_memories}
+    new_memory_ids: list[str] = []
     for memory in recalled:
         if memory.get("id") in existing_ids:
             continue
         state.long_term_memories.append(memory)
         existing_ids.add(memory.get("id"))
+        if memory.get("id") is not None:
+            new_memory_ids.append(str(memory["id"]))
+    state.memory_batches.append(new_memory_ids)
     state.memory_recalled = True
     state.memory_context = build_memory_context_for_question(
         db,
         state.user_id,
         state.input,
         conversation_id=state.conversation_id,
-        preloaded_short_memory=state.short_term_memory,
+        preloaded_short_memory=[],
         preloaded_long_memories=state.long_term_memories,
+        preloaded_memory_batches=state.memory_batches,
         preloaded_profile_memories=state.profile_memories,
         conversation_summary=state.conversation_summary,
     )

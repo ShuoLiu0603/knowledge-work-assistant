@@ -11,7 +11,7 @@
 5. 文本清洗后进入 chunk splitter。
 6. chunk 写入 `document_chunks`。
 7. Embedding Provider 生成向量。
-8. Qdrant upsert 向量点，payload 包含 `knowledge_base_id`、`document_id`、`chunk_id`、`file_name`、metadata。
+8. Qdrant upsert 向量点，payload 包含 `knowledge_base_id`、`document_id`、`chunk_id`、`file_name`、`security_level` 和 metadata。
 
 ## 2. 检索阶段
 
@@ -33,7 +33,9 @@
 
 ## 4. 评估指标
 
-- `Recall@K`：前 K 个引用中是否命中预期来源。适合衡量“有没有找回来”。
+以下四项是 `scripts/run_eval.py` 对本地演示集采用的轻量指标，不等同于 BEIR/SciFact 的标准信息检索指标：
+
+- `Recall@K`：当前演示脚本按“前 K 个引用是否命中至少一个预期来源”聚合。适合检查主链路是否找回来源，不是多相关文档场景下的标准 recall 定义。
 - `MRR`：第一个正确引用越靠前，分数越高。适合衡量排序质量。
 - `citation_hit_rate`：回答是否给出了命中预期来源的引用。适合衡量引用可信度。
 - `answer_keyword_hit_rate`：答案是否包含预期关键词。只能作为弱信号，不能替代人工判断。

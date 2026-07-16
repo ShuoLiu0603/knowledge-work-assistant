@@ -39,6 +39,7 @@ MEMORY_CATEGORIES = {
 }
 IMPORTANCE_LEVELS = {"low", "medium", "high"}
 SENSITIVITY_LEVELS = {"low", "medium", "high"}
+MEMORY_RELATIONS = {"independent", "equivalent", "refinement", "replacement", "uncertain", "discard"}
 
 
 class MemoryClassificationOutput(BaseModel):
@@ -106,6 +107,67 @@ class MemoryOperationsOutput(BaseModel):
         if isinstance(value, dict):
             return [value]
         return value[:5] if isinstance(value, list) else []
+
+
+class MemoryCandidateOutput(BaseModel):
+    content: str = Field(default="", max_length=2000)
+    kind: str = "preference"
+    category: str = Field(default="general", max_length=80)
+    canonical_key: str = Field(default="", max_length=160)
+    importance: str = "low"
+    sensitivity: str = "high"
+    evidence: str = Field(min_length=1, max_length=1000)
+    reason: str = Field(default="", max_length=1000)
+
+    @field_validator("content", "category", "canonical_key", "evidence", "reason", mode="before")
+    @classmethod
+    def clean_text(cls, value: object) -> str:
+        return normalize_whitespace(str(value or ""))
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def normalize_kind(cls, value: object) -> str:
+        if str(value or "").strip().lower() == "project":
+            return "profile"
+        return normalize_allowed(value, MEMORY_KINDS, "preference")
+
+    @field_validator("importance", mode="before")
+    @classmethod
+    def normalize_importance(cls, value: object) -> str:
+        return normalize_allowed(value, IMPORTANCE_LEVELS, "low")
+
+    @field_validator("sensitivity", mode="before")
+    @classmethod
+    def normalize_sensitivity(cls, value: object) -> str:
+        return normalize_allowed(value, SENSITIVITY_LEVELS, "high")
+
+
+class MemoryCandidatesOutput(BaseModel):
+    candidates: list[MemoryCandidateOutput] = Field(default_factory=list)
+
+    @field_validator("candidates", mode="before")
+    @classmethod
+    def limit_candidates(cls, value: object) -> list:
+        if isinstance(value, dict):
+            return [value]
+        return value[:5] if isinstance(value, list) else []
+
+
+class MemoryJudgeDecisionOutput(BaseModel):
+    relation: str = "discard"
+    target_memory_id: str | None = None
+    content: str = Field(default="", max_length=2000)
+    reason: str = Field(default="", max_length=1000)
+
+    @field_validator("relation", mode="before")
+    @classmethod
+    def normalize_relation(cls, value: object) -> str:
+        return normalize_allowed(value, MEMORY_RELATIONS, "discard")
+
+    @field_validator("content", "target_memory_id", "reason", mode="before")
+    @classmethod
+    def clean_text(cls, value: object) -> str:
+        return normalize_whitespace(str(value or ""))
 
 
 class CompressedMemoryItemOutput(BaseModel):

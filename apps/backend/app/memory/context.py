@@ -48,27 +48,25 @@ def format_memory_context(
     if profile_memories is None:
         profile_memories, long_memories = split_profile_memories(long_memories)
 
-    headers = (
-        "Stable preferences and profile:\n"
-        "\n\nRelevant long-term memories:\n"
-        "\n\nConversation summary:\n"
-        "\n\nRecent conversation:\n"
-    )
-    available = max(0, budget.limit - budget.count(headers))
     recent_values = [
         f"{item.get('role')}: {item.get('content')}"
         for item in short_memory
         if item.get("content")
     ]
+    include_recent = bool(recent_values)
+    headers = format_memory_sections("", "", "", "" if include_recent else None)
+    available = max(0, budget.limit - budget.count(headers))
+    has_content = {
+        "profile": bool(profile_memories),
+        "long": bool(long_memories),
+        "summary": bool(conversation_summary),
+    }
+    if include_recent:
+        has_content["recent"] = bool(recent_values)
     section_budgets = allocate_section_budgets(
         budget,
         available,
-        {
-            "profile": bool(profile_memories),
-            "long": bool(long_memories),
-            "summary": bool(conversation_summary),
-            "recent": bool(recent_values),
-        },
+        has_content,
     )
 
     profiles = budgeted_memory_lines(
@@ -82,19 +80,28 @@ def format_memory_context(
         budget=budget,
     )
     summary = budget.truncate(conversation_summary or EMPTY_VALUE, section_budgets["summary"])
-    recent = budgeted_recent_lines(
-        recent_values,
-        limit=section_budgets["recent"],
-        budget=budget,
+    recent = (
+        budgeted_recent_lines(
+            recent_values,
+            limit=section_budgets["recent"],
+            budget=budget,
+        )
+        if include_recent
+        else None
     )
-
-    context = (
-        f"Stable preferences and profile:\n{profiles}\n\n"
-        f"Relevant long-term memories:\n{memories}\n\n"
-        f"Conversation summary:\n{summary}\n\n"
-        f"Recent conversation:\n{recent}"
-    )
+    context = format_memory_sections(profiles, memories, summary, recent)
     return budget.truncate(context, budget.limit)
+
+
+def format_memory_sections(profile: str, long_term: str, summary: str, recent: str | None) -> str:
+    sections = [
+        f"Stable preferences and profile:\n{profile}",
+        f"Relevant long-term memories:\n{long_term}",
+        f"Conversation summary:\n{summary}",
+    ]
+    if recent is not None:
+        sections.append(f"Recent conversation:\n{recent}")
+    return "\n\n".join(sections)
 
 
 def allocate_section_budgets(budget: "TextBudget", available: int, has_content: dict[str, bool]) -> dict[str, int]:
@@ -105,6 +112,7 @@ def allocate_section_budgets(budget: "TextBudget", available: int, has_content: 
         "summary": settings.memory_context_summary_weight,
         "recent": settings.memory_context_recent_weight,
     }
+    weights = {name: weight for name, weight in weights.items() if name in has_content}
     available = max(0, available)
     empty_budget = budget.count(f"- {EMPTY_VALUE}")
     minimums = {
@@ -216,11 +224,11 @@ def render_memory_sources(sources: list[dict]) -> str:
     grouped = {"profile": [], "long_term": [], "summary": [], "recent": []}
     for source in sources:
         grouped[str(source["section"])].append(f"- {source['content']}")
-    return (
-        f"Stable preferences and profile:\n{join_lines_or_none(grouped['profile'])}\n\n"
-        f"Relevant long-term memories:\n{join_lines_or_none(grouped['long_term'])}\n\n"
-        f"Conversation summary:\n{join_lines_or_none(grouped['summary'])}\n\n"
-        f"Recent conversation:\n{join_lines_or_none(grouped['recent'])}"
+    return format_memory_sections(
+        join_lines_or_none(grouped["profile"]),
+        join_lines_or_none(grouped["long_term"]),
+        join_lines_or_none(grouped["summary"]),
+        join_lines_or_none(grouped["recent"]) if grouped["recent"] else None,
     )
 
 
@@ -284,6 +292,56 @@ def prioritize_memories(memories: list[dict]) -> list[dict]:
     indexed = list(enumerate(memories))
     indexed.sort(key=lambda item: (-memory_priority(item[1]), item[0]))
     return [memory for _, memory in indexed]
+
+
+def select_memories_by_batches(
+    memories: list[dict],
+    batches: list[list[str]],
+    limit: int,
+) -> list[dict]:
+    if limit <= 0 or not memories:
+        return []
+    if not batches:
+        return prioritize_memories(memories)[:limit]
+
+    memories_by_id = {
+        str(memory["id"]): memory
+        for memory in memories
+        if memory.get("id") is not None
+    }
+    batch_memories: list[list[dict]] = []
+    assigned_ids: set[str] = set()
+    for batch in batches:
+        current_batch = []
+        for memory_id in batch:
+            normalized_id = str(memory_id)
+            memory = memories_by_id.get(normalized_id)
+            if memory is None or normalized_id in assigned_ids:
+                continue
+            current_batch.append(memory)
+            assigned_ids.add(normalized_id)
+        batch_memories.append(current_batch)
+
+    selected: list[dict] = []
+    selected_object_ids: set[int] = set()
+    max_batch_size = max((len(batch) for batch in batch_memories), default=0)
+    for index in range(max_batch_size):
+        for batch in batch_memories:
+            if index >= len(batch):
+                continue
+            memory = batch[index]
+            selected.append(memory)
+            selected_object_ids.add(id(memory))
+            if len(selected) == limit:
+                return selected
+
+    for memory in prioritize_memories(memories):
+        if id(memory) in selected_object_ids:
+            continue
+        selected.append(memory)
+        if len(selected) == limit:
+            break
+    return selected
 
 
 def memory_priority(memory: dict) -> float:

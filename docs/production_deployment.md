@@ -85,7 +85,7 @@ Retention values use days. Setting an individual `*_RETENTION_DAYS` value to `0`
 
 - `GET /api/health` is process liveness only.
 - `GET /api/ready` verifies PostgreSQL, Redis, Qdrant, MinIO, and that a Celery worker answers ping. Use this endpoint for load-balancer and backend container readiness checks.
-- Beat is a separate required process and is not covered by backend readiness. Monitor it and confirm the logs show `recover-stale-memory-update-jobs`, `recover-deferred-agent-memory-updates`, `recover-stale-conversation-summaries`, `recover-stale-external-cleanup-jobs`, and `apply-operational-retention-daily`.
+- Beat is a separate required process and is not covered by backend readiness. Monitor it and confirm the logs show `recover-stale-memory-update-jobs`, `recover-deferred-agent-memory-updates`, `recover-stale-conversation-summaries`, `recover-stale-external-cleanup-jobs`, `apply-operational-retention-daily`, and `reconcile-memory-vector-indexes-daily`.
 
 After deployment, verify the service state and readiness:
 

@@ -383,11 +383,7 @@ def is_content_grounded_in_evidence(content: object, evidence: object) -> bool:
     evidence_terms = memory_grounding_terms(normalized_evidence)
     if not content_terms or not evidence_terms:
         return False
-    shared_terms = content_terms & evidence_terms
-    return bool(shared_terms) and (
-        len(shared_terms) / min(len(content_terms), len(evidence_terms))
-        >= get_settings().memory_grounding_overlap_threshold
-    )
+    return bool(content_terms & evidence_terms)
 
 
 def memory_grounding_terms(value: str) -> set[str]:
@@ -605,18 +601,3 @@ def get_memory_metadata(memory: Any) -> dict:
 
 def normalize_key(value: object) -> str:
     return str(value or "").strip().lower()
-
-
-def retrieval_similarity_threshold() -> float:
-    settings = get_settings()
-    return max(
-        settings.memory_recall_threshold_min,
-        min(
-            settings.memory_recall_threshold_max,
-            settings.memory_semantic_threshold * settings.memory_recall_threshold_factor,
-        ),
-    )
-
-
-def semantic_similarity_threshold() -> float:
-    return get_settings().memory_semantic_threshold

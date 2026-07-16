@@ -67,7 +67,7 @@ Authorization: Bearer <access_token>
 
 当前支持的主要演示格式包括 PDF、DOCX、TXT、MD、CSV。上传后由 worker 执行解析、切分、Embedding 和 Qdrant upsert。同一知识库内重复上传相同文件内容会返回 `409`，避免重复入库和重复向量。
 
-文档密级会写入 `documents.security_level`、`document_chunks.security_level` 和 Qdrant payload 的 `security_level`。所有知识库 chunk 共享 `QDRANT_COLLECTION`，并在公开/部门知识库检索时通过 payload filter 限制 `security_level <= current_user.security_level`。可选的长期记忆向量索引使用独立的 `MEMORY_QDRANT_COLLECTION`。
+文档密级会写入 `documents.security_level`、`document_chunks.security_level` 和 Qdrant payload 的 `security_level`。所有知识库 chunk 共享 `QDRANT_COLLECTION`，并在公开/部门知识库检索时通过 payload filter 限制 `security_level <= current_user.security_level`。默认启用、可通过配置关闭的长期记忆向量索引使用独立的 `MEMORY_QDRANT_COLLECTION`。
 私人知识库的 owner/editor 可以上传和删除文档，上传时后端统一使用默认密级；部门知识库需要 owner/editor 或管理员维护；公开知识库的文档只能由管理员维护。越权调用会返回 `403`，并写入审计日志。
 
 ## 问答与会话
@@ -92,7 +92,7 @@ Authorization: Bearer <access_token>
 }
 ```
 
-`search_scope` 支持 `single`、`department`、`accessible`。默认 `single` 只检索当前知识库；`department` 检索本部门知识库和公司公开库；`accessible` 检索当前用户全部可访问知识库。检索日志会记录 `scope_type` 和 `searched_knowledge_base_ids`。
+`search_scope` 支持 `single`、`department`、`public`、`accessible` 和兼容别名 `all`。默认 `single` 只检索当前知识库；`department` 只检索指定或当前部门的部门知识库；`public` 只检索公开知识库；`accessible`/`all` 检索当前用户全部可访问知识库。检索日志会记录 `scope_type` 和 `searched_knowledge_base_ids`。
 
 SSE 流式响应使用 `text/event-stream`，事件包含 `conversation`、`user_message`、`trace`、`token`、`retrieval_log`、`agent_run`、`citations`、`assistant_message`、`done` 和 `error`。
 如果检索不到当前用户可访问的依据，回答会说明依据不足，并给出改写问题、检查入库状态或联系管理员调整密级的建议。
@@ -125,7 +125,7 @@ Agent trace 用于展示模型步骤、`memory(query)` / `rag(query)` 工具调�
 | DELETE | `/api/memories/{memory_id}` | soft delete 长期记忆 |
 | DELETE | `/api/memories/{memory_id}/purge` | 永久清除单条记忆和对应向量索引，保留 purge 审计快照 |
 
-长期记忆服务会对用户偏好执行精确去重、相似合并和冲突覆盖，避免重复 active 记录。
+自动长期记忆采用两阶段流程：Candidate Extractor 只从当前 turn 提取候选，系统检索相关旧记忆后再由 Memory Judge 判断 `independent/equivalent/refinement/replacement/uncertain/discard`，服务层映射为 `create/ignore/update/supersede/pending/ignore`。向量相似度只做无阈值 top-K 候选排序，不触发自动语义合并。最终还会执行 evidence、敏感信息、目标归属、exact hash、revision、唯一约束和事务校验；模型建议不等于直接写库。
 
 ## 反馈、日志与指标
 

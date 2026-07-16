@@ -154,7 +154,6 @@ def search_active_memories(
     user_id: str,
     query_vector: list[float],
     limit: int,
-    score_threshold: float | None = None,
 ) -> list[MemoryVectorHit]:
     if not is_memory_vector_index_enabled():
         return []
@@ -173,7 +172,6 @@ def search_active_memories(
         limit=limit,
         with_payload=True,
         with_vectors=False,
-        score_threshold=score_threshold,
     )
     return [
         MemoryVectorHit(

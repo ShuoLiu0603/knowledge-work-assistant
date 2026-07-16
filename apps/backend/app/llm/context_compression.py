@@ -35,6 +35,7 @@ def compress_memory_context(
     completions: list[LlmCompletion] = []
     allowed_ids = {str(source["id"]) for source in sources}
     protected_ids = {str(source["id"]) for source in sources if source.get("protected")}
+    include_recent = any(str(source.get("section")) == "recent" for source in sources)
     target = compression_target(max_tokens)
     retries = get_settings().context_compression_retry_limit
 
@@ -46,7 +47,12 @@ def compress_memory_context(
                 temperature=get_settings().llm_context_compression_temperature,
             )
             completions.append(completion)
-            content = render_compressed_memory(output, allowed_ids, protected_ids)
+            content = render_compressed_memory(
+                output,
+                allowed_ids,
+                protected_ids,
+                include_recent=include_recent,
+            )
             actual = count_tokens(content)
             if actual <= max_tokens:
                 return ContextCompressionResult(
@@ -182,10 +188,14 @@ def render_compressed_memory(
     output: MemoryContextCompressionOutput,
     allowed_ids: set[str],
     protected_ids: set[str],
+    *,
+    include_recent: bool = True,
 ) -> str:
     used_ids: set[str] = set()
     grouped = {"profile": [], "long_term": [], "summary": [], "recent": []}
     for item in output.items:
+        if item.section == "recent" and not include_recent:
+            raise ValueError("Compressed memory returned an unavailable recent section")
         source_ids = [str(value) for value in item.source_ids]
         if not source_ids or any(value not in allowed_ids for value in source_ids):
             raise ValueError("Compressed memory references an unknown source id")
@@ -195,12 +205,14 @@ def render_compressed_memory(
         raise ValueError("Compressed memory omitted a protected source")
     if not any(grouped.values()):
         raise ValueError("Compressed memory is empty")
-    return (
-        f"Stable preferences and profile:\n{join_or_none(grouped['profile'])}\n\n"
-        f"Relevant long-term memories:\n{join_or_none(grouped['long_term'])}\n\n"
-        f"Conversation summary:\n{join_or_none(grouped['summary'])}\n\n"
-        f"Recent conversation:\n{join_or_none(grouped['recent'])}"
-    )
+    sections = [
+        f"Stable preferences and profile:\n{join_or_none(grouped['profile'])}",
+        f"Relevant long-term memories:\n{join_or_none(grouped['long_term'])}",
+        f"Conversation summary:\n{join_or_none(grouped['summary'])}",
+    ]
+    if include_recent:
+        sections.append(f"Recent conversation:\n{join_or_none(grouped['recent'])}")
+    return "\n\n".join(sections)
 
 
 def validate_and_build_evidence(

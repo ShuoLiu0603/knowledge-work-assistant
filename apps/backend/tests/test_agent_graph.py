@@ -9,9 +9,10 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
-from app.agents.runtime import build_agent_tools, run_agent_runtime
+from app.agents.runtime import build_agent_tools, build_system_prompt, run_agent_runtime
 from app.agents.state import AgentRunState
 from app.core.config import get_settings
+from app.llm.token_counter import count_tokens
 from app.rag.retrieval import RetrievedChunk
 
 
@@ -19,6 +20,8 @@ class ScriptedChatModel(BaseChatModel):
     responses: list[AIMessage]
     bound_tool_names: list[list[str]] = Field(default_factory=list)
     system_prompts: list[str] = Field(default_factory=list)
+    message_snapshots: list[list[tuple[str, str]]] = Field(default_factory=list)
+    logged_prompt_tokens: list[int] = Field(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -32,6 +35,7 @@ class ScriptedChatModel(BaseChatModel):
         if not self.responses:
             raise AssertionError("Scripted model received an unexpected call")
         self.system_prompts.append(str(messages[0].content))
+        self.message_snapshots.append([(message.type, str(message.content)) for message in messages])
         return ChatResult(generations=[ChatGeneration(message=self.responses.pop(0))])
 
 
@@ -91,9 +95,14 @@ class AgentRuntimeTests(unittest.TestCase):
         model = ScriptedChatModel(responses=list(responses))
         settings = get_settings().model_copy(update=settings_updates or {})
         logs = iter(SimpleNamespace(id=f"llm-log-{index}") for index in range(1, 20))
+
+        def record_log(_db, completion, *args, **kwargs):
+            model.logged_prompt_tokens.append(completion.prompt_tokens)
+            return next(logs)
+
         with (
             patch("app.agents.runtime.create_chat_model", return_value=model),
-            patch("app.agents.runtime.create_llm_call_log", side_effect=lambda *args, **kwargs: next(logs)),
+            patch("app.agents.runtime.create_llm_call_log", side_effect=record_log),
             patch("app.agents.runtime.recall_long_term_memory", return_value=memories or []) as recall,
             patch("app.agents.runtime.retrieve_rag_evidence", side_effect=rag_results or []) as retrieve,
             patch("app.agents.runtime.get_settings", return_value=settings),
@@ -112,6 +121,54 @@ class AgentRuntimeTests(unittest.TestCase):
         recall.assert_not_called()
         retrieve.assert_not_called()
         self.assertEqual(model.bound_tool_names[0], ["memory", "rag"])
+        self.assertEqual(
+            model.logged_prompt_tokens[0],
+            count_tokens(f"{model.system_prompts[0]}\n你好"),
+        )
+
+    def test_system_prompt_does_not_claim_deferred_memory_write_succeeded(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id=None, input="其实我也喜欢踢足球")
+
+        prompt = build_system_prompt(state)
+
+        self.assertIn("Long-term memory persistence runs after the answer and may fail", prompt)
+        self.assertIn("Do not claim that a new user fact has already been saved or updated", prompt)
+
+    def test_system_prompt_requires_evidence_sufficiency_and_bounded_retries(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="查询制度")
+
+        model, _recall, _retrieve = self.run_script(state, [final_answer("直接回答。")])
+
+        prompt = model.system_prompts[0]
+        self.assertIn("If every factual component required for the answer is already supported", prompt)
+        self.assertIn("Do not call a tool merely to increase confidence", prompt)
+        self.assertIn("If that retry also makes no progress, stop using that tool", prompt)
+
+    def test_recent_conversation_is_passed_as_typed_messages(self) -> None:
+        state = AgentRunState(
+            user_id="user",
+            knowledge_base_id="kb-1",
+            input="current question",
+            short_term_memory=[
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": "earlier answer"},
+            ],
+            memory_context="Conversation summary:\nsummary only",
+        )
+
+        model, _recall, _retrieve = self.run_script(state, [final_answer("current answer")])
+
+        self.assertEqual(
+            model.message_snapshots[0],
+            [
+                ("system", model.system_prompts[0]),
+                ("human", "earlier question"),
+                ("ai", "earlier answer"),
+                ("human", "current question"),
+            ],
+        )
+        self.assertNotIn("earlier question", model.system_prompts[0])
+        self.assertNotIn("earlier answer", model.system_prompts[0])
 
     def test_memory_result_can_be_followed_by_a_final_answer(self) -> None:
         state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="你记得我的项目吗？")
@@ -180,6 +237,28 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(state.tool_call_count, 2)
         self.assertEqual(state.rag_tool_call_count, 1)
         self.assertEqual(state.tool_observations[-1]["status"], "duplicate")
+
+    def test_tool_message_is_a_receipt_and_full_rag_evidence_stays_in_system_context(self) -> None:
+        state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="查询差旅制度")
+        evidence_text = "差旅申请必须提前审批。"
+
+        model, _recall, _retrieve = self.run_script(
+            state,
+            [tool_call("rag", "差旅审批制度", "rag-1"), final_answer("需要提前审批[1]。")],
+            rag_results=[evidence("retrieval-1", [chunk("chunk-1", evidence_text)])],
+        )
+
+        tool_messages = [
+            content
+            for message_type, content in model.message_snapshots[1]
+            if message_type == "tool"
+        ]
+        self.assertEqual(len(tool_messages), 1)
+        self.assertNotIn(evidence_text, tool_messages[0])
+        self.assertNotIn('"results"', tool_messages[0])
+        self.assertIn('"retrieval_log_id": "retrieval-1"', tool_messages[0])
+        self.assertIn(evidence_text, model.system_prompts[1])
+        self.assertIn(evidence_text, state.tool_observations[0]["results"][0]["content"])
 
     def test_last_model_call_has_no_tools_and_must_finish(self) -> None:
         state = AgentRunState(user_id="user", knowledge_base_id="kb-1", input="回顾信息")

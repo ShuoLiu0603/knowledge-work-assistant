@@ -63,7 +63,7 @@ def rank_editor_context(memories: list[Any], query: str, embed: EmbedFn) -> list
         if not query_embedding:
             raise ValueError("embedding provider returned an empty vector")
     except Exception:
-        lexical = [memory for memory, score in rank_lexical_memories(memories, query) if score > 0]
+        lexical = [memory for memory, _score in rank_lexical_memories(memories, query)]
         return dedupe_memories([*sticky, *lexical])
     scored = [
         (memory, cosine_similarity(query_embedding, memory.embedding or []))
@@ -71,7 +71,7 @@ def rank_editor_context(memories: list[Any], query: str, embed: EmbedFn) -> list
         if not policy.is_profile_memory(memory)
     ]
     scored.sort(key=lambda item: (item[1], item[0].last_touched_at), reverse=True)
-    semantic = [memory for memory, score in scored if score > 0]
+    semantic = [memory for memory, _score in scored]
     return dedupe_memories([*sticky, *semantic, *memories])
 
 
@@ -129,7 +129,7 @@ def retrieve_relevant_memories_with_metadata(
             raise ValueError("embedding provider returned an empty vector")
     except Exception as exc:
         lexical_scores = rank_lexical_memories(non_sticky, query)
-        lexical = [memory for memory, score in lexical_scores if score > 0]
+        lexical = [memory for memory, _score in lexical_scores]
         selected = dedupe_memories([*sticky, *lexical])[:recall_limit]
         selected_ids = {memory.id for memory in selected}
         candidates = [
@@ -139,7 +139,7 @@ def retrieve_relevant_memories_with_metadata(
         candidates.extend(
             MemoryRecallCandidate(
                 memory=memory,
-                route="lexical" if score > 0 else "lexical_no_match",
+                route="lexical_ranked",
                 score=score,
                 selected=memory.id in selected_ids,
             )
@@ -159,8 +159,7 @@ def retrieve_relevant_memories_with_metadata(
         for memory in non_sticky
     ]
     scored.sort(key=lambda item: (item[1], item[0].last_touched_at), reverse=True)
-    threshold = policy.retrieval_similarity_threshold()
-    semantic = [memory for memory, score in scored if score >= threshold]
+    semantic = [memory for memory, _score in scored]
     selected = dedupe_memories([*sticky, *semantic])[:recall_limit]
     selected_ids = {memory.id for memory in selected}
     candidates = [
@@ -170,7 +169,7 @@ def retrieve_relevant_memories_with_metadata(
     candidates.extend(
         MemoryRecallCandidate(
             memory=memory,
-            route="semantic" if score >= threshold else "below_threshold",
+            route="semantic_ranked",
             score=score,
             selected=memory.id in selected_ids,
         )
@@ -183,7 +182,7 @@ def retrieve_relevant_memories_with_metadata(
         requested_limit=limit,
         recall_limit=recall_limit,
         active_count=reported_active_count,
-        threshold=threshold,
+        threshold=None,
     )
 
 
@@ -192,11 +191,9 @@ def retrieve_relevant_memories_with_vector_hits(
     query: str,
     limit: int,
     hits: list[Any],
-    threshold: float | None = None,
     active_count: int | None = None,
 ) -> MemoryRecallResult:
     recall_limit = max(limit, policy.FULL_MEMORY_RECALL_LIMIT) if policy.is_full_memory_recall_query(query) else limit
-    threshold = policy.retrieval_similarity_threshold() if threshold is None else threshold
     reported_active_count = len(active) if active_count is None else active_count
     active_by_id = {memory.id: memory for memory in active}
     sticky = [memory for memory in active if policy.is_profile_memory(memory)]
@@ -206,7 +203,6 @@ def retrieve_relevant_memories_with_vector_hits(
         if (
             hit.memory_id in active_by_id
             and not policy.is_profile_memory(active_by_id[hit.memory_id])
-            and hit.score >= threshold
         )
     ]
     selected = dedupe_memories([*sticky, *vector_memories])[:recall_limit]
@@ -219,7 +215,7 @@ def retrieve_relevant_memories_with_vector_hits(
     candidates.extend(
         MemoryRecallCandidate(
             memory=active_by_id[hit.memory_id],
-            route="vector" if hit.score >= threshold else "below_threshold",
+            route="vector_ranked",
             score=hit.score,
             selected=hit.memory_id in selected_ids,
         )
@@ -233,7 +229,7 @@ def retrieve_relevant_memories_with_vector_hits(
         requested_limit=limit,
         recall_limit=recall_limit,
         active_count=reported_active_count,
-        threshold=threshold,
+        threshold=None,
     )
 
 
@@ -268,19 +264,6 @@ def recall_candidate_to_dict(candidate: MemoryRecallCandidate) -> dict:
         "selected": candidate.selected,
         "last_touched_at": memory.last_touched_at.isoformat() if memory.last_touched_at else None,
     }
-
-
-def find_similar_memory(memories: list[Any], embedding: list[float], threshold: float) -> Any | None:
-    best_memory = None
-    best_score = 0.0
-    for memory in memories:
-        score = cosine_similarity(embedding, memory.embedding or [])
-        if score > best_score:
-            best_memory = memory
-            best_score = score
-    if best_memory is not None and best_score >= threshold:
-        return best_memory
-    return None
 
 
 def rank_lexical_memories(memories: list[Any], query: str) -> list[tuple[Any, float]]:

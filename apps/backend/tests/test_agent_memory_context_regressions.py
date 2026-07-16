@@ -86,12 +86,13 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in state.profile_memories], ["profile"])
             self.assertEqual(state.long_term_memories, [])
             self.assertEqual(
-                captured["preloaded_short_memory"],
+                state.short_term_memory,
                 [
                     {"role": "user", "content": "older question"},
                     {"role": "assistant", "content": "older answer"},
                 ],
             )
+            self.assertEqual(captured["preloaded_short_memory"], [])
             self.assertTrue(state.trace[-1]["output"]["current_turn_removed"])
 
     def test_load_context_rejects_another_users_conversation(self) -> None:
@@ -183,8 +184,13 @@ class AgentMemoryContextRegressionTests(unittest.TestCase):
             self.assertNotIn("PRIVATE_SECRET", state.memory_context)
             self.assertNotIn("PRIVATE_REPLY", state.memory_context)
             self.assertNotIn("CURRENT_QUESTION", state.memory_context)
-            self.assertEqual(state.memory_context.count("NORMAL_QUESTION"), 1)
-            self.assertEqual(state.memory_context.count("NORMAL_ANSWER"), 1)
+            self.assertNotIn("NORMAL_QUESTION", state.memory_context)
+            self.assertNotIn("NORMAL_ANSWER", state.memory_context)
+            self.assertNotIn("Recent conversation:", state.memory_context)
+            self.assertEqual(
+                [(item["role"], item["content"]) for item in state.short_term_memory],
+                [("user", "NORMAL_QUESTION"), ("assistant", "NORMAL_ANSWER")],
+            )
 
 
 if __name__ == "__main__":

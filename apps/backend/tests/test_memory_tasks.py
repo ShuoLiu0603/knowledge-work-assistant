@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from app.db.models.conversation import Conversation, Message
-from app.db.models.user_memory import UserMemoryUpdateJob
+from app.db.models.user_memory import UserMemory, UserMemoryUpdateJob
 from app.memory.jobs import create_memory_update_job
 from app.memory.types import MemoryAction
 from app.services import memory_service
-from app.workers.memory_tasks import process_memory_update_job, reconcile_user_memory_task
+from app.workers.memory_tasks import (
+    process_memory_update_job,
+    reconcile_memory_vector_indexes,
+    reconcile_user_memory_task,
+)
 from helpers import create_user, isolated_session
 
 
@@ -245,6 +250,43 @@ class MemoryTaskTests(unittest.TestCase):
             self.assertEqual(result["user_id"], user.id)
             self.assertEqual(result["findings"], [])
             reconcile.assert_called_once_with(session, user.id, apply=False, llm_review=False)
+
+    def test_periodic_memory_vector_reconcile_repairs_all_users(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "memory-vector-reconcile@example.com", "Memory Vector Reconcile")
+            memory = UserMemory(
+                user_id=user.id,
+                content="user prefers concise answers",
+                normalized_content="user prefers concise answers",
+                content_hash="hash",
+                scope_id=user.id,
+                embedding=[1.0, 0.0],
+                embedding_model="fake",
+                embedding_dimension=2,
+            )
+            session.add(memory)
+            session.commit()
+            user_id = user.id
+
+            finding = SimpleNamespace(applied=True)
+            with (
+                patch("app.workers.memory_tasks.init_db"),
+                patch("app.workers.memory_tasks.SessionLocal", return_value=session),
+                patch(
+                    "app.workers.memory_tasks.get_settings",
+                    return_value=SimpleNamespace(memory_vector_index_enabled=True),
+                ),
+                patch(
+                    "app.workers.memory_tasks.memory_reconcile.reconcile_vector_index",
+                    return_value=[finding],
+                ) as reconcile,
+            ):
+                result = reconcile_memory_vector_indexes()
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["user_count"], 1)
+            self.assertEqual(result["applied_count"], 1)
+            reconcile.assert_called_once_with(session, user_id, apply=True)
 
 
 if __name__ == "__main__":

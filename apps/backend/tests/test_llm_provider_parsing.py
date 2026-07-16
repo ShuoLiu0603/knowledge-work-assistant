@@ -8,7 +8,9 @@ from pydantic import ValidationError
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from app.llm.provider import (
+    LlmCompletion,
     LlmMessage,
+    LlmProvider,
     OpenAICompatibleChatModel,
     OpenAICompatibleProvider,
     parse_memory_operations,
@@ -18,6 +20,98 @@ from app.schemas.memory import UserMemoryCreate, UserMemoryUpdate
 
 
 class LlmProviderParsingTests(unittest.TestCase):
+    def test_conversation_summary_prompt_is_state_oriented_without_token_instruction(self) -> None:
+        provider = CapturingProvider()
+
+        with patch(
+            "app.llm.provider.get_settings",
+            return_value=type("Settings", (), {"llm_summary_temperature": 0.1})(),
+        ):
+            provider.update_conversation_summary_with_metadata(
+                "## CURRENT GOAL\n- Build the memory flow.",
+                "user: Do not modify the Agent.\nassistant: Understood.",
+            )
+
+        system_prompt = provider.messages[0].content
+        user_payload = provider.messages[1].content
+        self.assertIn("state-transfer task", system_prompt)
+        self.assertIn("Never turn an assistant proposal into a user decision", system_prompt)
+        self.assertIn("Do not modify the Agent", user_payload)
+        self.assertNotIn("token", (system_prompt + user_payload).casefold())
+
+    def test_conversation_summary_retry_uses_semantic_priority_without_token_instruction(self) -> None:
+        provider = CapturingProvider()
+
+        with patch(
+            "app.llm.provider.get_settings",
+            return_value=type("Settings", (), {"llm_summary_temperature": 0.1})(),
+        ):
+            provider.compact_conversation_summary_with_metadata(
+                "## ACTIVE CONSTRAINTS AND DECISIONS\n- Do not modify the Agent."
+            )
+
+        prompt = "\n".join(message.content for message in provider.messages)
+        self.assertIn("Active user prohibitions, permissions, constraints, and corrections", prompt)
+        self.assertIn("Never remove information merely because it appears near the end", prompt)
+        self.assertNotIn("token", prompt.casefold())
+
+    def test_memory_prompts_use_abstract_relation_contract_without_domain_examples(self) -> None:
+        provider = CapturingProvider('{"candidates": []}')
+        settings = type("Settings", (), {"llm_memory_editor_temperature": 0.0})()
+
+        with patch("app.llm.provider.get_settings", return_value=settings):
+            provider.review_memory_operations("其实我也喜欢踢足球", "")
+            extractor_prompt = provider.messages[0].content
+
+            provider.content = (
+                '{"relation":"independent","content":"用户喜欢踢足球"}'
+            )
+            review = provider.review_memory_conflict_candidates(
+                {
+                    "action": "create",
+                    "content": "用户喜欢踢足球",
+                    "kind": "preference",
+                    "category": "general",
+                    "sensitivity": "low",
+                    "evidence": "其实我也喜欢踢足球",
+                },
+                [
+                    {
+                        "id": "basketball-memory",
+                        "content": "用户喜欢打篮球",
+                        "status": "active",
+                        "kind": "preference",
+                        "category": "general",
+                    }
+                ],
+                user_message="其实我也喜欢踢足球",
+            )
+            judge_prompt = provider.messages[0].content
+
+        self.assertIn("Stable user-authored facts, attributes, preferences", extractor_prompt)
+        self.assertNotIn("JSON Examples", extractor_prompt)
+        self.assertIn("independent", judge_prompt)
+        self.assertIn("equivalent", judge_prompt)
+        self.assertIn("refinement", judge_prompt)
+        self.assertIn("replacement", judge_prompt)
+        self.assertNotIn("basketball", judge_prompt.casefold())
+        self.assertNotIn("football", judge_prompt.casefold())
+        self.assertEqual(review.operations[0].relation, "independent")
+        self.assertEqual(review.operations[0].action, "create")
+
+    def test_memory_candidate_uses_evidence_when_normalized_content_is_omitted(self) -> None:
+        provider = CapturingProvider(
+            '{"candidates":[{"kind":"profile","category":"name","sensitivity":"low",'
+            '"evidence":"用户提供了一条持久事实"}]}'
+        )
+        settings = type("Settings", (), {"llm_memory_editor_temperature": 0.0})()
+
+        with patch("app.llm.provider.get_settings", return_value=settings):
+            review = provider.review_memory_operations("用户提供了一条持久事实", "")
+
+        self.assertEqual(review.operations[0].content, "用户提供了一条持久事实")
+        self.assertEqual(review.operations[0].evidence, "用户提供了一条持久事实")
+
     def test_parse_memory_operations_accepts_embedded_json_array(self) -> None:
         operations = parse_memory_operations(
             'Result: [{"action": "create", "content": "User prefers concise answers", '
@@ -150,6 +244,29 @@ class FakeStructuredChat:
 
     def invoke(self, _messages):
         return self.response
+
+
+class CapturingProvider(LlmProvider):
+    def __init__(self, content: str = "## CURRENT GOAL\n- Continue the task.") -> None:
+        self.messages: list[LlmMessage] = []
+        self.content = content
+
+    def complete_with_metadata(
+        self,
+        messages: list[LlmMessage],
+        temperature: float | None = None,
+    ) -> LlmCompletion:
+        self.messages = messages
+        return LlmCompletion(
+            content=self.content,
+            provider="fake",
+            model_name="fake",
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+            latency_ms=1,
+            status="success",
+        )
 
 
 if __name__ == "__main__":

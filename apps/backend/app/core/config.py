@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     qdrant_timeout_seconds: int = Field(default=10, gt=0)
     healthcheck_timeout_seconds: int = Field(default=3, gt=0)
     memory_qdrant_collection: str = "user_memories"
-    memory_vector_index_enabled: bool = False
+    memory_vector_index_enabled: bool = True
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"
@@ -93,11 +93,6 @@ class Settings(BaseSettings):
     memory_context_min_section_tokens: int = Field(default=24, ge=1)
     memory_context_min_section_chars: int = Field(default=80, ge=1)
     memory_update_mode: str = "sync"
-    memory_semantic_threshold: float = Field(default=0.82, ge=0, le=1)
-    memory_recall_threshold_factor: float = Field(default=0.35, ge=0)
-    memory_recall_threshold_min: float = Field(default=0.2, ge=0, le=1)
-    memory_recall_threshold_max: float = Field(default=0.45, ge=0, le=1)
-    memory_grounding_overlap_threshold: float = Field(default=1 / 3, ge=0, le=1)
     memory_max_operations: int = Field(default=3, ge=1)
     memory_editor_context_limit: int = Field(default=30, ge=1)
     memory_editor_candidate_limit: int = Field(default=80, ge=1)
@@ -111,7 +106,7 @@ class Settings(BaseSettings):
     memory_reconcile_max_semantic_pairs: int = Field(default=2000, ge=1)
     conversation_summary_trigger_tokens: int = Field(default=2000, ge=1)
     conversation_summary_min_tokens: int = Field(default=500, ge=1)
-    conversation_summary_min_messages: int = Field(default=8, ge=1)
+    conversation_summary_min_messages: int = Field(default=16, ge=1)
     conversation_summary_max_unprocessed: int = Field(default=30, ge=1)
     conversation_summary_max_tokens: int = Field(default=1200, ge=1)
     conversation_summary_lease_min_seconds: int = Field(default=60, ge=1)
@@ -142,7 +137,7 @@ class Settings(BaseSettings):
     embedding_batch_size: int = Field(default=10, ge=1)
     embedding_timeout_seconds: int = Field(default=30, gt=0)
     retrieval_top_k: int = Field(default=5, ge=1)
-    retrieval_route_limit: int = Field(default=8, ge=1)
+    retrieval_route_limit: int = Field(default=15, ge=1)
     retrieval_dense_prefilter_multiplier: int = Field(default=4, ge=1)
     retrieval_bm25_prefilter_terms: int = Field(default=12, ge=1)
     retrieval_max_matched_terms: int = Field(default=32, ge=1)
@@ -233,8 +228,6 @@ class Settings(BaseSettings):
             errors.append("CONVERSATION_SUMMARY_MIN_TOKENS must not exceed CONVERSATION_SUMMARY_TRIGGER_TOKENS")
         if self.conversation_summary_min_messages > self.conversation_summary_max_unprocessed:
             errors.append("CONVERSATION_SUMMARY_MIN_MESSAGES must not exceed CONVERSATION_SUMMARY_MAX_UNPROCESSED")
-        if self.memory_recall_threshold_min > self.memory_recall_threshold_max:
-            errors.append("MEMORY_RECALL_THRESHOLD_MIN must not exceed MEMORY_RECALL_THRESHOLD_MAX")
         if not any(
             weight > 0
             for weight in (

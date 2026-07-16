@@ -331,7 +331,7 @@ class MemoryContextGuardTests(unittest.TestCase):
 
 
 class MemoryRetrievalFallbackTests(unittest.TestCase):
-    def test_embedding_failure_selects_only_sticky_and_lexically_related_memory(self) -> None:
+    def test_embedding_failure_keeps_ranked_candidates_without_a_relevance_threshold(self) -> None:
         active = [
             make_memory("sticky", "user prefers Chinese answers", category="language"),
             make_memory("related", "user is building an agentic RAG architecture", touched=2),
@@ -345,13 +345,13 @@ class MemoryRetrievalFallbackTests(unittest.TestCase):
             embed=raising_embed,
         )
 
-        self.assertEqual([memory.id for memory in result.selected], ["sticky", "related"])
+        self.assertEqual([memory.id for memory in result.selected], ["sticky", "related", "unrelated"])
         self.assertEqual(result.recall_mode, "fallback_no_embedding")
         routes = {candidate.memory.id: candidate.route for candidate in result.candidates}
-        self.assertEqual(routes["related"], "lexical")
-        self.assertEqual(routes["unrelated"], "lexical_no_match")
+        self.assertEqual(routes["related"], "lexical_ranked")
+        self.assertEqual(routes["unrelated"], "lexical_ranked")
 
-    def test_editor_ranking_does_not_append_unrelated_recent_memory_on_embedding_failure(self) -> None:
+    def test_editor_ranking_keeps_bounded_candidates_on_embedding_failure(self) -> None:
         memories = [
             make_memory("related", "agentic RAG architecture", touched=1),
             make_memory("unrelated", "beach holiday", touched=2),
@@ -359,7 +359,7 @@ class MemoryRetrievalFallbackTests(unittest.TestCase):
 
         ranked = retrieval.rank_editor_context(memories, "RAG architecture", raising_embed)
 
-        self.assertEqual([memory.id for memory in ranked], ["related"])
+        self.assertEqual([memory.id for memory in ranked], ["related", "unrelated"])
 
     def test_empty_embedding_uses_the_same_lexical_fallback(self) -> None:
         active = [
@@ -374,7 +374,7 @@ class MemoryRetrievalFallbackTests(unittest.TestCase):
             embed=lambda _query: [],
         )
 
-        self.assertEqual([memory.id for memory in result.selected], ["related"])
+        self.assertEqual([memory.id for memory in result.selected], ["related", "unrelated"])
         self.assertIn("empty vector", result.embedding_error)
 
 

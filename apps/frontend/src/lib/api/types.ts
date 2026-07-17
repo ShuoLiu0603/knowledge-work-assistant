@@ -9,6 +9,7 @@ export type User = {
   security_level: number;
   department_id: string | null;
   department_name: string | null;
+  is_department_admin: boolean;
 };
 
 export type KnowledgeBaseVisibility = "private" | "department" | "public";
@@ -18,6 +19,8 @@ export type Department = {
   id: string;
   name: string;
   description: string | null;
+  admin_user_id: string | null;
+  admin_username: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -244,43 +247,8 @@ export type AdminUser = {
   security_level: number;
   department_id: string | null;
   department_name: string | null;
+  is_department_admin: boolean;
   created_at: string;
-};
-
-export type AuditLog = {
-  id: string;
-  actor_user_id: string | null;
-  action: string;
-  resource_type: string;
-  resource_id: string | null;
-  outcome: string;
-  security_level: number | null;
-  detail: string | null;
-  metadata: Record<string, unknown>;
-  created_at: string;
-};
-
-export type ExternalCleanupJob = {
-  id: string;
-  actor_user_id: string | null;
-  resource_type: string;
-  resource_id: string;
-  action: string;
-  status: "queued" | "processing" | "completed" | "failed" | string;
-  attempts: number;
-  object_keys: string[];
-  error_message: string;
-  metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
-  completed_at: string | null;
-};
-
-export type RetentionRun = {
-  generated_at: string;
-  dry_run: boolean;
-  deleted_counts: Record<string, number>;
-  cutoffs: Record<string, string | null>;
 };
 
 export type AskKnowledgeBaseResult = {

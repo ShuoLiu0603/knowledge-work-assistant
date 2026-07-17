@@ -34,16 +34,14 @@ export {
 // admin
 export {
   fetchAdminMetrics,
+  createAdminUser,
+  deleteAdminUser,
   listAdminUsers,
-  listAuditLogs,
-  listExternalCleanupJobs,
-  retryExternalCleanupJob,
-  runOperationalRetention,
   updateAdminUser,
 } from "./admin";
 
 // departments
-export { listDepartments, createDepartment } from "./departments";
+export { listDepartments, createDepartment, deleteDepartment, updateDepartmentAdmin } from "./departments";
 
 // agents / logs / qa
 export { listRetrievalLogs, listAgentRuns, createAgentRun, listLlmCallLogs, askKnowledgeBase } from "./agents";

@@ -31,7 +31,7 @@ const selectStyle = {
 
 function defaultVisibility(user: User): KnowledgeBaseVisibility {
   if (user.is_admin) return "public";
-  return user.department_id ? "department" : "private";
+  return user.is_department_admin ? "department" : "private";
 }
 
 function visibilityLabel(kb: KnowledgeBase): string {
@@ -81,6 +81,10 @@ export function KnowledgeBaseListPage({ token, user, onLogout }: Props) {
       setError("请输入知识库名称。");
       return;
     }
+    if (visibility === "department" && !user.is_admin && !user.is_department_admin) {
+      setError("只有部门管理员可以创建部门知识库。");
+      return;
+    }
     if (visibility === "department" && !(user.is_admin ? departmentId : user.department_id)) {
       setError("创建部门知识库前，请先选择部门。");
       return;
@@ -124,8 +128,8 @@ export function KnowledgeBaseListPage({ token, user, onLogout }: Props) {
     { value: "private", label: "私有：仅成员可访问" },
     {
       value: "department",
-      label: "部门：所选部门内可见",
-      disabled: !user.department_id && departments.length === 0,
+      label: "部门：仅部门管理员可维护",
+      disabled: !user.is_admin && !user.is_department_admin,
     },
     { value: "public", label: "全公司：所有用户可见", disabled: !user.is_admin },
   ];
@@ -137,7 +141,7 @@ export function KnowledgeBaseListPage({ token, user, onLogout }: Props) {
         <aside className={page.sidePanel}>
           <h2 className={page.sectionTitle}>创建知识库</h2>
           <p className={page.subtitle} style={{ marginBottom: 16 }}>
-            请按实际需要选择最小可用范围。私有知识库仅成员可访问，部门知识库在部门内共享，全公司知识库对所有用户开放。
+            私有知识库由创建者维护；部门知识库仅部门管理员可维护；全公司知识库仅系统管理员可维护。
           </p>
           <form onSubmit={handleCreate} className={page.formStack}>
             <Input label="名称" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} />
@@ -213,7 +217,9 @@ export function KnowledgeBaseListPage({ token, user, onLogout }: Props) {
               <p>
                 {user.is_admin
                   ? "创建全公司知识库后，即可上传文档。"
-                  : "你可以创建私有知识库，或等待管理员发布共享内容。"}
+                  : user.is_department_admin
+                    ? "你可以创建并维护本部门知识库。"
+                    : "你可以创建私有知识库，或使用管理员发布的共享内容。"}
               </p>
             </div>
           )}

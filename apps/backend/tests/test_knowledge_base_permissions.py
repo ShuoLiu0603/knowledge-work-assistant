@@ -283,15 +283,22 @@ class KnowledgeBasePermissionTests(unittest.TestCase):
 
     def test_department_knowledge_base_is_visible_only_inside_department(self) -> None:
         with isolated_session() as session:
-            ops = create_department(session, DepartmentCreate(name="Operations"))
-            marketing = create_department(session, DepartmentCreate(name="Marketing"))
             owner = create_user(session, "ops-owner@example.com", "Ops Owner")
             peer = create_user(session, "ops-peer@example.com", "Ops Peer")
             outsider = create_user(session, "marketing-user@example.com", "Marketing User")
-            owner.department_id = ops.id
+            marketing_manager = create_user(session, "marketing-manager@example.com", "Marketing Manager")
+            system_admin = create_user(session, "department-system-admin@example.com", "Department System Admin")
+            system_admin.is_admin = True
+            session.add(system_admin)
+            session.commit()
+            ops = create_department(session, DepartmentCreate(name="Operations", admin_user_id=owner.id))
+            marketing = create_department(
+                session,
+                DepartmentCreate(name="Marketing", admin_user_id=marketing_manager.id),
+            )
             peer.department_id = ops.id
             outsider.department_id = marketing.id
-            session.add_all([owner, peer, outsider])
+            session.add_all([peer, outsider])
             session.commit()
 
             kb = create_knowledge_base(
@@ -299,23 +306,55 @@ class KnowledgeBasePermissionTests(unittest.TestCase):
                 owner.id,
                 KnowledgeBaseCreate(name="Ops Playbook", visibility="department"),
             )
+            system_created = create_knowledge_base(
+                session,
+                system_admin.id,
+                KnowledgeBaseCreate(
+                    name="Ops System Managed",
+                    visibility="department",
+                    department_id=ops.id,
+                ),
+            )
 
             self.assertEqual(kb.department_id, ops.id)
+            self.assertEqual(system_created.owner_id, owner.id)
+            session.add(KnowledgeBaseMember(knowledge_base_id=kb.id, user_id=peer.id, role="owner"))
+            session.commit()
             _knowledge_base, peer_role = ensure_kb_access(session, peer.id, kb.id, required_role="viewer")
             self.assertEqual(peer_role, "viewer")
+            with self.assertRaises(HTTPException) as create_forbidden:
+                create_knowledge_base(
+                    session,
+                    peer.id,
+                    KnowledgeBaseCreate(name="Peer Department KB", visibility="department"),
+                )
+            self.assertEqual(create_forbidden.exception.status_code, 403)
+            with self.assertRaises(HTTPException) as update_forbidden:
+                update_knowledge_base(
+                    session,
+                    peer.id,
+                    kb.id,
+                    KnowledgeBaseUpdate(name="Peer Rename"),
+                )
+            self.assertEqual(update_forbidden.exception.status_code, 403)
             with self.assertRaises(HTTPException) as missing:
                 ensure_kb_access(session, outsider.id, kb.id, required_role="viewer")
             self.assertEqual(missing.exception.status_code, 404)
-            self.assertEqual([item.id for item in list_knowledge_bases(session, peer.id)], [kb.id])
+            self.assertEqual(
+                {item.id for item in list_knowledge_bases(session, peer.id)},
+                {kb.id, system_created.id},
+            )
             self.assertEqual(list_knowledge_bases(session, outsider.id), [])
 
     def test_search_scopes_use_distinct_knowledge_base_sets(self) -> None:
         with isolated_session() as session:
-            department = create_department(session, DepartmentCreate(name="Finance"))
             admin = create_user(session, "finance-admin@example.com", "Finance Admin")
             user = create_user(session, "finance-user@example.com", "Finance User")
+            department = create_department(
+                session,
+                DepartmentCreate(name="Finance", admin_user_id=user.id),
+            )
             admin.is_admin = True
-            user.department_id = department.id
             admin.department_id = department.id
             session.add_all([admin, user])
             session.commit()
@@ -351,11 +390,11 @@ class KnowledgeBasePermissionTests(unittest.TestCase):
 
     def test_direct_knowledge_base_ask_cannot_widen_search_scope(self) -> None:
         with isolated_session() as session:
-            department = create_department(session, DepartmentCreate(name="Legal"))
             user = create_user(session, "direct-ask-scope@example.com", "Direct Ask Scope")
-            user.department_id = department.id
-            session.add(user)
-            session.commit()
+            department = create_department(
+                session,
+                DepartmentCreate(name="Legal", admin_user_id=user.id),
+            )
             kb = create_knowledge_base(
                 session,
                 user.id,

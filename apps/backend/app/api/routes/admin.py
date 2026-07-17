@@ -1,21 +1,28 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, require_admin
+from app.api.deps import require_admin
 from app.db.models.external_cleanup_job import ExternalCleanupJob
 from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.admin import (
     AdminMetricsRead,
+    AdminUserCreate,
     AdminUserRead,
     AdminUserUpdate,
     AuditLogRead,
     ExternalCleanupJobRead,
     RetentionRunRead,
 )
-from app.services.admin_service import get_admin_metrics, list_admin_users, update_admin_user
+from app.services.admin_service import (
+    create_admin_user,
+    delete_admin_user,
+    get_admin_metrics,
+    list_admin_users,
+    update_admin_user,
+)
 from app.services.audit_service import list_audit_logs
 from app.services.cleanup_service import list_external_cleanup_jobs, retry_external_cleanup_job
 from app.services.retention_service import apply_operational_retention
@@ -39,6 +46,15 @@ def users(
     return list_admin_users(db)
 
 
+@router.post("/users", response_model=AdminUserRead, status_code=status.HTTP_201_CREATED)
+def create_user(
+    payload: AdminUserCreate,
+    admin_user: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+) -> AdminUserRead:
+    return create_admin_user(db, payload, actor_user_id=admin_user.id)
+
+
 @router.patch("/users/{user_id}", response_model=AdminUserRead)
 def update_user(
     user_id: str,
@@ -47,6 +63,16 @@ def update_user(
     db: Annotated[Session, Depends(get_db)],
 ) -> AdminUserRead:
     return update_admin_user(db, user_id, payload, actor_user_id=admin_user.id)
+
+
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    user_id: str,
+    admin_user: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+) -> Response:
+    delete_admin_user(db, user_id, actor_user_id=admin_user.id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/audit-logs", response_model=list[AuditLogRead])

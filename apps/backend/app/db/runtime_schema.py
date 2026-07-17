@@ -39,6 +39,7 @@ def ensure_runtime_schema(engine: Engine) -> None:
     )
     add_column_if_missing(engine, inspector, "users", "department_id", "department_id VARCHAR(36)")
     add_column_if_missing(engine, inspector, "users", "security_level", "security_level INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(engine, inspector, "departments", "admin_user_id", "admin_user_id VARCHAR(36)")
     add_column_if_missing(engine, inspector, "knowledge_bases", "department_id", "department_id VARCHAR(36)")
     add_column_if_missing(engine, inspector, "documents", "security_level", "security_level INTEGER NOT NULL DEFAULT 1")
     add_column_if_missing(engine, inspector, "conversations", "summary", "summary TEXT")
@@ -107,6 +108,13 @@ def ensure_runtime_schema(engine: Engine) -> None:
     create_index_if_missing(engine, inspector, "user_memories", "ix_user_memories_scope_type", ["scope_type"])
     create_index_if_missing(engine, inspector, "user_memories", "ix_user_memories_scope_id", ["scope_id"])
     create_index_if_missing(engine, inspector, "user_memories", "ix_user_memories_expires_at", ["expires_at"])
+    create_unique_index_if_missing(
+        engine,
+        inspector,
+        "departments",
+        "uq_departments_admin_user_id",
+        ["admin_user_id"],
+    )
     create_index_if_missing(
         engine,
         inspector,
@@ -344,6 +352,26 @@ def create_index_if_missing(
     columns = ", ".join(column_names)
     with engine.begin() as connection:
         connection.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({columns})"))
+
+
+def create_unique_index_if_missing(
+    engine: Engine,
+    inspector: Inspector,
+    table_name: str,
+    index_name: str,
+    column_names: list[str],
+) -> None:
+    indexes = {index["name"] for index in inspector.get_indexes(table_name)}
+    constraints = {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints(table_name)
+        if constraint.get("name")
+    }
+    if index_name in indexes or index_name in constraints:
+        return
+    columns = ", ".join(column_names)
+    with engine.begin() as connection:
+        connection.execute(text(f"CREATE UNIQUE INDEX {index_name} ON {table_name} ({columns})"))
 
 
 def create_profile_singleton_unique_index_if_supported(engine: Engine, inspector: Inspector) -> None:

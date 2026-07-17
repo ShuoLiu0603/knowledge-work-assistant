@@ -3,6 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from app.core.security_levels import MAX_SECURITY_LEVEL, MIN_SECURITY_LEVEL
+from app.schemas.auth import UserCreate
 
 
 class AdminMetricsRead(BaseModel):
@@ -35,7 +36,14 @@ class AdminUserRead(BaseModel):
     security_level: int
     department_id: str | None
     department_name: str | None
+    is_department_admin: bool
     created_at: datetime
+
+
+class AdminUserCreate(UserCreate):
+    is_admin: bool = False
+    security_level: int = Field(default=MIN_SECURITY_LEVEL, ge=MIN_SECURITY_LEVEL, le=MAX_SECURITY_LEVEL)
+    department_id: str | None = None
 
 
 class AdminUserUpdate(BaseModel):

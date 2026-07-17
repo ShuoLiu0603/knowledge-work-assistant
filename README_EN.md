@@ -15,13 +15,13 @@ Knowledge Work Assistant is an engineering reference implementation for enterpri
 
 | Area | Current implementation |
 |---|---|
-| Identity and authorization | Registration, login, access/refresh tokens, administrator role, department scope, knowledge-base membership, L1-L5 document classification |
-| Enterprise knowledge bases | Public/department/private knowledge bases, an owner/editor/viewer access model, PDF/DOCX/TXT/Markdown/CSV upload, document status, and chunk inspection |
+| Identity and authorization | Registration, login, access/refresh tokens, system administrators, one administrator per department, account lifecycle controls, department scope, knowledge-base membership, and L1-L5 document classification |
+| Enterprise knowledge bases | Public/department/private knowledge bases; department knowledge bases are writable only by that department's administrator or a system administrator; PDF/DOCX/TXT/Markdown/CSV upload, document status, and chunk inspection |
 | Knowledge assistance | Agent-authored search queries, Dense + BM25 retrieval, unweighted RRF, context compression, repeated retrieval, streaming answers, and citations |
 | Agent orchestration | One LangChain `create_agent` loop; the model may answer directly or repeatedly call `memory(query)` and `rag(query)` as needed |
 | Conversational memory | Redis short-term memory, incremental summaries, PostgreSQL long-term memory, and a default-enabled Qdrant semantic index |
 | Memory governance | Two-stage LLM candidate extraction and adjudication, pending approval, revisions, soft delete, restore, purge, export, index reconciliation, and recall logs |
-| Administration and audit | Agent traces, LLM call logs, retrieval logs, feedback, memory events, audit logs, and administrative metrics |
+| Administration and audit | Account creation, role/status/department management, safe deletion with external cleanup, department-administrator assignment, audit logs, and administrative metrics |
 
 ## Core Design
 
@@ -225,7 +225,7 @@ Key defaults in the current templates:
 | `MEMORY_SEMANTIC_LIMIT` | 6 | Ordinary long-term memories returned per recall |
 | `MEMORY_CONTEXT_MAX_LONG_MEMORIES` | 10 | Accumulated ordinary memories considered during formatting |
 | `MEMORY_CONTEXT_MAX_TOKENS` | 1600 | Independent complete Memory-context budget |
-| `MEMORY_UPDATE_MODE` | sync / async | Synchronous in development; durable Celery jobs in production |
+| `MEMORY_UPDATE_MODE` | async | Durable Celery jobs by default; use `sync` only when debugging without a worker |
 
 Environment variables are loaded at process startup. Restart the backend, worker, and Beat after changing them. Never commit a local `.env` file or real credentials.
 

@@ -15,13 +15,13 @@ Knowledge Work Assistant 是一个面向企业知识场景的 Agentic RAG 工程
 
 | 领域 | 当前实现 |
 |---|---|
-| 身份与权限 | 注册、登录、访问/刷新令牌、管理员角色、部门范围、知识库成员角色、L1-L5 文档密级 |
-| 企业知识库 | 公开/部门/私有知识库、owner/editor/viewer 访问模型、PDF/DOCX/TXT/Markdown/CSV 上传、文档状态与分块查看 |
+| 身份与权限 | 注册、登录、访问/刷新令牌、系统管理员、单部门管理员、账号生命周期、部门范围、知识库成员角色、L1-L5 文档密级 |
+| 企业知识库 | 公开/部门/私有知识库；部门知识库仅对应部门管理员或系统管理员可维护；PDF/DOCX/TXT/Markdown/CSV 上传、文档状态与分块查看 |
 | 知识问答 | Agent 按需生成检索词、Dense + BM25、无权重 RRF、上下文压缩、多次检索、流式回答与引用 |
 | Agent 编排 | 单个 LangChain `create_agent` 循环；模型可直接回答，或按需多次调用 `memory(query)` / `rag(query)` |
 | 对话记忆 | Redis 短期记忆、会话增量摘要、PostgreSQL 长期记忆、默认启用的 Qdrant 语义索引 |
 | 记忆治理 | 两阶段 LLM 候选提取/裁决、待审批、版本修订、软删除、恢复、永久删除、导出、索引校准与召回日志 |
-| 管理与审计 | Agent trace、LLM 调用日志、检索日志、反馈、记忆事件、审计日志和管理指标 |
+| 管理与审计 | 账号创建、角色/状态/部门管理、安全删除与外部资源清理、部门管理员指派、审计日志和管理指标 |
 
 ## 核心设计
 
@@ -224,7 +224,7 @@ python scripts/smoke_demo.py
 | `MEMORY_SEMANTIC_LIMIT` | 6 | 单次普通长期记忆召回上限 |
 | `MEMORY_CONTEXT_MAX_LONG_MEMORIES` | 10 | 一轮累计结果进入格式化阶段的普通长期记忆上限 |
 | `MEMORY_CONTEXT_MAX_TOKENS` | 1600 | 完整 Memory context 独立预算 |
-| `MEMORY_UPDATE_MODE` | sync / async | 开发模板同步写入，生产模板使用 durable Celery job |
+| `MEMORY_UPDATE_MODE` | async | 默认使用 durable Celery job；`sync` 仅用于未启动 Worker 的调试场景 |
 
 环境变量在进程启动时读取。修改后应重启 backend、worker 和 Beat。不要提交本地 `.env` 或任何真实凭据。
 

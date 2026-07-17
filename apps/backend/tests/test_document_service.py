@@ -351,10 +351,12 @@ class DocumentServiceTests(unittest.TestCase):
 
     def test_department_knowledge_base_documents_respect_user_security_level(self) -> None:
         with isolated_session() as session:
-            department = create_department(session, DepartmentCreate(name="Legal"))
             owner = create_user(session, "legal-owner@example.com", "Legal Owner")
             viewer = create_user(session, "legal-viewer@example.com", "Legal Viewer")
-            owner.department_id = department.id
+            department = create_department(
+                session,
+                DepartmentCreate(name="Legal", admin_user_id=owner.id),
+            )
             viewer.department_id = department.id
             viewer.security_level = 1
             session.add_all([owner, viewer])

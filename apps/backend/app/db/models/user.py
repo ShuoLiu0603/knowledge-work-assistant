@@ -23,7 +23,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    department = relationship("Department", back_populates="users")
+    department = relationship("Department", back_populates="users", foreign_keys=[department_id])
     refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
     owned_knowledge_bases = relationship("KnowledgeBase", back_populates="owner", cascade="all, delete-orphan")
     knowledge_base_memberships = relationship("KnowledgeBaseMember", back_populates="user", cascade="all, delete-orphan")
@@ -33,3 +33,7 @@ class User(Base):
     @property
     def department_name(self) -> str | None:
         return self.department.name if self.department else None
+
+    @property
+    def is_department_admin(self) -> bool:
+        return bool(self.department and self.department.admin_user_id == self.id)

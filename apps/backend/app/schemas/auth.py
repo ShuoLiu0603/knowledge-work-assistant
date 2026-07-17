@@ -50,6 +50,7 @@ class UserRead(BaseModel):
     security_level: int
     department_id: str | None = None
     department_name: str | None = None
+    is_department_admin: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 

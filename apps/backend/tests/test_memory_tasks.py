@@ -8,6 +8,8 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
+from app.agents.memory_agent import update_user_memories
+from app.agents.state import AgentRunState
 from app.db.models.conversation import Conversation, Message
 from app.db.models.user_memory import UserMemory, UserMemoryUpdateJob
 from app.memory.jobs import create_memory_update_job
@@ -51,6 +53,36 @@ class MemoryTaskTests(unittest.TestCase):
 
             self.assertEqual(first.id, second.id)
             self.assertEqual(session.scalar(select(func.count(UserMemoryUpdateJob.id))), 1)
+
+    def test_async_memory_update_queues_without_processing_inline(self) -> None:
+        with isolated_session() as session:
+            user = create_user(session, "memory-async@example.com", "Memory Async")
+            state = AgentRunState(
+                user_id=user.id,
+                knowledge_base_id=None,
+                input="I prefer concise answers",
+                answer="Understood.",
+                memory_enabled=True,
+                status="completed",
+            )
+
+            with (
+                patch(
+                    "app.agents.memory_agent.get_settings",
+                    return_value=SimpleNamespace(memory_update_mode="async"),
+                ),
+                patch("app.agents.memory_agent.enqueue_memory_update") as enqueue_memory_update,
+                patch("app.agents.memory_agent.process_user_memory") as process_user_memory,
+            ):
+                update_user_memories(session, state)
+
+            job = session.scalar(select(UserMemoryUpdateJob).where(UserMemoryUpdateJob.user_id == user.id))
+            self.assertIsNotNone(job)
+            self.assertEqual(job.status, "queued")
+            self.assertEqual(state.memory_actions[0]["action"], "queued")
+            self.assertEqual(state.memory_actions[0]["job_id"], job.id)
+            enqueue_memory_update.assert_called_once_with(job.id)
+            process_user_memory.assert_not_called()
 
     def test_process_memory_update_job_marks_job_completed(self) -> None:
         with isolated_session() as session:

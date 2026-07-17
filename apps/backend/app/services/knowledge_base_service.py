@@ -48,9 +48,13 @@ def create_knowledge_base(db: Session, user_id: str, payload: KnowledgeBaseCreat
         )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can create public knowledge bases")
     department_id = resolve_department_id_for_write(db, user, payload.visibility, payload.department_id)
+    owner_id = user_id
+    if payload.visibility == "department" and department_id is not None:
+        department = require_department(db, department_id)
+        owner_id = department.admin_user_id or user_id
 
     knowledge_base = KnowledgeBase(
-        owner_id=user_id,
+        owner_id=owner_id,
         department_id=department_id,
         name=payload.name,
         description=payload.description,
@@ -61,7 +65,7 @@ def create_knowledge_base(db: Session, user_id: str, payload: KnowledgeBaseCreat
 
     member = KnowledgeBaseMember(
         knowledge_base_id=knowledge_base.id,
-        user_id=user_id,
+        user_id=owner_id,
         role="owner",
     )
     db.add(member)
@@ -77,9 +81,13 @@ def create_knowledge_base(db: Session, user_id: str, payload: KnowledgeBaseCreat
             "name": knowledge_base.name,
             "visibility": knowledge_base.visibility,
             "department_id": knowledge_base.department_id,
+            "owner_id": knowledge_base.owner_id,
         },
     )
-    return to_read_model(knowledge_base, "owner")
+    return to_read_model(
+        knowledge_base,
+        effective_role(user, knowledge_base, "owner" if owner_id == user_id else None),
+    )
 
 
 def list_knowledge_bases(db: Session, user_id: str) -> list[KnowledgeBaseRead]:
@@ -306,7 +314,14 @@ def require_user(db: Session, user_id: str) -> User:
 
 
 def effective_role(user: User, knowledge_base: KnowledgeBase, member_role: str | None) -> str:
-    if user.is_admin and knowledge_base.visibility in {"department", "public"}:
+    if knowledge_base.visibility == "department":
+        if user.is_admin or (
+            knowledge_base.department is not None
+            and knowledge_base.department.admin_user_id == user.id
+        ):
+            return "owner"
+        return "viewer"
+    if user.is_admin and knowledge_base.visibility == "public":
         return "owner"
     if member_role:
         return member_role
@@ -363,11 +378,11 @@ def resolve_department_id_for_write(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Department knowledge bases require a department",
         )
-    require_department(db, department_id)
-    if not user.is_admin and department_id != user.department_id:
+    department = require_department(db, department_id)
+    if not user.is_admin and department.admin_user_id != user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Cannot create or move a knowledge base for another department",
+            detail="Only the department admin can manage department knowledge bases",
         )
     return department_id
 

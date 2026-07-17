@@ -12,6 +12,7 @@ import {
   listMessages,
   listRetrievalLogs,
   listUserMemories,
+  listUserMemoryUpdateJobs,
   streamConversationMessage,
   type AgentRun,
   type Citation,
@@ -46,6 +47,7 @@ import styles from "./ChatPage.module.css";
 type Props = { token: string; user: User; onLogout: () => Promise<void> };
 
 const STREAMING_ID = "streaming-assistant";
+const MEMORY_JOB_POLL_INTERVAL_MS = 3000;
 
 // --- stateless helpers ---
 
@@ -145,6 +147,7 @@ function targetDesc(scope: SearchScope, u: User): string {
 export function ChatPage({ token, user, onLogout }: Props) {
   const streamAbort = useRef<AbortController | null>(null);
   const streamingCitationsRef = useRef<Citation[]>([]);
+  const postStreamRefreshVersionRef = useRef(0);
 
   const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
   const [selectedKbId, setSelectedKbId] = useState("");
@@ -155,6 +158,7 @@ export function ChatPage({ token, user, onLogout }: Props) {
   const [question, setQuestion] = useState("");
   const [memoryOff, setMemoryOff] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  const [memoryUpdating, setMemoryUpdating] = useState(false);
   const [streamStatus, setStreamStatus] = useState("就绪");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -221,6 +225,36 @@ export function ChatPage({ token, user, onLogout }: Props) {
     listUserMemories(token, "active").then(setMemories).catch(() => {});
   }, [token]);
 
+  useEffect(() => {
+    if (!memoryUpdating) return;
+    let active = true;
+    let checking = false;
+
+    async function refreshMemoriesWhenSettled() {
+      if (checking) return;
+      checking = true;
+      try {
+        const jobs = await listUserMemoryUpdateJobs(token);
+        if (!active || jobs.some((job) => job.status === "queued" || job.status === "processing")) return;
+        const items = await listUserMemories(token, "active");
+        if (!active) return;
+        setMemories(items);
+        setMemoryUpdating(false);
+      } catch {
+        // Keep polling; task state is informational and must not block chat.
+      } finally {
+        checking = false;
+      }
+    }
+
+    void refreshMemoriesWhenSettled();
+    const timer = window.setInterval(() => void refreshMemoriesWhenSettled(), MEMORY_JOB_POLL_INTERVAL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [memoryUpdating, token]);
+
   // --- load conversations ---
   useEffect(() => {
     if (!canUse) {
@@ -267,6 +301,7 @@ export function ChatPage({ token, user, onLogout }: Props) {
   // --- handlers ---
 
   async function selectConv(conv: Conversation) {
+    postStreamRefreshVersionRef.current += 1;
     setActiveConvId(conv.id);
     setSelectedCitMsgId("");
     setStreamingCitations([]);
@@ -291,6 +326,7 @@ export function ChatPage({ token, user, onLogout }: Props) {
 
   async function newConv() {
     if (!canUse) return;
+    postStreamRefreshVersionRef.current += 1;
     setError("");
     try {
       const c = await createConversation(token, convPayload(targetScope, selectedKb?.id ?? null, user.department_id));
@@ -311,6 +347,7 @@ export function ChatPage({ token, user, onLogout }: Props) {
 
   async function delConv(convId: string) {
     if (streaming) return;
+    postStreamRefreshVersionRef.current += 1;
     setError("");
     try {
       await deleteConversation(token, convId);
@@ -365,6 +402,7 @@ export function ChatPage({ token, user, onLogout }: Props) {
     const trimmed = question.trim();
     if (!trimmed) return setError("请输入问题。");
     const memoryMode = memoryOff ? "off" : "normal";
+    const refreshVersion = ++postStreamRefreshVersionRef.current;
 
     setQuestion("");
     setMemoryOff(false);
@@ -419,21 +457,8 @@ export function ChatPage({ token, user, onLogout }: Props) {
         },
         ctrl.signal,
       );
-      // refresh after stream
-      const [uc, ul, ur, ull, um] = await Promise.all([
-        listConversations(token, convFilters),
-        listRetrievalLogs(token, { conversation_id: conv.id }),
-        listAgentRuns(token, { conversation_id: conv.id }),
-        listLlmCallLogs(token, { conversation_id: conv.id }),
-        listUserMemories(token, "active"),
-      ]);
-      setConvs(uc);
-      setLogs(ul);
-      setSelectedLogId(ul[0]?.id ?? selectedLogId);
-      setRuns(ur);
-      setSelectedRunId(ur[0]?.id ?? selectedRunId);
-      setLlmLogs(ull);
-      setMemories(um);
+      if (memoryMode === "normal") setMemoryUpdating(true);
+      void refreshAfterStream(conv.id, refreshVersion);
     } catch (e) {
       if (isAbortError(e)) {
         setMsgs((prev) => markStopped(prev));
@@ -447,6 +472,26 @@ export function ChatPage({ token, user, onLogout }: Props) {
     } finally {
       streamAbort.current = null;
       setStreaming(false);
+    }
+  }
+
+  async function refreshAfterStream(convId: string, refreshVersion: number) {
+    try {
+      const [updatedConvs, updatedLogs, updatedRuns, updatedLlmLogs] = await Promise.all([
+        listConversations(token, convFilters),
+        listRetrievalLogs(token, { conversation_id: convId }),
+        listAgentRuns(token, { conversation_id: convId }),
+        listLlmCallLogs(token, { conversation_id: convId }),
+      ]);
+      if (postStreamRefreshVersionRef.current !== refreshVersion) return;
+      setConvs(updatedConvs);
+      setLogs(updatedLogs);
+      setSelectedLogId((current) => updatedLogs[0]?.id ?? current);
+      setRuns(updatedRuns);
+      setSelectedRunId((current) => updatedRuns[0]?.id ?? current);
+      setLlmLogs(updatedLlmLogs);
+    } catch {
+      // Stream data is already committed; side-panel refresh failure is non-blocking.
     }
   }
 
@@ -481,10 +526,10 @@ export function ChatPage({ token, user, onLogout }: Props) {
         <aside className={styles.leftRail}>
           <SearchScopeSelector
             targetScope={targetScope}
-            onChange={(s) => { setTargetScope(s); setError(""); }}
+            onChange={(s) => { postStreamRefreshVersionRef.current += 1; setTargetScope(s); setError(""); }}
             personalKbs={personalKbs}
             selectedKbId={selectedKbId}
-            onKbChange={(id) => { setSelectedKbId(id); setError(""); }}
+            onKbChange={(id) => { postStreamRefreshVersionRef.current += 1; setSelectedKbId(id); setError(""); }}
             disabled={streaming}
           />
           <ConversationList
@@ -511,7 +556,10 @@ export function ChatPage({ token, user, onLogout }: Props) {
               <strong className={styles.targetTitle}>{targetLabel(targetScope, selectedKb, user)}</strong>
               <span className={styles.targetMeta}>{targetDesc(targetScope, user)} · 密级 L{user.security_level}</span>
             </div>
-            <StatusPill variant={streaming ? "streaming" : "active"} label={streaming ? streamStatus : "就绪"} />
+            <StatusPill
+              variant={streaming || memoryUpdating ? "streaming" : "active"}
+              label={streaming ? streamStatus : memoryUpdating ? "记忆更新中" : "就绪"}
+            />
           </div>
 
           {!loading && kbs.length === 0 && (

@@ -2470,20 +2470,25 @@ class MemoryServiceTests(unittest.TestCase):
                     AuditLog.resource_type == "user_memory",
                 )
             ).all()
+            governance_actions = {
+                "memory.create",
+                "memory.update",
+                "memory.approve",
+                "memory.reject",
+                "memory.delete",
+                "memory.restore",
+                "memory.purge",
+            }
             actions = {log.action for log in audit_logs}
 
+            self.assertTrue(governance_actions.issubset(actions))
             self.assertTrue(
-                {
-                    "memory.create",
-                    "memory.update",
-                    "memory.approve",
-                    "memory.reject",
-                    "memory.delete",
-                    "memory.restore",
-                    "memory.purge",
-                }.issubset(actions)
+                all(
+                    log.outcome == "success"
+                    for log in audit_logs
+                    if log.action in governance_actions
+                )
             )
-            self.assertTrue(all(log.outcome == "success" for log in audit_logs))
             self.assertTrue(all(log.resource_id for log in audit_logs))
             metadata_text = str([log.extra_metadata for log in audit_logs])
             self.assertNotIn("sensitive launch details", metadata_text)

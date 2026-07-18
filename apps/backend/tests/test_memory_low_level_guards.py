@@ -305,7 +305,7 @@ class MemoryContextGuardTests(unittest.TestCase):
         result = context.format_memory_context(
             long_memories=[{"content": "User is building an enterprise RAG system."}],
             short_memory=[{"role": "user", "content": "Keep the full recent message available."}],
-            conversation_summary="The project uses FastAPI, Qdrant, and LangGraph.",
+            conversation_summary="The project uses FastAPI, PostgreSQL pgvector, and LangGraph.",
             max_chars=40,
             max_tokens=120,
         )

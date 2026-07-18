@@ -239,11 +239,10 @@ class MemoryOrchestrationRegressionTests(unittest.TestCase):
             self.assertEqual(conversation.summary_message_count, 2)
             self.assertEqual(provider.calls, 0)
 
-    def test_purge_keeps_retryable_cleanup_job_when_vector_delete_fails(self) -> None:
+    def test_purge_removes_embedding_with_the_memory_row(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.services.cleanup_service.delete_memory_vector", side_effect=RuntimeError("qdrant offline")),
         ):
             user = create_user(session, "purge-cleanup@example.com", "Purge Cleanup")
             memory = memory_service.create_manual_memory(session, user.id, "user prefers concise answers")
@@ -257,9 +256,7 @@ class MemoryOrchestrationRegressionTests(unittest.TestCase):
                     ExternalCleanupJob.resource_id == memory.id,
                 )
             )
-            self.assertIsNotNone(job)
-            self.assertEqual(job.status, "failed")
-            self.assertIn("qdrant offline", job.error_message)
+            self.assertIsNone(job)
 
 
 if __name__ == "__main__":

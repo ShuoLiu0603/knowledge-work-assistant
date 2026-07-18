@@ -35,7 +35,6 @@ from app.memory.types import MemoryAction, MemoryEmbedding, MemorySource
 
 _SUMMARY_TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
 from app.services.audit_service import record_audit_event
-from app.services.cleanup_service import create_external_cleanup_job, run_external_cleanup_job, to_cleanup_metadata
 from app.services.llm_log_service import create_llm_call_log
 
 ALLOWED_MEMORY_STATUSES = memory_policy.ALLOWED_MEMORY_STATUSES
@@ -236,7 +235,6 @@ def process_user_memory(
     proposals = extract_memory_candidates_with_logging(db, provider, user_id, text, assistant_text, conversation_id)
     actions: list[MemoryAction] = []
     judge_was_called = False
-    memory_commands.pop_queued_memory_vector_sync_ids(db)
     try:
         for proposal in proposals[:MAX_MEMORY_OPERATIONS]:
             if proposal.action == "ignore" or not proposal.content.strip():
@@ -297,16 +295,12 @@ def process_user_memory(
             )
 
         if autocommit:
-            sync_memory_ids = memory_commands.pop_queued_memory_vector_sync_ids(db)
-            if sync_memory_ids or judge_was_called:
+            if judge_was_called:
                 db.commit()
-            if sync_memory_ids:
-                sync_memory_vectors_by_ids(db, sync_memory_ids)
         else:
             db.flush()
     except Exception:
         db.rollback()
-        memory_commands.pop_queued_memory_vector_sync_ids(db)
         raise
     return actions or [MemoryAction("ignore", None, "", "no durable memory candidate")]
 
@@ -391,7 +385,7 @@ def load_related_memories_for_candidate(
     user_id: str,
     candidate: MemoryOperation,
 ) -> list[UserMemory]:
-    """Build a bounded judge context using deterministic keys, Qdrant, and a local fallback."""
+    """Build a bounded judge context using deterministic keys and pgvector recall."""
     normalized = memory_policy.normalize_memory_content(candidate.content)
     if not normalized:
         return []
@@ -431,6 +425,7 @@ def load_related_memories_for_candidate(
     try:
         query_vector = memory_embedding.embed_memory_text(candidate.content).vector
         vector_hits = memory_vector_index.search_active_memories(
+            db,
             user_id,
             query_vector,
             limit=MEMORY_EDITOR_CONTEXT_LIMIT,
@@ -603,15 +598,6 @@ def process_memory_operation(
         user_message=user_message,
         autocommit=autocommit,
     )
-
-
-def sync_memory_vectors_by_ids(db: Session, memory_ids: set[str]) -> None:
-    for memory_id in memory_ids:
-        memory = db.get(UserMemory, memory_id)
-        if memory is None or memory.status == "deleted":
-            memory_vector_index.try_delete_memory_vector(memory_id)
-            continue
-        memory_vector_index.try_sync_memory_vector(memory)
 
 
 def memory_operation_to_context_dict(operation: MemoryOperation) -> dict:
@@ -850,6 +836,7 @@ def retrieve_relevant_memories(
         try:
             query_vector = embed_memory_text(query).vector
             vector_hits = memory_vector_index.search_active_memories(
+                db,
                 user_id,
                 query_vector,
                 limit=max(limit, FULL_MEMORY_RECALL_LIMIT),
@@ -1984,9 +1971,6 @@ def create_manual_memory(
     )
     db.commit()
     db.refresh(memory)
-    memory_vector_index.try_sync_memory_vector(memory)
-    for conflict in activation_conflicts:
-        memory_vector_index.try_sync_memory_vector(conflict)
     record_memory_governance_audit(
         db,
         user_id,
@@ -2123,12 +2107,6 @@ def update_user_memory(
     )
     db.commit()
     db.refresh(memory)
-    if memory.status == "deleted":
-        memory_vector_index.try_delete_memory_vector(memory.id)
-    else:
-        memory_vector_index.try_sync_memory_vector(memory)
-    for conflict in activation_conflicts:
-        memory_vector_index.try_sync_memory_vector(conflict)
     record_memory_governance_audit(
         db,
         user_id,
@@ -2214,9 +2192,6 @@ def approve_user_memory(db: Session, user_id: str, memory_id: str) -> UserMemory
     )
     db.commit()
     db.refresh(memory)
-    memory_vector_index.try_sync_memory_vector(memory)
-    for conflict in activation_conflicts:
-        memory_vector_index.try_sync_memory_vector(conflict)
     record_memory_governance_audit(
         db,
         user_id,
@@ -2251,7 +2226,6 @@ def reject_user_memory(db: Session, user_id: str, memory_id: str) -> UserMemory:
     )
     db.commit()
     db.refresh(memory)
-    memory_vector_index.try_sync_memory_vector(memory)
     record_memory_governance_audit(
         db,
         user_id,
@@ -2293,9 +2267,6 @@ def restore_user_memory(db: Session, user_id: str, memory_id: str) -> UserMemory
     )
     db.commit()
     db.refresh(memory)
-    memory_vector_index.try_sync_memory_vector(memory)
-    for conflict in activation_conflicts:
-        memory_vector_index.try_sync_memory_vector(conflict)
     record_memory_governance_audit(
         db,
         user_id,
@@ -2324,18 +2295,6 @@ def purge_user_memory(db: Session, user_id: str, memory_id: str) -> None:
     memory = get_user_memory_or_404(db, user_id, memory_id)
     redaction_counts = redact_purged_memory_references(db, memory)
     audit_payload = {**purged_memory_audit_payload(memory), **redaction_counts}
-    cleanup_job = create_external_cleanup_job(
-        db,
-        actor_user_id=user_id,
-        resource_type="user_memory",
-        resource_id=memory.id,
-        object_keys=[],
-        metadata={
-            "user_id": memory.user_id,
-            "memory_status": memory.status,
-            "memory_revision": memory.revision,
-        },
-    )
     event = UserMemoryEvent(
         user_id=memory.user_id,
         memory_id=None,
@@ -2352,14 +2311,13 @@ def purge_user_memory(db: Session, user_id: str, memory_id: str) -> None:
     db.flush()
     db.delete(memory)
     db.commit()
-    cleanup_job = run_external_cleanup_job(db, cleanup_job.id)
     record_audit_event(
         db,
         actor_user_id=user_id,
         action="memory.purge",
         resource_type="user_memory",
         resource_id=memory_id,
-        metadata={**audit_payload, **to_cleanup_metadata(cleanup_job)},
+        metadata=audit_payload,
     )
 
 

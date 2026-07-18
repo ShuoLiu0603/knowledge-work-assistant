@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
+import uuid
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, func
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+from app.db.pgvector import PgVector
 
 
 class Document(Base):
@@ -49,7 +50,9 @@ class DocumentChunk(Base):
     title_path: Mapped[str | None] = mapped_column(Text)
     page_number: Mapped[int | None] = mapped_column(Integer)
     section_name: Mapped[str | None] = mapped_column(Text)
-    qdrant_point_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    embedding: Mapped[list[float] | None] = mapped_column(PgVector())
+    embedding_model: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    embedding_dimension: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     security_level: Mapped[int] = mapped_column(Integer, index=True, nullable=False, default=1)
     extra_metadata: Mapped[dict] = mapped_column("metadata", JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

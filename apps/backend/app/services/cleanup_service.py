@@ -9,8 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models.external_cleanup_job import ExternalCleanupJob
-from app.memory.vector_index import delete_memory_vector
-from app.rag.vector_store import delete_document_vectors, delete_knowledge_base_vectors
 from app.services.audit_service import record_audit_event
 from app.storage.minio_client import remove_object
 
@@ -184,13 +182,7 @@ def cleanup_lease_is_active(job: ExternalCleanupJob, *, now: datetime | None = N
 
 
 def cleanup_external_resources(job: ExternalCleanupJob) -> None:
-    if job.resource_type == "document":
-        delete_document_vectors(job.resource_id)
-    elif job.resource_type == "knowledge_base":
-        delete_knowledge_base_vectors(job.resource_id)
-    elif job.resource_type == "user_memory":
-        delete_memory_vector(job.resource_id)
-    else:
+    if job.resource_type not in {"document", "knowledge_base", "user_memory"}:
         raise ValueError(f"Unsupported external cleanup resource type: {job.resource_type}")
 
     for object_key in job.object_keys or []:

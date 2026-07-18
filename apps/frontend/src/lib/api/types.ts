@@ -61,7 +61,6 @@ export type DocumentChunk = {
   knowledge_base_id: string;
   chunk_index: number;
   content: string;
-  qdrant_point_id: string | null;
   token_count: number;
   title_path: string | null;
   page_number: number | null;

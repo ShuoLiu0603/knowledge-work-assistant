@@ -33,7 +33,6 @@ class DocumentChunkRead(BaseModel):
     knowledge_base_id: str
     chunk_index: int
     content: str
-    qdrant_point_id: str | None = None
     token_count: int
     title_path: str | None
     page_number: int | None

@@ -1050,9 +1050,7 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertIn(new_name.content, context)
             self.assertNotIn(project.content, context)
 
-    def test_memory_vector_payload_contains_governance_fields(self) -> None:
-        from app.memory import vector_index
-
+    def test_memory_embedding_is_persisted_with_governance_fields(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
@@ -1065,37 +1063,38 @@ class MemoryServiceTests(unittest.TestCase):
                 category="language",
             )
 
-            payload = vector_index.memory_payload(memory)
+            self.assertEqual(memory.memory_layer, "profile")
+            self.assertEqual(memory.profile_slot, "language")
+            self.assertEqual(memory.scope_type, "user")
+            self.assertEqual(memory.scope_id, user.id)
+            self.assertTrue(memory.pinned)
+            self.assertEqual(memory.revision, 1)
+            self.assertEqual(memory.embedding, [0.5, 0.5])
+            self.assertEqual(memory.embedding_model, "fake")
+            self.assertEqual(memory.embedding_dimension, 2)
 
-            self.assertEqual(payload["memory_layer"], "profile")
-            self.assertEqual(payload["profile_slot"], "language")
-            self.assertEqual(payload["scope_type"], "user")
-            self.assertEqual(payload["scope_id"], user.id)
-            self.assertTrue(payload["pinned"])
-            self.assertEqual(payload["revision"], 1)
-
-    def test_memory_vector_sync_deletes_non_active_memory_vectors(self) -> None:
+    def test_non_active_memory_is_excluded_from_vector_recall(self) -> None:
         from app.memory import vector_index
 
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.memory.vector_index.is_memory_vector_index_enabled", return_value=True),
-            patch("app.memory.vector_index.delete_memory_vector") as delete_memory_vector,
-            patch("app.memory.vector_index.get_qdrant_client") as get_qdrant_client,
+            patch(
+                "app.memory.vector_index.get_settings",
+                return_value=SimpleNamespace(memory_vector_index_enabled=True, embedding_model="fake"),
+            ),
         ):
             user = create_user(session, "memory-vector-non-active@example.com", "Memory Vector Non Active")
-            memory = memory_service.create_manual_memory(session, user.id, "user works on vector governance")
-            delete_memory_vector.reset_mock()
-            get_qdrant_client.reset_mock()
+            memory = memory_service.create_manual_memory(session, user.id, "user prefers concise answers")
+
+            active_hits = vector_index.search_active_memories(session, user.id, [1.0, 0.0], limit=5)
+            self.assertEqual([hit.memory_id for hit in active_hits], [memory.id])
 
             for status in ("pending", "ignored", "superseded", "deleted"):
                 memory.status = status
-                vector_index.sync_memory_vector(memory)
-
-            self.assertEqual(delete_memory_vector.call_count, 4)
-            delete_memory_vector.assert_called_with(memory.id)
-            get_qdrant_client.assert_not_called()
+                session.flush()
+                hits = vector_index.search_active_memories(session, user.id, [1.0, 0.0], limit=5)
+                self.assertEqual(hits, [])
 
     def test_low_level_create_supersedes_existing_profile_singleton(self) -> None:
         with (
@@ -1478,88 +1477,91 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertEqual(first.status, "active")
             self.assertEqual(second.status, "active")
 
-    def test_memory_reconcile_reports_missing_vector_without_applying(self) -> None:
+    def test_memory_reconcile_reports_missing_embedding_without_applying(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.memory.vector_index.is_memory_vector_index_enabled", return_value=True),
-            patch("app.memory.vector_index.get_memory_vector_payloads", return_value={}),
-            patch("app.memory.vector_index.try_sync_memory_vector") as sync_memory_vector,
+            patch(
+                "app.memory.reconcile.get_settings",
+                return_value=SimpleNamespace(memory_vector_index_enabled=True, memory_reconcile_max_semantic_pairs=200),
+            ),
         ):
             user = create_user(session, "memory-reconcile-vector-dry@example.com", "Memory Reconcile Vector Dry")
             memory = memory_service.create_manual_memory(session, user.id, "user works on vector recall", category="project")
-            sync_memory_vector.reset_mock()
+            memory.embedding = None
+            memory.embedding_dimension = 0
+            session.commit()
 
             report = memory_service.reconcile_user_memories(session, user.id, apply=False)
 
-            self.assertTrue(any(finding["finding_type"] == "missing_vector" for finding in report["findings"]))
+            self.assertTrue(any(finding["finding_type"] == "missing_embedding" for finding in report["findings"]))
             self.assertEqual(report["applied_count"], 0)
-            sync_memory_vector.assert_not_called()
+            session.refresh(memory)
+            self.assertIsNone(memory.embedding)
             self.assertIsNone(
                 session.scalar(
                     select(UserMemoryEvent).where(
                         UserMemoryEvent.memory_id == memory.id,
-                        UserMemoryEvent.event_type == "vector_sync",
+                        UserMemoryEvent.event_type == "embedding_backfill",
                     )
                 )
             )
 
-    def test_memory_reconcile_apply_repairs_missing_vector_with_event(self) -> None:
+    def test_memory_reconcile_apply_backfills_missing_embedding_with_event(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.memory.vector_index.is_memory_vector_index_enabled", return_value=True),
-            patch("app.memory.vector_index.get_memory_vector_payloads", return_value={}),
-            patch("app.memory.vector_index.try_sync_memory_vector", return_value=True) as sync_memory_vector,
+            patch(
+                "app.memory.reconcile.get_settings",
+                return_value=SimpleNamespace(memory_vector_index_enabled=True, memory_reconcile_max_semantic_pairs=200),
+            ),
         ):
             user = create_user(session, "memory-reconcile-vector-apply@example.com", "Memory Reconcile Vector Apply")
             memory = memory_service.create_manual_memory(session, user.id, "user works on vector recall", category="project")
-            sync_memory_vector.reset_mock()
+            memory.embedding = None
+            memory.embedding_dimension = 0
+            session.commit()
 
             report = memory_service.reconcile_user_memories(session, user.id, apply=True)
 
-            finding = next(finding for finding in report["findings"] if finding["finding_type"] == "missing_vector")
+            finding = next(finding for finding in report["findings"] if finding["finding_type"] == "missing_embedding")
             self.assertTrue(finding["applied"])
             self.assertGreaterEqual(report["applied_count"], 1)
-            sync_memory_vector.assert_called_with(memory)
+            session.refresh(memory)
+            self.assertEqual(memory.embedding, [0.5, 0.5])
+            self.assertEqual(memory.embedding_model, "fake")
+            self.assertEqual(memory.embedding_dimension, 2)
             event = session.scalar(
                 select(UserMemoryEvent).where(
                     UserMemoryEvent.memory_id == memory.id,
-                    UserMemoryEvent.event_type == "vector_sync",
+                    UserMemoryEvent.event_type == "embedding_backfill",
                 )
             )
             self.assertIsNotNone(event)
-            self.assertEqual(event.reason, "memory vector is missing")
-            self.assertTrue(event.payload["vector_reconcile"])
+            self.assertEqual(event.reason, "active memory embedding was missing or invalid")
+            self.assertTrue(event.payload["embedding_reconcile"])
 
-    def test_memory_reconcile_apply_deletes_pending_memory_vector(self) -> None:
+    def test_memory_reconcile_ignores_pending_memory_embeddings(self) -> None:
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+            patch(
+                "app.memory.reconcile.get_settings",
+                return_value=SimpleNamespace(memory_vector_index_enabled=True, memory_reconcile_max_semantic_pairs=200),
+            ),
         ):
             user = create_user(session, "memory-reconcile-pending-vector@example.com", "Memory Reconcile Pending Vector")
             memory = memory_service.create_manual_memory(session, user.id, "user works on vector retention", category="project")
             memory_service.update_user_memory(session, user.id, memory.id, status="pending")
+            memory.embedding = None
+            memory.embedding_dimension = 0
+            session.commit()
 
-            with (
-                patch("app.memory.vector_index.is_memory_vector_index_enabled", return_value=True),
-                patch("app.memory.vector_index.get_memory_vector_payloads", return_value={memory.id: {"status": "pending"}}),
-                patch("app.memory.vector_index.try_delete_memory_vector", return_value=True) as delete_memory_vector,
-            ):
-                report = memory_service.reconcile_user_memories(session, user.id, apply=True)
+            report = memory_service.reconcile_user_memories(session, user.id, apply=True)
 
-            finding = next(finding for finding in report["findings"] if finding["finding_type"] == "stale_vector")
-            self.assertTrue(finding["applied"])
-            delete_memory_vector.assert_called_with(memory.id)
-            event = session.scalar(
-                select(UserMemoryEvent).where(
-                    UserMemoryEvent.memory_id == memory.id,
-                    UserMemoryEvent.event_type == "vector_delete",
-                )
-            )
-            self.assertIsNotNone(event)
-            self.assertEqual(event.reason, "memory vector should be absent")
-            self.assertTrue(event.payload["vector_reconcile"])
+            self.assertFalse(any(finding["memory_id"] == memory.id for finding in report["findings"]))
+            session.refresh(memory)
+            self.assertIsNone(memory.embedding)
 
     def test_create_with_hidden_canonical_conflict_becomes_pending(self) -> None:
         from app.llm.provider import MemoryOperation
@@ -1921,7 +1923,7 @@ class MemoryServiceTests(unittest.TestCase):
             user = create_user(session, "memory-vector-fallback@example.com", "Memory Vector Fallback")
             memory = memory_service.create_manual_memory(session, user.id, "user works on an agentic RAG project", category="project")
 
-            with patch("app.memory.vector_index.search_active_memories", side_effect=RuntimeError("qdrant unavailable")):
+            with patch("app.memory.vector_index.search_active_memories", side_effect=RuntimeError("pgvector unavailable")):
                 recalled = memory_service.retrieve_relevant_memories(session, user.id, "agentic RAG architecture")
 
             self.assertEqual([item.id for item in recalled], [memory.id])
@@ -1996,7 +1998,6 @@ class MemoryServiceTests(unittest.TestCase):
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.memory.vector_index.try_sync_memory_vector") as sync_memory_vector,
         ):
             user = create_user(session, "memory-restore@example.com", "Memory Restore")
             memory = memory_service.create_manual_memory(session, user.id, "Use concise answers")
@@ -2006,7 +2007,7 @@ class MemoryServiceTests(unittest.TestCase):
 
             self.assertEqual(restored.status, "active")
             self.assertIsNone(restored.invalid_at)
-            sync_memory_vector.assert_called()
+            self.assertEqual(restored.embedding, [1.0, 0.0])
             event = session.scalar(
                 select(UserMemoryEvent)
                 .where(UserMemoryEvent.memory_id == memory.id, UserMemoryEvent.event_type == "restore")
@@ -2020,7 +2021,6 @@ class MemoryServiceTests(unittest.TestCase):
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.memory.vector_index.try_delete_memory_vector") as delete_memory_vector,
         ):
             user = create_user(session, "memory-purge@example.com", "Memory Purge")
             memory = memory_service.create_manual_memory(session, user.id, "Use concise answers")
@@ -2029,7 +2029,6 @@ class MemoryServiceTests(unittest.TestCase):
             memory_service.purge_user_memory(session, user.id, memory.id)
 
             self.assertIsNone(session.get(UserMemory, memory.id))
-            delete_memory_vector.assert_called_with(memory.id)
             event = session.scalar(
                 select(UserMemoryEvent)
                 .where(UserMemoryEvent.user_id == user.id, UserMemoryEvent.event_type == "purge")
@@ -2416,8 +2415,6 @@ class MemoryServiceTests(unittest.TestCase):
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.memory.vector_index.try_sync_memory_vector"),
-            patch("app.memory.vector_index.try_delete_memory_vector"),
         ):
             user = create_user(session, "memory-global-audit@example.com", "Memory Global Audit")
             memory = memory_service.create_manual_memory(
@@ -2659,7 +2656,6 @@ class MemoryServiceTests(unittest.TestCase):
         with (
             isolated_session() as session,
             patch("app.memory.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.memory.vector_index.try_delete_memory_vector"),
         ):
             user = create_user(session, "memory-purge-redacted@example.com", "Memory Purge Redacted")
             memory = memory_service.create_manual_memory(
@@ -3118,7 +3114,7 @@ class MemoryServiceTests(unittest.TestCase):
             self.assertEqual(provider.seen_assistant_message, "Got it.")
             self.assertEqual(provider.judge_call_count, 1)
 
-    def test_memory_judge_uses_qdrant_hit_outside_recent_editor_window(self) -> None:
+    def test_memory_judge_uses_dense_hit_outside_recent_editor_window(self) -> None:
         from app.llm.provider import MemoryOperation
 
         provider = ConflictReviewFakeLlmProvider(
@@ -3137,9 +3133,8 @@ class MemoryServiceTests(unittest.TestCase):
             isolated_session() as session,
             patch.object(memory_service, "get_llm_provider", return_value=provider),
             patch("app.memory.embedding.get_embedding_provider", return_value=ConflictEmbeddingProvider()),
-            patch("app.memory.vector_index.try_sync_memory_vector", return_value=True),
         ):
-            user = create_user(session, "memory-judge-qdrant@example.com", "Memory Judge Qdrant")
+            user = create_user(session, "memory-judge-dense@example.com", "Memory Judge Dense")
             old = memory_service.create_manual_memory(
                 session,
                 user.id,

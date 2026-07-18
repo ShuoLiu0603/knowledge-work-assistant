@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.user_memory import UserMemory
 from app.llm.provider import MemoryCandidate, MemoryOperation
-from app.memory import commands, embedding, events, policy, repository, retrieval, vector_index
+from app.memory import commands, embedding, events, policy, repository, retrieval
 from app.memory.types import MemoryAction, MemoryEmbedding, MemorySource
 
 ConflictReviewer = Callable[[MemoryOperation, list[UserMemory]], MemoryOperation | None]
@@ -193,13 +193,9 @@ def update_memory_from_operation(
         },
     )
     if not autocommit:
-        commands.queue_memory_vector_sync(db, target, *activation_conflicts)
         return MemoryAction("update", target.id, target.content, operation.reason or "memory editor updated memory")
     db.commit()
     db.refresh(target)
-    for conflict in activation_conflicts:
-        vector_index.try_sync_memory_vector(conflict)
-    vector_index.try_sync_memory_vector(target)
     return MemoryAction("update", target.id, target.content, operation.reason or "memory editor updated memory")
 
 
@@ -253,11 +249,9 @@ def supersede_memory_from_operation(
         },
     )
     if not autocommit:
-        commands.queue_memory_vector_sync(db, target, memory)
         return MemoryAction("supersede", memory.id, memory.content, operation.reason or f"superseded {target.id}")
     db.commit()
     db.refresh(memory)
-    vector_index.try_sync_memory_vector(target)
     return MemoryAction("supersede", memory.id, memory.content, operation.reason or f"superseded {target.id}")
 
 
@@ -657,7 +651,6 @@ def supersede_conflicting_memory(
     )
     db.commit()
     db.refresh(new_memory)
-    vector_index.try_sync_memory_vector(conflict)
     return MemoryAction("supersede", new_memory.id, new_memory.content, f"superseded {conflict.id}")
 
 
@@ -704,7 +697,6 @@ def supersede_conflicting_memory_from_operation(
     )
     db.commit()
     db.refresh(new_memory)
-    vector_index.try_sync_memory_vector(conflict)
     return MemoryAction(
         "supersede",
         new_memory.id,

@@ -19,7 +19,7 @@ Knowledge Work Assistant 是一个面向企业知识场景的 Agentic RAG 工程
 | 企业知识库 | 公开/部门/私有知识库；部门知识库仅对应部门管理员或系统管理员可维护；PDF/DOCX/TXT/Markdown/CSV 上传、文档状态与分块查看 |
 | 知识问答 | Agent 按需生成检索词、Dense + BM25、无权重 RRF、上下文压缩、多次检索、流式回答与引用 |
 | Agent 编排 | 单个 LangChain `create_agent` 循环；模型可直接回答，或按需多次调用 `memory(query)` / `rag(query)` |
-| 对话记忆 | Redis 短期记忆、会话增量摘要、PostgreSQL 长期记忆、默认启用的 Qdrant 语义索引 |
+| 对话记忆 | Redis 短期记忆、会话增量摘要，以及以 PostgreSQL pgvector 存储和召回的长期记忆 |
 | 记忆治理 | 两阶段 LLM 候选提取/裁决、待审批、版本修订、软删除、恢复、永久删除、导出、索引校准与召回日志 |
 | 管理与审计 | 账号创建、角色/状态/部门管理、安全删除与外部资源清理、部门管理员指派、审计日志和管理指标 |
 
@@ -37,24 +37,24 @@ Knowledge Work Assistant 是一个面向企业知识场景的 Agentic RAG 工程
 ```text
 Agent query
 → knowledge-base / department / classification authorization
-→ Dense(Qdrant) + BM25(PostgreSQL)
+→ Dense(pgvector) + BM25(PostgreSQL)
 → unweighted RRF
 → context compression and token budget
 → accumulated evidence with stable citation numbers
 → final answer
 ```
 
-Dense 与 BM25 在候选阶段就应用相同权限过滤。PostgreSQL 保存文档、chunk 与权限真相，Qdrant 保存可重建向量；最终引用只来自实际提供给模型的授权 chunk。
+Dense 与 BM25 在候选阶段就应用相同权限过滤。PostgreSQL 同时保存文档、chunk、权限真相与 embedding；Dense 查询先收窄授权范围，再按余弦距离排序，最终引用只来自实际提供给模型的授权 chunk。
 
 ### 分层记忆与两阶段写入
 
 - 回答前固定加载核心 Profile、会话摘要和最近对话；普通长期记忆仅在 Agent 调用 `memory(query)` 时按需召回。
-- 普通长期记忆默认使用 Qdrant 全量向量召回，并与 PostgreSQL 最近候选回退合并；同一轮多次召回按 Memory ID 去重，最终再受条数和 token 预算约束。
+- 普通长期记忆默认使用 PostgreSQL pgvector 语义召回，并与有界的最近候选回退合并；同一轮多次召回按 Memory ID 去重，最终再受条数和 token 预算约束。
 - 回答提交后，Candidate Extractor 只从当前 turn 提取候选，不接收旧记忆，也不能指定目标 ID。
-- 每条候选都会经过 exact hash、canonical key/category、Qdrant 和 PostgreSQL 回退检索，再由独立的第二次 Memory Judge 判断 `independent/equivalent/refinement/replacement/uncertain/discard`，服务层机械映射为最终写入动作。
+- 每条候选都会经过 exact hash、canonical key/category、pgvector 相关记忆检索和 PostgreSQL 有界候选检索，再由独立的第二次 Memory Judge 判断 `independent/equivalent/refinement/replacement/uncertain/discard`，服务层机械映射为最终写入动作。
 - 向量相似度只用于有界 top-K 排序，不设关系阈值，也不触发自动语义合并。`refinement/replacement` 继承目标记忆的注入层、槽位和 canonical key；只有 `independent` 按候选自身分类决定固定注入或按需召回。
 - Judge 失败、目标非法或缺失时 fail-closed；通过后仍需接受 evidence、敏感信息、目标归属、exact hash、revision、唯一约束和事务校验。
-- PostgreSQL 始终是长期记忆权威源；Qdrant 写入是 best-effort，Celery Beat 每日修复 missing/stale memory point。
+- PostgreSQL 是长期记忆及其 embedding 的唯一存储；Celery Beat 每日检查 active memory 的缺失或无效 embedding，并可回填。
 
 Celery durable job、幂等键、租约 fencing、指数退避和 Beat 扫描恢复覆盖主要异步失败窗口。SSE 会话保留 Agent、检索、LLM 与消息之间的 provenance，统一质量门禁覆盖迁移、后端回归、Python 编译、前端构建和 Compose 校验。
 
@@ -73,10 +73,8 @@ flowchart LR
     Services --> Redis[(Redis: cache / broker)]
     Services --> MinIO[(MinIO: source files)]
     RAG --> PG
-    RAG --> Qdrant[(Qdrant)]
     Memory --> PG
     Memory --> Redis
-    Memory --> Qdrant
     RAG --> Embedding[OpenAI-compatible Embedding]
     Memory --> Embedding
     Memory --> LLM
@@ -85,14 +83,13 @@ flowchart LR
     Beat[Celery Beat] --> Redis
     Worker --> PG
     Worker --> MinIO
-    Worker --> Qdrant
 ```
 
 系统包含三条主要数据链路：
 
-1. **文档入库**：上传原文到 MinIO，保存文档元数据，由 Celery 解析、切分、生成向量，并写入 PostgreSQL 与 Qdrant。
+1. **文档入库**：上传原文到 MinIO，保存文档元数据，由 Celery 解析、切分、生成 embedding，并与 chunk 一起写入 PostgreSQL。
 2. **对话执行**：提交用户消息，固定加载核心画像与获准的会话上下文；模型直接回答或按需多次调用 Memory/RAG，直到信息充分或达到预算。
-3. **回答后记忆更新**：第一阶段只提取候选，系统按候选检索 Qdrant 与 PostgreSQL 旧记忆，第二阶段逐条裁决，最后由后端确定性规则和数据库事务决定是否落库。
+3. **回答后记忆更新**：第一阶段只提取候选，系统按候选检索 PostgreSQL 中的相关旧记忆，第二阶段逐条裁决，最后由后端确定性规则和数据库事务决定是否落库。
 
 完整时序、事务边界、失败语义和数据模型见 [Agent 与记忆模块深度设计](docs/agent_memory_deep_dive.md)。
 
@@ -106,7 +103,7 @@ flowchart LR
 | Agent trajectory | 25 个项目 golden cases × 3 轮 | 严格轨迹 **98.67%（74/75）**、工具类型 **100%** | 直接回答、Memory/RAG 选择与多次检索 |
 | RGB-derived Reader | 100 题分层子集 | 综合成功率 **84%**、官方答案命中 **88%**、引用精确率 **99%** | 给定文档后的读取鲁棒性 |
 | LongMemEval-S Reader | 30 题、14,841 个历史 turn | Turn Recall Any@5 **95.83%**、Recall All@5 **83.33%**、Top-5 QA **83.33%** | 单次长期记忆检索与读取 |
-| 工程质量门禁 | 生产容器依赖与真实 Qdrant | 后端回归 **310/310**、24 个 Alembic revision、前端生产构建与端到端 smoke 全部通过 | 工程可靠性与可部署性 |
+| 工程质量门禁 | 生产容器依赖 | 后端回归 **310/310**、24 个 Alembic revision、前端生产构建与端到端 smoke 全部通过 | 工程可靠性与可部署性 |
 
 主要复现入口：
 
@@ -117,13 +114,13 @@ python scripts/evaluate_rgb_reader.py --per-task 25 --workers 4
 python scripts/evaluate_longmemeval_memory.py --per-type 4 --abstention 6
 ```
 
-`evaluate_rgb_agent_runtime.py` 和 `evaluate_longmemeval_agent_runtime.py` 会走真实生产 Agent/数据库/Qdrant 链路，必须使用隔离的评估数据库与独立 Qdrant collection。不要对生产数据直接运行带 `--allow-database-seed` 的评估命令。
+`evaluate_rgb_agent_runtime.py` 和 `evaluate_longmemeval_agent_runtime.py` 会走真实生产 Agent/数据库/pgvector 链路，必须使用隔离的评估数据库。不要对生产数据直接运行带 `--allow-database-seed` 的评估命令。
 
 ## 技术栈
 
 - 后端：Python 3.12、FastAPI、SQLAlchemy 2、Alembic、Pydantic Settings、LangGraph、LangChain、Celery
 - 前端：React 18、TypeScript、Vite、React Router、React Markdown、Nginx
-- 基础设施：PostgreSQL 16、Redis 7、Qdrant、MinIO、Docker Compose
+- 基础设施：PostgreSQL 16 + pgvector、Redis 7、MinIO、Docker Compose
 - 模型接口：OpenAI-compatible Chat Completions 与 Embeddings
 
 ## 前置条件
@@ -165,7 +162,7 @@ EMBEDDING_MODEL=your-embedding-model
 EMBEDDING_DIMENSION=1024
 ```
 
-`EMBEDDING_DIMENSION` 必须与模型实际输出一致。修改模型或维度后，需要重建对应的 Qdrant collection；文档向量需要重新入库，Memory point 可通过 reconcile 重新生成，不能把旧维度向量直接沿用。
+`EMBEDDING_DIMENSION` 必须与模型实际输出一致。修改模型或维度后，文档需要重新入库，长期记忆需要重新生成 embedding；查询会同时校验模型和维度，不会混用旧向量。
 
 ### 2. 启动开发环境
 
@@ -180,7 +177,7 @@ docker compose -f infra/docker-compose.yml --env-file .env up --build
 | OpenAPI 文档 | http://localhost:8000/docs |
 | 存活检查 | http://localhost:8000/api/health |
 | 就绪检查 | http://localhost:8000/api/ready |
-| Qdrant | http://localhost:6333 |
+| PostgreSQL + pgvector | localhost:5432 |
 | MinIO Console | http://localhost:9001 |
 
 停止服务：
@@ -209,7 +206,7 @@ python scripts/smoke_demo.py
 - [`.env.production.example`](.env.production.example)：生产参考模板，敏感项均为待替换占位符。
 - [`config.py`](apps/backend/app/core/config.py)：后端配置类型、默认值、范围及跨参数校验的权威定义。
 
-主要配置组包括应用与 CORS、PostgreSQL 连接池、Redis、Qdrant、MinIO、LLM、Embedding、Agent 并发与超时、混合检索、上下文压缩、短期/长期记忆、增量摘要、Celery 恢复、数据保留、文档切分和认证。
+主要配置组包括应用与 CORS、PostgreSQL/pgvector 连接池、Redis、MinIO、LLM、Embedding、Agent 并发与超时、混合检索、上下文压缩、短期/长期记忆、增量摘要、Celery 恢复、数据保留、文档切分和认证。
 
 当前模板中的关键运行默认值：
 
@@ -220,7 +217,7 @@ python scripts/smoke_demo.py
 | `AGENT_MAX_MEMORY_CALLS` / `AGENT_MAX_RAG_CALLS` | 2 / 3 | 分工具声明预算；执行入口二次硬校验仍待补充 |
 | `RETRIEVAL_TOP_K` / `RETRIEVAL_ROUTE_LIMIT` | 6 / 15 | 最终证据数 / 每条检索路线候选深度 |
 | `SHORT_MEMORY_MAX_MESSAGES` | 16 | 最近消息缓存窗口 |
-| `MEMORY_VECTOR_INDEX_ENABLED` | true | 回答召回和更新前相关记忆召回均使用 Qdrant |
+| `MEMORY_VECTOR_INDEX_ENABLED` | true | 回答召回和更新前相关记忆召回均使用 pgvector |
 | `MEMORY_SEMANTIC_LIMIT` | 6 | 单次普通长期记忆召回上限 |
 | `MEMORY_CONTEXT_MAX_LONG_MEMORIES` | 10 | 一轮累计结果进入格式化阶段的普通长期记忆上限 |
 | `MEMORY_CONTEXT_MAX_TOKENS` | 1600 | 完整 Memory context 独立预算 |
@@ -246,7 +243,7 @@ npm --prefix apps/frontend ci
 python scripts/check_project.py
 ```
 
-该命令当前运行 310 项后端回归、Python `compileall`、完整 Alembic 迁移验证、TypeScript/Vite 构建，以及开发与生产 Compose 配置校验。2026-07-15 在生产容器依赖和真实 Qdrant 下完整回归为 **310/310**；GitHub Actions 还会实际构建生产前端镜像，执行 Nginx 参数 preflight 和 `nginx -t`。服务已启动时可追加端到端冒烟测试：
+该命令当前运行 310 项后端回归、Python `compileall`、完整 Alembic 迁移验证、TypeScript/Vite 构建，以及开发与生产 Compose 配置校验。2026-07-15 的生产容器回归为 **310/310**；GitHub Actions 还会实际构建生产前端镜像，执行 Nginx 参数 preflight 和 `nginx -t`。服务已启动时可追加端到端冒烟测试：
 
 ```bash
 python scripts/check_project.py --with-smoke
@@ -267,11 +264,11 @@ docker compose -f infra/docker-compose.prod.yml --env-file .env up --build -d
 上线前至少完成以下工作：
 
 - 使用密钥管理服务注入 PostgreSQL、MinIO、JWT、LLM 与 Embedding 凭据，并建立轮换流程。
-- 在受控入口部署 TLS、精确 CORS、边缘限流/WAF；不要直接暴露数据库、Redis、Qdrant 或 MinIO 管理端口。
+- 在受控入口部署 TLS、精确 CORS、边缘限流/WAF；不要直接暴露数据库、Redis 或 MinIO 管理端口。
 - 只向外发布前端/Nginx 入口，保持 backend 在内部网络，防止绕过代理限制与安全策略。
 - 将刷新令牌迁移到 `Secure`、`HttpOnly`、适当 `SameSite` 的 Cookie，并评估 SSO/OIDC、MFA 与管理员治理。
 - 建立集中日志、指标、分布式追踪、告警、审计归档和敏感数据脱敏。
-- 为 PostgreSQL、MinIO、Qdrant 和 Redis 制定备份、恢复演练、保留周期和跨区域灾备策略。
+- 为 PostgreSQL、MinIO 和 Redis 制定备份、恢复演练、保留周期和跨区域灾备策略。
 - 固定并扫描容器镜像与依赖版本，补充 SBOM、漏洞扫描、文件恶意内容检测和供应链策略。
 - 在真实基础设施上完成权限、并发、队列恢复、负载、故障注入和数据恢复测试。
 
@@ -305,7 +302,7 @@ scripts/            质量门禁、迁移校验、冒烟演示与评估脚本
 ## 提醒
 
 - 当前没有启用 cross-encoder reranker；每次 `rag(query)` 使用 Dense、BM25 与无权重 RRF 融合。
-- Qdrant Memory index 是 best-effort 派生索引；不可用时只回退到有界 PostgreSQL 候选，极旧且不在候选窗口中的普通记忆可能漏召回。
+- pgvector 记忆查询异常时会回退到有界 PostgreSQL 候选，极旧且不在候选窗口中的普通记忆可能漏召回。
 - 记忆只用于用户偏好、风格和对话连续性，不能作为企业事实证据。
 - Agent 会在模型调用前移除已耗尽预算的工具，但工具执行入口尚未实施第二道硬预算校验；兼容模型若重复输出历史 tool call，可能越过声明的分工具预算，详见量化结果文档。
 - Agent 流式并发限制按 Uvicorn 进程生效，不是跨副本的全局配额。

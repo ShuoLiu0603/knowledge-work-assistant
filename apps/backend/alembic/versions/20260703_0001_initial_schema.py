@@ -116,13 +116,11 @@ def upgrade() -> None:
         sa.Column("title_path", sa.Text()),
         sa.Column("page_number", sa.Integer()),
         sa.Column("section_name", sa.Text()),
-        sa.Column("qdrant_point_id", sa.String(length=36), nullable=False),
         sa.Column("metadata", sa.JSON(), nullable=False, server_default=sa.text("'{}'")),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
     )
     op.create_index("ix_chunks_document_id", "document_chunks", ["document_id"])
     op.create_index("ix_chunks_kb_id", "document_chunks", ["knowledge_base_id"])
-    op.create_index("ix_chunks_qdrant_point_id", "document_chunks", ["qdrant_point_id"])
 
     op.create_table(
         "conversations",

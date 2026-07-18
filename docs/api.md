@@ -38,7 +38,7 @@ Authorization: Bearer <access_token>
 | Method | Path | 说明 |
 |---|---|---|
 | GET | `/api/health` | 进程存活检查，只表示 FastAPI 可响应 |
-| GET | `/api/ready` | 依赖就绪检查，覆盖 database、redis、qdrant、minio 和 Celery worker |
+| GET | `/api/ready` | 依赖就绪检查，覆盖 database、redis、pgvector、minio 和 Celery worker |
 
 `/api/ready` 在任一依赖异常时返回 `503`，响应体会包含每个依赖的状态和错误摘要。
 
@@ -65,9 +65,9 @@ Authorization: Bearer <access_token>
 | DELETE | `/api/documents/{document_id}` | 删除文档和对应向量 |
 | GET | `/api/documents/{document_id}/chunks` | 查看文档切分后的 chunk |
 
-当前支持的主要演示格式包括 PDF、DOCX、TXT、MD、CSV。上传后由 worker 执行解析、切分、Embedding 和 Qdrant upsert。同一知识库内重复上传相同文件内容会返回 `409`，避免重复入库和重复向量。
+当前支持的主要演示格式包括 PDF、DOCX、TXT、MD、CSV。上传后由 worker 执行解析、切分、Embedding，并将 embedding 与 chunk 一起写入 PostgreSQL。同一知识库内重复上传相同文件内容会返回 `409`，避免重复入库和重复向量。
 
-文档密级会写入 `documents.security_level`、`document_chunks.security_level` 和 Qdrant payload 的 `security_level`。所有知识库 chunk 共享 `QDRANT_COLLECTION`，并在公开/部门知识库检索时通过 payload filter 限制 `security_level <= current_user.security_level`。默认启用、可通过配置关闭的长期记忆向量索引使用独立的 `MEMORY_QDRANT_COLLECTION`。
+文档密级会写入 `documents.security_level` 和 `document_chunks.security_level`。Dense 查询在 PostgreSQL 中按知识库、owner、文档状态、模型/维度和 `security_level <= current_user.security_level` 共同过滤后，再以 pgvector 排序。长期记忆 embedding 存在 `user_memories` 行中，并按 active 状态、用户、模型和维度过滤。
 私人知识库的 owner/editor 可以上传和删除文档，上传时后端统一使用默认密级；部门知识库需要 owner/editor 或管理员维护；公开知识库的文档只能由管理员维护。越权调用会返回 `403`，并写入审计日志。
 
 ## 问答与会话
@@ -114,7 +114,7 @@ Agent trace 用于展示模型步骤、`memory(query)` / `rag(query)` 工具调�
 | GET | `/api/memories` | 当前用户长期记忆列表，可按 `status` 过滤 |
 | GET | `/api/memories/export` | 导出当前用户的记忆、记忆事件、召回日志和异步更新任务 |
 | GET | `/api/memories/recall-metrics` | 当前用户记忆召回质量聚合指标 |
-| POST | `/api/memories/reconcile` | 检查记忆重复与 Qdrant 索引漂移，支持 dry-run/apply |
+| POST | `/api/memories/reconcile` | 检查记忆重复及缺失/无效 embedding，支持 dry-run/apply |
 | GET | `/api/memories/update-jobs` | 当前用户异步记忆更新任务列表，可按 `status` 过滤 |
 | POST | `/api/memories/update-jobs/{job_id}/retry` | 重试 queued 或 failed 记忆更新任务 |
 | POST | `/api/memories` | 手动创建长期记忆 |
@@ -141,7 +141,7 @@ Agent trace 用于展示模型步骤、`memory(query)` / `rag(query)` 工具调�
 | GET | `/api/admin/users` | 管理员查看用户安全级别、部门和状态 |
 | PATCH | `/api/admin/users/{user_id}` | 管理员更新用户 `security_level`、`department_id`、`is_active` 或 `is_admin` |
 | GET | `/api/admin/audit-logs` | 查看关键操作审计；管理员看全局，普通用户看自己的记录 |
-| GET | `/api/admin/external-cleanup-jobs` | 管理员查看 MinIO/Qdrant 外部清理任务 |
+| GET | `/api/admin/external-cleanup-jobs` | 管理员查看 MinIO 外部清理任务 |
 | POST | `/api/admin/external-cleanup-jobs/{job_id}/retry` | 重试可恢复的外部清理任务 |
 | POST | `/api/admin/retention/run` | 预览或执行运营数据保留策略 |
 

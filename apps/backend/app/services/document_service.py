@@ -366,7 +366,6 @@ def to_chunk_read(chunk: DocumentChunk) -> DocumentChunkRead:
         knowledge_base_id=chunk.knowledge_base_id,
         chunk_index=chunk.chunk_index,
         content=chunk.content,
-        qdrant_point_id=chunk.qdrant_point_id,
         token_count=chunk.token_count,
         title_path=chunk.title_path,
         page_number=chunk.page_number,

@@ -164,7 +164,10 @@ def ensure_runtime_schema(engine: Engine) -> None:
 
     content_tsv_type = "TSVECTOR" if dialect == "postgresql" else "TEXT"
     add_column_if_missing(engine, inspector, "document_chunks", "content_tsv", f"content_tsv {content_tsv_type}")
-    add_column_if_missing(engine, inspector, "document_chunks", "qdrant_point_id", "qdrant_point_id VARCHAR(36)")
+    vector_type = "VECTOR" if dialect == "postgresql" else "JSON"
+    add_column_if_missing(engine, inspector, "document_chunks", "embedding", f"embedding {vector_type}")
+    add_column_if_missing(engine, inspector, "document_chunks", "embedding_model", "embedding_model VARCHAR(100) NOT NULL DEFAULT ''")
+    add_column_if_missing(engine, inspector, "document_chunks", "embedding_dimension", "embedding_dimension INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(
         engine,
         inspector,
@@ -195,7 +198,6 @@ def ensure_runtime_schema(engine: Engine) -> None:
     )
 
     with engine.begin() as connection:
-        connection.execute(text("UPDATE document_chunks SET qdrant_point_id = id WHERE qdrant_point_id IS NULL"))
         connection.execute(text("UPDATE user_memories SET kind = 'profile' WHERE kind = 'project'"))
         connection.execute(
             text(

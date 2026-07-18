@@ -56,7 +56,7 @@ Do not omit the `beat` service when deploying asynchronous memory updates. Run e
 - Celery Beat redispatches memory jobs with expired processing leases, missing dispatch records, or explicit broker dispatch failures. Dispatch claims are fenced so consecutive scans do not create a delivery storm.
 - Beat also recovers completed Agent runs whose assistant message was committed before the deferred memory job could be created. Memory jobs are unique per user message, so recovery is idempotent.
 - Conversation summaries run as Celery tasks and use a token-fenced Redis lease per conversation, preventing concurrent deliveries from issuing duplicate LLM calls. Beat scans persisted summary cursors and redispatches eligible conversations, so a lost in-process or broker dispatch is recovered without losing committed messages.
-- Document, knowledge-base, and permanent memory deletion record an `external_cleanup_jobs` task for Qdrant points and MinIO objects. Cleanup jobs use atomic leases; queued, failed, and expired-processing jobs are recovered automatically and mirrored to audit logs.
+- Document and knowledge-base deletion record an `external_cleanup_jobs` task for MinIO objects. PostgreSQL cascades remove associated chunk embeddings, and permanent-memory deletion removes its row in the same database. Cleanup jobs use atomic leases; queued, failed, and expired-processing jobs are recovered automatically and mirrored to audit logs.
 - Admins can inspect and retry cleanup tasks through `GET /api/admin/external-cleanup-jobs` and `POST /api/admin/external-cleanup-jobs/{job_id}/retry`.
 - Operational retention is configurable through `*_RETENTION_DAYS` settings. Admins can preview or apply it from the Admin Retention tab or through `POST /api/admin/retention/run?dry_run=true|false`.
 - Production conversation serialization is fail-closed: when Redis is unavailable, a new turn returns `503` instead of falling back to a process-local lock that is unsafe across multiple Uvicorn workers.
@@ -84,8 +84,8 @@ Retention values use days. Setting an individual `*_RETENTION_DAYS` value to `0`
 ### Health Checks
 
 - `GET /api/health` is process liveness only.
-- `GET /api/ready` verifies PostgreSQL, Redis, Qdrant, MinIO, and that a Celery worker answers ping. Use this endpoint for load-balancer and backend container readiness checks.
-- Beat is a separate required process and is not covered by backend readiness. Monitor it and confirm the logs show `recover-stale-memory-update-jobs`, `recover-deferred-agent-memory-updates`, `recover-stale-conversation-summaries`, `recover-stale-external-cleanup-jobs`, `apply-operational-retention-daily`, and `reconcile-memory-vector-indexes-daily`.
+- `GET /api/ready` verifies PostgreSQL, pgvector, Redis, MinIO, and that a Celery worker answers ping. Use this endpoint for load-balancer and backend container readiness checks.
+- Beat is a separate required process and is not covered by backend readiness. Monitor it and confirm the logs show `recover-stale-memory-update-jobs`, `recover-deferred-agent-memory-updates`, `recover-stale-conversation-summaries`, `recover-stale-external-cleanup-jobs`, `apply-operational-retention-daily`, and `reconcile-memory-embeddings-daily`.
 
 After deployment, verify the service state and readiness:
 

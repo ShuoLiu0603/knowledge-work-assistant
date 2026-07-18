@@ -59,35 +59,41 @@ class SecurityLevelTests(unittest.TestCase):
             self.assertEqual({item.chunk.file_name for item in low_bm25}, {"public-policy.md"})
             self.assertEqual({item.chunk.file_name for item in high_bm25}, {"public-policy.md", "secret-policy.md"})
 
-    def test_vector_search_uses_single_collection_with_security_filter(self) -> None:
-        captured_queries = []
-
+    def test_vector_search_filters_by_owner_knowledge_base_and_security_level(self) -> None:
         class FakeEmbeddingProvider:
             def embed_text(self, _text: str) -> list[float]:
-                return [0.1, 0.2, 0.3]
+                return [1.0, 0.0, 0.0]
 
-        class FakeQdrantClient:
-            def query_points(self, **kwargs):
-                captured_queries.append(kwargs)
-                return SimpleNamespace(points=[])
+        with isolated_session() as session:
+            owner = create_user(session, "dense-security-owner@example.com", "Dense Security Owner")
+            kb = create_knowledge_base(session, owner.id, KnowledgeBaseCreate(name="Dense Security KB"))
+            public_document = make_document(kb.id, "public-dense.md", "dense-public", security_level=1)
+            secret_document = make_document(kb.id, "secret-dense.md", "dense-secret", security_level=4)
+            session.add_all([public_document, secret_document])
+            session.flush()
+            public_chunk = make_chunk(public_document, "public policy", security_level=1)
+            secret_chunk = make_chunk(secret_document, "secret policy", security_level=4)
+            for chunk, embedding in ((public_chunk, [1.0, 0.0, 0.0]), (secret_chunk, [0.9, 0.1, 0.0])):
+                chunk.embedding = embedding
+                chunk.embedding_model = "fake"
+                chunk.embedding_dimension = len(embedding)
+            session.add_all([public_chunk, secret_chunk])
+            session.commit()
 
-        with (
-            patch("app.rag.vector_store.ensure_qdrant_collection"),
-            patch(
-                "app.rag.vector_store.get_settings",
-                return_value=SimpleNamespace(qdrant_collection="knowledge_chunks"),
-            ),
-            patch("app.rag.vector_store.get_embedding_provider", return_value=FakeEmbeddingProvider()),
-            patch("app.rag.vector_store.get_qdrant_client", return_value=FakeQdrantClient()),
-        ):
-            search_knowledge_base_chunks("owner-id", "kb-id", "policy", limit=3, max_security_level=2)
+            with (
+                patch("app.rag.vector_store.get_settings", return_value=SimpleNamespace(embedding_model="fake")),
+                patch("app.rag.vector_store.get_embedding_provider", return_value=FakeEmbeddingProvider()),
+            ):
+                hits = search_knowledge_base_chunks(
+                    session,
+                    owner.id,
+                    kb.id,
+                    "policy",
+                    limit=3,
+                    max_security_level=2,
+                )
 
-        query_filter = captured_queries[-1]["query_filter"].model_dump(exclude_none=True)
-        self.assertEqual(captured_queries[-1]["collection_name"], "knowledge_chunks")
-        self.assertEqual(captured_queries[-1]["limit"], 3)
-        self.assertIn({"key": "knowledge_base_id", "match": {"value": "kb-id"}}, query_filter["must"])
-        self.assertIn({"key": "security_level", "range": {"lte": 2.0}}, query_filter["should"])
-        self.assertIn({"is_empty": {"key": "security_level"}}, query_filter["should"])
+            self.assertEqual([hit.chunk_id for hit in hits], [public_chunk.id])
 
     def test_admin_can_update_user_security_level(self) -> None:
         with isolated_session() as session:
@@ -254,7 +260,6 @@ def make_chunk(document: Document, content: str, security_level: int) -> Documen
         chunk_index=0,
         content=content,
         token_count=len(content.split()),
-        qdrant_point_id=f"point-{document.id}",
         security_level=security_level,
     )
 

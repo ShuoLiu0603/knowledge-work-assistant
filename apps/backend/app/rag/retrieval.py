@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy.orm import Session
+
 from app.core.config import get_settings
 from app.rag.vector_store import search_knowledge_base_chunks
 
@@ -25,6 +27,7 @@ class RetrievedChunk:
 
 
 def retrieve_dense_chunks(
+    db: Session,
     owner_id: str,
     kb_id: str,
     question: str,
@@ -33,7 +36,14 @@ def retrieve_dense_chunks(
 ) -> list[RetrievedChunk]:
     settings = get_settings()
     limit = top_k or settings.retrieval_top_k
-    hits = search_knowledge_base_chunks(owner_id, kb_id, question, limit=limit, max_security_level=max_security_level)
+    hits = search_knowledge_base_chunks(
+        db,
+        owner_id,
+        kb_id,
+        question,
+        limit=limit,
+        max_security_level=max_security_level,
+    )
     return [to_retrieved_chunk(hit.payload, hit.score) for hit in hits if hit.payload.get("content")]
 
 

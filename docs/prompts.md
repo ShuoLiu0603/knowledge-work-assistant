@@ -61,7 +61,7 @@ Memory 上下文压缩必须保留受保护的核心画像 source ID；RAG 压�
 
 第一阶段 Candidate Extractor 只接收当前 user/assistant turn；现有记忆区段强制为空。它只能提出零到多条候选，不得指定 target memory id，也不得决定 update/supersede。
 
-每条候选都会先通过 exact hash、canonical key/category、Qdrant 全量语义检索和 PostgreSQL 有界回退加载相关旧记忆，再强制交给第二阶段 Memory Judge。Judge 只能输出一个 `independent/equivalent/refinement/replacement/uncertain/discard` 关系；需要目标的关系只能引用本次相关记忆集合中的 ID。Judge 缺失、异常或返回非法目标时 fail-closed，不写长期记忆。
+每条候选都会先通过 exact hash、canonical key/category、PostgreSQL pgvector 语义检索和有界候选回退加载相关旧记忆，再强制交给第二阶段 Memory Judge。Judge 只能输出一个 `independent/equivalent/refinement/replacement/uncertain/discard` 关系；需要目标的关系只能引用本次相关记忆集合中的 ID。Judge 缺失、异常或返回非法目标时 fail-closed，不写长期记忆。
 
 第二模型通过后，证据归属、敏感信息、目标归属、exact hash、乐观并发、唯一约束和最终数据库操作仍由服务层决定；模型不能物理删除记忆，向量分数也不能覆盖 Judge 的关系裁决。
 

@@ -17,7 +17,7 @@ from app.memory.types import MemoryAction
 from app.services import memory_service
 from app.workers.memory_tasks import (
     process_memory_update_job,
-    reconcile_memory_vector_indexes,
+    reconcile_memory_embeddings,
     reconcile_user_memory_task,
 )
 from helpers import create_user, isolated_session
@@ -283,7 +283,7 @@ class MemoryTaskTests(unittest.TestCase):
             self.assertEqual(result["findings"], [])
             reconcile.assert_called_once_with(session, user.id, apply=False, llm_review=False)
 
-    def test_periodic_memory_vector_reconcile_repairs_all_users(self) -> None:
+    def test_periodic_memory_embedding_reconcile_repairs_all_users(self) -> None:
         with isolated_session() as session:
             user = create_user(session, "memory-vector-reconcile@example.com", "Memory Vector Reconcile")
             memory = UserMemory(
@@ -305,15 +305,11 @@ class MemoryTaskTests(unittest.TestCase):
                 patch("app.workers.memory_tasks.init_db"),
                 patch("app.workers.memory_tasks.SessionLocal", return_value=session),
                 patch(
-                    "app.workers.memory_tasks.get_settings",
-                    return_value=SimpleNamespace(memory_vector_index_enabled=True),
-                ),
-                patch(
-                    "app.workers.memory_tasks.memory_reconcile.reconcile_vector_index",
+                    "app.workers.memory_tasks.memory_reconcile.reconcile_memory_embeddings",
                     return_value=[finding],
                 ) as reconcile,
             ):
-                result = reconcile_memory_vector_indexes()
+                result = reconcile_memory_embeddings()
 
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["user_count"], 1)

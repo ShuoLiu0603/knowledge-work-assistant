@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models.user_memory import UserMemory
-from app.memory import events, policy, retrieval, vector_index
+from app.memory import embedding, events, policy, retrieval
 
 
 @dataclass(frozen=True)
@@ -85,10 +85,7 @@ def reconcile_user_memories(
 
     if apply and changed:
         db.commit()
-        for memory in changed:
-            db.refresh(memory)
-            vector_index.try_sync_memory_vector(memory)
-    findings.extend(reconcile_vector_index(db, user_id, apply=apply))
+    findings.extend(reconcile_memory_embeddings(db, user_id, apply=apply))
 
     return MemoryReconcileReport(
         user_id=user_id,
@@ -110,161 +107,58 @@ def list_reconcile_candidates(db: Session, user_id: str) -> list[UserMemory]:
     ).all()
 
 
-def list_vector_reconcile_candidates(db: Session, user_id: str) -> list[UserMemory]:
-    return db.scalars(
+def reconcile_memory_embeddings(db: Session, user_id: str, *, apply: bool) -> list[MemoryReconcileFinding]:
+    if not get_settings().memory_vector_index_enabled:
+        return []
+
+    memories = db.scalars(
         select(UserMemory)
-        .where(UserMemory.user_id == user_id)
+        .where(UserMemory.user_id == user_id, UserMemory.status == "active")
         .order_by(UserMemory.last_touched_at.desc(), UserMemory.updated_at.desc(), UserMemory.created_at.desc())
     ).all()
-
-
-def reconcile_vector_index(db: Session, user_id: str, *, apply: bool) -> list[MemoryReconcileFinding]:
-    if not vector_index.is_memory_vector_index_enabled():
-        return []
-
-    memories = list_vector_reconcile_candidates(db, user_id)
-    if not memories:
-        return []
-
-    try:
-        payloads = vector_index.get_memory_vector_payloads([memory.id for memory in memories])
-    except Exception as exc:
-        return [
-            MemoryReconcileFinding(
-                finding_type="vector_index_unavailable",
-                severity="medium",
-                memory_id=memories[0].id,
-                related_memory_id=None,
-                proposed_action="retry_vector_reconcile",
-                reason="memory vector index could not be inspected",
-                applied=False,
-                metadata={"error": str(exc)},
-            )
-        ]
     findings: list[MemoryReconcileFinding] = []
-    applied_events = 0
+    changed = False
     for memory in memories:
-        payload = payloads.get(memory.id)
-        expected_present = should_memory_have_vector(memory)
-        if expected_present and payload is None:
-            applied = sync_memory_vector_from_reconcile(db, memory, apply=apply, reason="memory vector is missing")
-            applied_events += int(applied)
-            findings.append(
-                MemoryReconcileFinding(
-                    finding_type="missing_vector",
-                    severity="medium",
-                    memory_id=memory.id,
-                    related_memory_id=None,
-                    proposed_action="sync_vector",
-                    reason="memory should have a vector index point but none was found",
-                    applied=applied,
-                    metadata={"status": memory.status, "revision": memory.revision},
-                )
-            )
+        if memory.embedding and len(memory.embedding) == memory.embedding_dimension:
             continue
 
-        if not expected_present and payload is not None:
-            applied = delete_memory_vector_from_reconcile(db, memory, apply=apply, reason="memory vector should be absent")
-            applied_events += int(applied)
-            findings.append(
-                MemoryReconcileFinding(
-                    finding_type="stale_vector",
-                    severity="medium",
-                    memory_id=memory.id,
-                    related_memory_id=None,
-                    proposed_action="delete_vector",
-                    reason="memory should not have a vector index point",
-                    applied=applied,
-                    metadata={"status": memory.status, "revision": memory.revision},
+        applied = False
+        metadata: dict[str, Any] = {"status": memory.status, "revision": memory.revision}
+        if apply:
+            try:
+                generated = embedding.embed_memory_text(memory.normalized_content or memory.content)
+                memory.embedding = generated.vector
+                memory.embedding_model = generated.model
+                memory.embedding_dimension = generated.dimension
+                db.add(memory)
+                events.record_memory_event(
+                    db,
+                    memory,
+                    "embedding_backfill",
+                    reason="active memory embedding was missing or invalid",
+                    previous_status=memory.status,
+                    new_status=memory.status,
+                    payload={"embedding_reconcile": True},
                 )
+                applied = True
+                changed = True
+            except Exception as exc:
+                metadata["error"] = str(exc)
+        findings.append(
+            MemoryReconcileFinding(
+                finding_type="missing_embedding",
+                severity="medium",
+                memory_id=memory.id,
+                related_memory_id=None,
+                proposed_action="backfill_embedding",
+                reason="active memory has no usable pgvector embedding",
+                applied=applied,
+                metadata=metadata,
             )
-            continue
-
-        if expected_present and payload is not None:
-            mismatches = vector_payload_mismatches(memory, payload)
-            if not mismatches:
-                continue
-            applied = sync_memory_vector_from_reconcile(db, memory, apply=apply, reason="memory vector payload is stale")
-            applied_events += int(applied)
-            findings.append(
-                MemoryReconcileFinding(
-                    finding_type="stale_vector_payload",
-                    severity="low",
-                    memory_id=memory.id,
-                    related_memory_id=None,
-                    proposed_action="sync_vector",
-                    reason="memory vector payload does not match the database row",
-                    applied=applied,
-                    metadata={"mismatches": mismatches},
-                )
-            )
-
-    if apply and applied_events:
+        )
+    if changed:
         db.commit()
     return findings
-
-
-def should_memory_have_vector(memory: UserMemory) -> bool:
-    return vector_index.should_index_memory(memory)
-
-
-def vector_payload_mismatches(memory: UserMemory, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    expected = vector_index.memory_payload(memory)
-    checked_fields = (
-        "status",
-        "kind",
-        "category",
-        "canonical_key",
-        "memory_layer",
-        "profile_slot",
-        "scope_type",
-        "scope_id",
-        "pinned",
-        "revision",
-        "expires_at",
-        "content_hash",
-        "embedding_model",
-        "embedding_dimension",
-    )
-    return {
-        field_name: {"expected": expected.get(field_name), "actual": payload.get(field_name)}
-        for field_name in checked_fields
-        if payload.get(field_name) != expected.get(field_name)
-    }
-
-
-def sync_memory_vector_from_reconcile(db: Session, memory: UserMemory, *, apply: bool, reason: str) -> bool:
-    if not apply:
-        return False
-    if not vector_index.try_sync_memory_vector(memory):
-        return False
-    events.record_memory_event(
-        db,
-        memory,
-        "vector_sync",
-        reason=reason,
-        previous_status=memory.status,
-        new_status=memory.status,
-        payload={"vector_reconcile": True},
-    )
-    return True
-
-
-def delete_memory_vector_from_reconcile(db: Session, memory: UserMemory, *, apply: bool, reason: str) -> bool:
-    if not apply:
-        return False
-    if not vector_index.try_delete_memory_vector(memory.id):
-        return False
-    events.record_memory_event(
-        db,
-        memory,
-        "vector_delete",
-        reason=reason,
-        previous_status=memory.status,
-        new_status=memory.status,
-        payload={"vector_reconcile": True},
-    )
-    return True
 
 
 def reconcile_exact_duplicates(

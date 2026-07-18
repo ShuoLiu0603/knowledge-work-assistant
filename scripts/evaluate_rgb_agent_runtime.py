@@ -31,13 +31,6 @@ from app.db.session import SessionLocal
 from app.evaluation.p0_metrics import answer_groups_match, citation_scores, official_rgb_answer_match
 from app.llm.provider import get_llm_provider
 from app.rag.embeddings import get_embedding_provider
-from app.rag.vector_store import (
-    chunk_payload,
-    embedding_text,
-    ensure_qdrant_collection,
-    get_qdrant_client,
-    qdrant_models,
-)
 from scripts.evaluate_rgb_reader import (
     DEFAULT_DATA_DIR,
     TASK_FILES,
@@ -96,7 +89,6 @@ def main() -> int:
         print(json.dumps(summary, ensure_ascii=True, indent=2))
     finally:
         cleanup_cases(cases)
-        cleanup_qdrant_collection()
     return 0
 
 
@@ -105,8 +97,6 @@ def validate_evaluation_targets() -> None:
     database_name = (make_url(settings.database_url).database or "").casefold()
     if "eval" not in database_name and not settings.database_url.startswith("sqlite"):
         raise RuntimeError("The evaluation database name must contain 'eval'.")
-    if "eval" not in settings.qdrant_collection.casefold():
-        raise RuntimeError("The evaluation Qdrant collection name must contain 'eval'.")
 
 
 def stable_uuid(value: str) -> str:
@@ -121,7 +111,6 @@ def attach_storage(cases: list[dict]) -> None:
         for index, document in enumerate(case["documents"], start=1):
             document["document_id"] = stable_uuid(f"document:{case_id}:{index}")
             document["chunk_id"] = stable_uuid(f"chunk:{case_id}:{index}")
-            document["point_id"] = stable_uuid(f"point:{case_id}:{index}")
             document["file_name"] = f"rgb-{index}.md"
             document["embedding_hash"] = hashlib.sha256(
                 embedding_source(document).encode("utf-8")
@@ -182,7 +171,7 @@ def load_embedding_cache(path: Path) -> dict[str, list[float]]:
 
 
 def seed_cases(cases: list[dict], vectors: dict[str, list[float]]) -> None:
-    reset_qdrant_collection()
+    settings = get_settings()
     with SessionLocal() as db:
         cleanup_cases(cases, db=db)
         for case in cases:
@@ -212,6 +201,7 @@ def seed_cases(cases: list[dict], vectors: dict[str, list[float]]) -> None:
                 )
             )
             for index, item in enumerate(case["documents"], start=1):
+                vector = vectors[item["embedding_hash"]]
                 db.add(
                     Document(
                         id=item["document_id"],
@@ -237,7 +227,9 @@ def seed_cases(cases: list[dict], vectors: dict[str, list[float]]) -> None:
                         chunk_index=0,
                         content=item["text"],
                         token_count=0,
-                        qdrant_point_id=item["point_id"],
+                        embedding=vector,
+                        embedding_model=settings.embedding_model,
+                        embedding_dimension=len(vector),
                         security_level=1,
                         extra_metadata={
                             "rgb_index": index,
@@ -248,48 +240,7 @@ def seed_cases(cases: list[dict], vectors: dict[str, list[float]]) -> None:
                     )
                 )
         db.commit()
-        seed_qdrant_points(db, cases, vectors)
     print(f"RGB Agent seed complete: {len(cases)} cases", flush=True)
-
-
-def seed_qdrant_points(db, cases: list[dict], vectors: dict[str, list[float]]) -> None:
-    client = get_qdrant_client()
-    models = qdrant_models()
-    points = []
-    for case in cases:
-        for item in case["documents"]:
-            document = db.get(Document, item["document_id"])
-            chunk = db.get(DocumentChunk, item["chunk_id"])
-            source = embedding_text(document, chunk)
-            if source != embedding_source(item):
-                raise RuntimeError("RGB embedding source does not match production ingestion format")
-            points.append(
-                models.PointStruct(
-                    id=item["point_id"],
-                    vector=vectors[item["embedding_hash"]],
-                    payload=chunk_payload(document, chunk),
-                )
-            )
-    for index in range(0, len(points), 100):
-        client.upsert(
-            collection_name=get_settings().qdrant_collection,
-            points=points[index : index + 100],
-            wait=True,
-        )
-
-
-def reset_qdrant_collection() -> None:
-    cleanup_qdrant_collection()
-    ensure_qdrant_collection()
-
-
-def cleanup_qdrant_collection() -> None:
-    collection_name = get_settings().qdrant_collection
-    if "eval" not in collection_name.casefold():
-        return
-    client = get_qdrant_client()
-    if client.collection_exists(collection_name):
-        client.delete_collection(collection_name=collection_name)
 
 
 def cleanup_cases(cases: list[dict], db=None) -> None:

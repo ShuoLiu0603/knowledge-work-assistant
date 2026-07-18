@@ -11,14 +11,14 @@
 5. 文本清洗后进入 chunk splitter。
 6. chunk 写入 `document_chunks`。
 7. Embedding Provider 生成向量。
-8. Qdrant upsert 向量点，payload 包含 `knowledge_base_id`、`document_id`、`chunk_id`、`file_name`、`security_level` 和 metadata。
+8. 将 embedding、模型名和维度与 chunk 一起写入 PostgreSQL 的 pgvector 列。
 
 ## 2. 检索阶段
 
 当前检索包含：
 
 - Agent Query：外层 Agent 每次向 `rag(query)` 提交一条针对当前缺口的独立 query；检索层不再二次改写或拆子问题。
-- Dense Retrieval：从 Qdrant 召回语义相近 chunk，并回 PostgreSQL hydration 再校验状态、范围和密级。
+- Dense Retrieval：在 PostgreSQL 中按授权范围、状态、模型、维度和密级过滤后，使用 pgvector 召回语义相近 chunk；融合前仍回表读取权威 chunk 数据。
 - BM25 Retrieval：用同一条 query 从 PostgreSQL chunk 正文与标题元数据召回词项匹配候选。
 - RRF 融合：按 chunk id 去重，并用无权重 RRF 合并 Dense 与 BM25 排名。
 - Context Compression：压缩过长 chunk，保留更相关片段。

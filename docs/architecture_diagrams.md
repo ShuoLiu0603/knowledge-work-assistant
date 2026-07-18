@@ -13,15 +13,12 @@ flowchart LR
   DOC --> REDIS[(Redis / Celery Broker)]
   REDIS --> WORKER[Celery Worker]
   WORKER --> PG[(PostgreSQL)]
-  WORKER --> QDRANT[(Qdrant)]
   CHAT --> RAG[RAG Pipeline]
   RAG --> PG
-  RAG --> QDRANT
   CHAT --> LLM[LLM Provider]
   CHAT --> MEMORY[Memory Service]
   MEMORY --> REDIS
   MEMORY --> PG
-  MEMORY --> QDRANT
 ```
 
 说明：
@@ -30,7 +27,7 @@ flowchart LR
 - FastAPI API 层负责路由、schema 和依赖注入。
 - Service 层承载业务边界，例如鉴权、知识库权限、文档处理投递、对话编排。
 - PostgreSQL 存关系数据、文档 chunk、会话、消息、检索日志、Agent trace 和长期记忆。
-- Qdrant 存文档与长期记忆的可重建向量点；文档 payload 带知识库、文档和密级边界，记忆 payload 带用户与状态边界。
+- PostgreSQL 的 pgvector 列存储文档 chunk 与长期记忆 embedding；查询用关系条件收窄知识库、密级、用户和状态边界后再排序。
 - Redis 同时服务 Celery 队列和短期记忆。
 - LLM Provider 隔离 OpenAI-compatible 调用细节；模型不可用时请求明确失败，不用本地规则伪造答案。
 
@@ -43,7 +40,6 @@ sequenceDiagram
   participant M as MinIO
   participant PG as PostgreSQL
   participant C as Celery
-  participant Q as Qdrant
 
   U->>API: upload document
   API->>M: store original file
@@ -52,7 +48,7 @@ sequenceDiagram
   C->>M: read original file
   C->>PG: status=parsing/chunking/embedding
   C->>PG: insert document_chunks
-  C->>Q: upsert vectors
+  C->>PG: persist chunk embeddings
   C->>PG: status=indexed, chunk_count=n
 ```
 
@@ -91,4 +87,4 @@ sequenceDiagram
   API-->>U: SSE tokens + citations
 ```
 
-图中的 Memory 更新发生在 assistant Message 提交之后：开发模板默认同步执行，生产模板默认创建 durable Celery job。Qdrant 只是记忆派生索引，PostgreSQL 始终保存权威状态。
+图中的 Memory 更新发生在 assistant Message 提交之后：开发模板默认同步执行，生产模板默认创建 durable Celery job。记忆内容及 embedding 都在同一 PostgreSQL 事务中保存。

@@ -16,12 +16,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND_PATH = ROOT / "apps" / "backend"
 if str(BACKEND_PATH) not in sys.path:
     sys.path.insert(0, str(BACKEND_PATH))
 
 from app.core.config import get_settings
+from app.db.pgvector import vector_literal
+from app.db.session import engine as database_engine
 from app.evaluation.ir_metrics import compute_ir_metrics
 from app.rag.advanced_retrieval import (
     RetrievalCandidate,
@@ -82,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-workers", type=int, default=8)
     parser.add_argument("--route-limit", type=int, default=settings.retrieval_route_limit)
     parser.add_argument("--max-queries", type=int, default=0)
+    parser.add_argument("--allow-database-seed", action="store_true")
     return parser.parse_args()
 
 
@@ -91,6 +97,8 @@ def main() -> int:
         raise ValueError("--embedding-workers must be positive")
     if args.route_limit < max(CUTOFFS):
         raise ValueError(f"--route-limit must be at least {max(CUTOFFS)}")
+    if not args.allow_database_seed:
+        raise ValueError("--allow-database-seed is required because the benchmark stores embeddings in PostgreSQL")
 
     dataset_root = ensure_dataset(args.data_dir)
     corpus = load_corpus(dataset_root / "corpus.jsonl")
@@ -103,12 +111,13 @@ def main() -> int:
     queries = {query_id: queries[query_id] for query_id in query_ids}
 
     settings = get_settings()
+    validate_evaluation_database(settings.database_url)
     provider = get_embedding_provider()
     fingerprint = embedding_fingerprint(settings.embedding_base_url, provider.name, settings.embedding_model, provider.dimension)
-    client, collection_name = prepare_dense_index(args.data_dir, fingerprint, provider.dimension)
+    dense_index = prepare_dense_index(fingerprint)
     index_corpus(
-        client,
-        collection_name,
+        dense_index,
+        fingerprint,
         corpus,
         provider,
         args.embedding_workers,
@@ -122,8 +131,8 @@ def main() -> int:
     )
 
     rankings, retrieval_latencies = evaluate_routes(
-        client,
-        collection_name,
+        dense_index,
+        fingerprint,
         corpus,
         queries,
         query_vectors,
@@ -232,29 +241,48 @@ def embedding_fingerprint(base_url: str, provider: str, model: str, dimension: i
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def prepare_dense_index(data_dir: Path, fingerprint: str, dimension: int):
-    from qdrant_client import QdrantClient, models
+def validate_evaluation_database(database_url: str) -> None:
+    if database_engine.dialect.name != "postgresql":
+        raise RuntimeError("BEIR/SciFact pgvector benchmark requires PostgreSQL")
+    database_name = (make_url(database_url).database or "").casefold()
+    if "eval" not in database_name:
+        raise RuntimeError("Refusing to seed a non-evaluation database; use a database name containing 'eval'.")
 
-    client = QdrantClient(path=str(data_dir / "qdrant"))
-    collection_name = f"beir_scifact_{fingerprint}"
-    if not client.collection_exists(collection_name):
-        client.create_collection(
-            collection_name=collection_name,
-            vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE),
+
+def prepare_dense_index(fingerprint: str):
+    with database_engine.begin() as connection:
+        installed = connection.scalar(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'"))
+        if installed != 1:
+            raise RuntimeError("pgvector extension is not installed; run Alembic migrations first")
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS benchmark_scifact_dense_embeddings (
+                    fingerprint VARCHAR(64) NOT NULL,
+                    corpus_id VARCHAR(64) NOT NULL,
+                    embedding vector NOT NULL,
+                    PRIMARY KEY (fingerprint, corpus_id)
+                )
+                """
+            )
         )
-    return client, collection_name
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_benchmark_scifact_dense_embeddings_fingerprint "
+                "ON benchmark_scifact_dense_embeddings (fingerprint)"
+            )
+        )
+    return database_engine
 
 
 def index_corpus(
-    client,
-    collection_name: str,
+    dense_index,
+    fingerprint: str,
     corpus: dict[str, CorpusRow],
     provider,
     workers: int,
 ) -> None:
-    from qdrant_client import models
-
-    existing_ids = load_existing_point_ids(client, collection_name)
+    existing_ids = load_existing_corpus_ids(dense_index, fingerprint)
     pending = [row for document_id, row in corpus.items() if document_id not in existing_ids]
     if not pending:
         print(f"Dense index ready: {len(corpus)} corpus records", flush=True)
@@ -272,39 +300,52 @@ def index_corpus(
         for future in as_completed(futures):
             batch = futures[future]
             vectors = future.result()
-            points = [
-                models.PointStruct(
-                    id=int(row.document.id),
-                    vector=vector,
-                    payload={"corpus_id": row.document.id},
+            with dense_index.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO benchmark_scifact_dense_embeddings (fingerprint, corpus_id, embedding)
+                        VALUES (:fingerprint, :corpus_id, CAST(:embedding AS vector))
+                        ON CONFLICT (fingerprint, corpus_id) DO UPDATE SET embedding = EXCLUDED.embedding
+                        """
+                    ),
+                    [
+                        {
+                            "fingerprint": fingerprint,
+                            "corpus_id": row.document.id,
+                            "embedding": vector_literal(vector),
+                        }
+                        for row, vector in zip(batch, vectors, strict=True)
+                    ],
                 )
-                for row, vector in zip(batch, vectors, strict=True)
-            ]
-            client.upsert(collection_name=collection_name, points=points, wait=True)
             completed += len(batch)
             if completed == len(corpus) or completed % 100 <= len(batch):
                 elapsed = time.perf_counter() - started
                 print(f"Indexed {completed}/{len(corpus)} records ({elapsed:.1f}s)", flush=True)
 
-    indexed_count = int(client.count(collection_name=collection_name, exact=True).count)
+    with dense_index.connect() as connection:
+        indexed_count = int(
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM benchmark_scifact_dense_embeddings WHERE fingerprint = :fingerprint"
+                ),
+                {"fingerprint": fingerprint},
+            )
+            or 0
+        )
     if indexed_count != len(corpus):
         raise RuntimeError(f"Dense index contains {indexed_count} records; expected {len(corpus)}")
 
 
-def load_existing_point_ids(client, collection_name: str) -> set[str]:
-    point_ids: set[str] = set()
-    offset = None
-    while True:
-        points, offset = client.scroll(
-            collection_name=collection_name,
-            limit=1000,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        point_ids.update(str(point.payload["corpus_id"]) for point in points)
-        if offset is None:
-            return point_ids
+def load_existing_corpus_ids(dense_index, fingerprint: str) -> set[str]:
+    with dense_index.connect() as connection:
+        corpus_ids = connection.execute(
+            text(
+                "SELECT corpus_id FROM benchmark_scifact_dense_embeddings WHERE fingerprint = :fingerprint"
+            ),
+            {"fingerprint": fingerprint},
+        ).scalars().all()
+    return {str(corpus_id) for corpus_id in corpus_ids}
 
 
 def embed_query_vectors(
@@ -336,8 +377,8 @@ def embed_query_vectors(
 
 
 def evaluate_routes(
-    client,
-    collection_name: str,
+    dense_index,
+    fingerprint: str,
     corpus: dict[str, CorpusRow],
     queries: dict[str, str],
     query_vectors: dict[str, list[float]],
@@ -355,8 +396,8 @@ def evaluate_routes(
     for index, (query_id, query) in enumerate(queries.items(), start=1):
         started = time.perf_counter()
         dense_candidates = dense_route(
-            client,
-            collection_name,
+            dense_index,
+            fingerprint,
             corpus,
             query,
             query_vectors[query_id],
@@ -381,23 +422,33 @@ def evaluate_routes(
 
 
 def dense_route(
-    client,
-    collection_name: str,
+    dense_index,
+    fingerprint: str,
     corpus: dict[str, CorpusRow],
     query: str,
     query_vector: list[float],
     route_limit: int,
 ) -> list[RetrievalCandidate]:
-    result = client.query_points(
-        collection_name=collection_name,
-        query=query_vector,
-        limit=route_limit,
-        with_payload=True,
-        with_vectors=False,
-    )
+    with dense_index.connect() as connection:
+        result = connection.execute(
+            text(
+                """
+                SELECT corpus_id, 1 - (embedding <=> CAST(:embedding AS vector)) AS score
+                FROM benchmark_scifact_dense_embeddings
+                WHERE fingerprint = :fingerprint
+                ORDER BY embedding <=> CAST(:embedding AS vector), corpus_id
+                LIMIT :route_limit
+                """
+            ),
+            {
+                "fingerprint": fingerprint,
+                "embedding": vector_literal(query_vector),
+                "route_limit": route_limit,
+            },
+        ).all()
     candidates: list[RetrievalCandidate] = []
-    for rank, point in enumerate(result.points, start=1):
-        document_id = str(point.payload["corpus_id"])
+    for rank, point in enumerate(result, start=1):
+        document_id = str(point.corpus_id)
         row = corpus[document_id]
         chunk = retrieved_chunk(row, float(point.score or 0), "dense")
         candidates.append(
@@ -503,7 +554,7 @@ def build_report(
             "embedding_model": settings.embedding_model,
             "embedding_dimension": settings.embedding_dimension,
             "retrieval_unit": "one SciFact abstract per BEIR corpus record",
-            "dense_engine": "Qdrant local mode / cosine similarity",
+            "dense_engine": "PostgreSQL pgvector / exact cosine similarity",
             "bm25_implementation": "project rank_bm25_rows / rank-bm25",
             "route_limit": route_limit,
             "rrf_k": settings.rrf_k,
@@ -513,7 +564,7 @@ def build_report(
         },
         "results": route_metrics,
         "latency": {
-            "scope": "local Qdrant + BM25 + RRF; excludes remote query embedding",
+            "scope": "PostgreSQL pgvector + BM25 + RRF; excludes remote query embedding",
             "queries": len(retrieval_latencies),
             "mean_ms": round(statistics.fmean(retrieval_latencies), 3),
             "p50_ms": round(percentile(retrieval_latencies, 50), 3),
@@ -613,7 +664,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 ## 可用于简历的表述
 
-> 基于 FastAPI、Qdrant 与 LangChain 构建 Agentic RAG 系统，在 BEIR/SciFact（{dataset['corpus_count']:,} 篇语料、{dataset['query_count']} 条公开测试查询）上完成 Dense、BM25、RRF 三条检索路线的可复现消融评估；{resume_result}。
+> 基于 FastAPI、PostgreSQL pgvector 与 LangChain 构建 Agentic RAG 系统，在 BEIR/SciFact（{dataset['corpus_count']:,} 篇语料、{dataset['query_count']} 条公开测试查询）上完成 Dense、BM25、RRF 三条检索路线的可复现消融评估；{resume_result}。
 
 这段表述只能用于“检索质量”，不能写成答案准确率或端到端 Agent 准确率。
 

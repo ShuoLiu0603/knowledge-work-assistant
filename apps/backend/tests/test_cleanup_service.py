@@ -48,7 +48,7 @@ class CleanupServiceTests(unittest.TestCase):
             )
             session.commit()
 
-            with patch("app.services.cleanup_service.delete_document_vectors", side_effect=RuntimeError("qdrant offline")):
+            with patch("app.services.cleanup_service.remove_object", side_effect=RuntimeError("object storage offline")):
                 failed = retry_external_cleanup_job(session, document_job.id)
 
             failed_jobs = list_external_cleanup_jobs(session, status="failed")
@@ -58,15 +58,11 @@ class CleanupServiceTests(unittest.TestCase):
             self.assertEqual([job.id for job in document_jobs], [document_job.id])
             self.assertEqual(failed.status, "failed")
 
-            with (
-                patch("app.services.cleanup_service.delete_document_vectors") as delete_vectors,
-                patch("app.services.cleanup_service.remove_object") as remove_object,
-            ):
+            with patch("app.services.cleanup_service.remove_object") as remove_object:
                 retried = retry_external_cleanup_job(session, document_job.id)
 
             self.assertEqual(retried.status, "completed")
             self.assertEqual(retried.attempts, 2)
-            delete_vectors.assert_called_once_with("doc-1")
             remove_object.assert_called_once_with("objects/doc-1.md")
 
             with self.assertRaises(HTTPException) as completed_error:

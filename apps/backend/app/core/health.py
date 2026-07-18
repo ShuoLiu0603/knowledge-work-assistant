@@ -8,7 +8,6 @@ from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.db.session import engine
-from app.rag.vector_store import get_qdrant_client
 
 
 HealthCheck = dict[str, str]
@@ -18,7 +17,7 @@ def build_readiness_report() -> dict[str, Any]:
     checks = {
         "database": check_database(),
         "redis": check_redis(),
-        "qdrant": check_qdrant(),
+        "pgvector": check_pgvector(),
         "minio": check_minio(),
         "worker": check_worker(),
     }
@@ -56,9 +55,14 @@ def check_redis() -> HealthCheck:
             client.close()
 
 
-def check_qdrant() -> HealthCheck:
+def check_pgvector() -> HealthCheck:
+    if engine.dialect.name != "postgresql":
+        return ok()
     try:
-        get_qdrant_client(timeout=get_settings().healthcheck_timeout_seconds).get_collections()
+        with engine.connect() as connection:
+            installed = connection.scalar(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'"))
+        if installed != 1:
+            raise RuntimeError("pgvector extension is not installed")
         return ok()
     except Exception as exc:
         return failed(exc)

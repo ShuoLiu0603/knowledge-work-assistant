@@ -7,7 +7,7 @@ from app.db.models.document import Document, DocumentChunk
 from app.db.session import SessionLocal, init_db
 from app.rag.loaders import load_documents
 from app.rag.splitters import split_documents
-from app.rag.vector_store import delete_document_vectors, upsert_document_chunks
+from app.rag.vector_store import upsert_document_chunks
 from app.storage.minio_client import download_bytes
 from app.workers.celery_app import RELIABLE_TASK_OPTIONS, celery_app, task_can_retry, task_retry_countdown
 
@@ -51,7 +51,6 @@ def process_document(self, document_id: str) -> dict[str, int | str]:
             db.commit()
 
             db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
-            delete_document_vectors(document.id)
             chunk_rows: list[DocumentChunk] = []
             for index, chunk in enumerate(chunks):
                 metadata = chunk.metadata
@@ -71,7 +70,7 @@ def process_document(self, document_id: str) -> dict[str, int | str]:
                 chunk_rows.append(chunk_row)
 
             db.flush()
-            upsert_document_chunks(document, chunk_rows)
+            upsert_document_chunks(db, document, chunk_rows)
             document.status = "indexed"
             document.chunk_count = len(chunks)
             document.error_message = None
@@ -88,10 +87,6 @@ def process_document(self, document_id: str) -> dict[str, int | str]:
             document.chunk_count = 0
             db.add(document)
             db.commit()
-            try:
-                delete_document_vectors(document.id)
-            except Exception:
-                pass
             if task_can_retry(self):
                 raise self.retry(exc=exc, countdown=task_retry_countdown(self.request.retries))
             return {"document_id": document.id, "status": document.status, "chunk_count": 0}

@@ -19,14 +19,14 @@ class HealthTests(unittest.TestCase):
         with (
             patch.object(health_module, "check_database", return_value=ok),
             patch.object(health_module, "check_redis", return_value=ok),
-            patch.object(health_module, "check_qdrant", return_value=ok),
+            patch.object(health_module, "check_pgvector", return_value=ok),
             patch.object(health_module, "check_minio", return_value=ok),
             patch.object(health_module, "check_worker", return_value=ok),
         ):
             report = health_module.build_readiness_report()
 
         self.assertEqual(report["status"], "ok")
-        self.assertEqual(set(report["checks"]), {"database", "redis", "qdrant", "minio", "worker"})
+        self.assertEqual(set(report["checks"]), {"database", "redis", "pgvector", "minio", "worker"})
 
     def test_readiness_endpoint_returns_503_when_dependency_fails(self) -> None:
         report = {
@@ -34,7 +34,7 @@ class HealthTests(unittest.TestCase):
             "checks": {
                 "database": {"status": "ok"},
                 "redis": {"status": "error", "detail": "ConnectionError"},
-                "qdrant": {"status": "ok"},
+                "pgvector": {"status": "ok"},
                 "minio": {"status": "ok"},
             },
         }

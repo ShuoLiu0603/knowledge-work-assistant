@@ -9,21 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.models.user_memory import UserMemory
 from app.memory import events as memory_events
 from app.memory import policy
-from app.memory import vector_index
 from app.memory.types import MemoryEmbedding, MemorySource
-
-VECTOR_SYNC_SESSION_KEY = "memory_vector_sync_ids"
-
-
-def queue_memory_vector_sync(db: Session, *memories: UserMemory) -> None:
-    memory_ids = db.info.setdefault(VECTOR_SYNC_SESSION_KEY, set())
-    for memory in memories:
-        if memory.id:
-            memory_ids.add(memory.id)
-
-
-def pop_queued_memory_vector_sync_ids(db: Session) -> set[str]:
-    return set(db.info.pop(VECTOR_SYNC_SESSION_KEY, set()))
 
 
 def create_memory_row(
@@ -201,13 +187,9 @@ def create_memory_row(
         new_status=status,
     )
     if not autocommit:
-        queue_memory_vector_sync(db, memory, *conflicts)
         return memory
     db.commit()
     db.refresh(memory)
-    for conflict in conflicts:
-        vector_index.try_sync_memory_vector(conflict)
-    vector_index.try_sync_memory_vector(memory)
     return memory
 
 
@@ -342,13 +324,9 @@ def touch_memory(
         new_status=memory.status,
     )
     if not autocommit:
-        queue_memory_vector_sync(db, memory, *conflicts)
         return memory, reason
     db.commit()
     db.refresh(memory)
-    for conflict in conflicts:
-        vector_index.try_sync_memory_vector(conflict)
-    vector_index.try_sync_memory_vector(memory)
     return memory, reason
 
 
@@ -456,4 +434,3 @@ def soft_delete_memory(db: Session, memory: UserMemory, actor_user_id: str) -> N
         new_status=memory.status,
     )
     db.commit()
-    vector_index.try_delete_memory_vector(memory.id)

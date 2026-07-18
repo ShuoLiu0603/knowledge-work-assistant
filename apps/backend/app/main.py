@@ -1,5 +1,4 @@
 from contextlib import asynccontextmanager
-import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,23 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import get_settings, validate_runtime_settings
 from app.db.session import init_db
-from app.memory.vector_index import ensure_memory_collection
-from app.rag.vector_store import ensure_qdrant_collection
-
-logger = logging.getLogger(__name__)
-
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    try:
-        ensure_qdrant_collection()
-    except RuntimeError as exc:
-        logger.warning("Qdrant collection initialization skipped: %s", exc)
-    try:
-        ensure_memory_collection()
-    except Exception as exc:
-        logger.warning("Qdrant memory collection initialization skipped: %s", exc)
     yield
 
 

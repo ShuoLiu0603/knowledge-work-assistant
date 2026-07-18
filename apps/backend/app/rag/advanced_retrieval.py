@@ -179,6 +179,7 @@ def retrieve_dense_route(
             continue
         raw_chunks.extend(
             retrieve_dense_chunks(
+                db,
                 owner,
                 kb_id,
                 query,

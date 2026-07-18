@@ -48,11 +48,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_socket_connect_timeout_seconds: float = Field(default=3.0, gt=0)
     redis_socket_timeout_seconds: float = Field(default=3.0, gt=0)
-    qdrant_url: str = "http://localhost:6333"
-    qdrant_collection: str = "knowledge_chunks"
-    qdrant_timeout_seconds: int = Field(default=10, gt=0)
     healthcheck_timeout_seconds: int = Field(default=3, gt=0)
-    memory_qdrant_collection: str = "user_memories"
     memory_vector_index_enabled: bool = True
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"

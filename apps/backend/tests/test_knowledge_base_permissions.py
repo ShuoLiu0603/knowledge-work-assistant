@@ -118,8 +118,7 @@ class KnowledgeBasePermissionTests(unittest.TestCase):
                 )
             self.assertEqual(forbidden.exception.status_code, 403)
 
-            with patch("app.services.cleanup_service.delete_knowledge_base_vectors"):
-                delete_knowledge_base(session, manager.id, public_kb.id)
+            delete_knowledge_base(session, manager.id, public_kb.id)
             with self.assertRaises(HTTPException) as missing:
                 ensure_kb_access(session, viewer.id, public_kb.id, required_role="viewer")
             self.assertEqual(missing.exception.status_code, 404)
@@ -139,8 +138,7 @@ class KnowledgeBasePermissionTests(unittest.TestCase):
                 kb.id,
                 KnowledgeBaseUpdate(name="Audited KB Updated"),
             )
-            with patch("app.services.cleanup_service.delete_knowledge_base_vectors"):
-                delete_knowledge_base(session, owner.id, kb.id)
+            delete_knowledge_base(session, owner.id, kb.id)
 
             audit_logs = session.scalars(
                 select(AuditLog).where(AuditLog.resource_id == kb.id)
@@ -213,13 +211,9 @@ class KnowledgeBasePermissionTests(unittest.TestCase):
             session.add(document)
             session.commit()
 
-            with (
-                patch("app.services.cleanup_service.delete_knowledge_base_vectors") as delete_vectors,
-                patch("app.services.cleanup_service.remove_object") as remove_object,
-            ):
+            with patch("app.services.cleanup_service.remove_object") as remove_object:
                 delete_knowledge_base(session, owner.id, kb.id)
 
-            delete_vectors.assert_called_once_with(kb.id)
             remove_object.assert_called_once_with("objects/delete-kb.md")
             with self.assertRaises(HTTPException):
                 ensure_kb_access(session, owner.id, kb.id, required_role="viewer")
@@ -229,11 +223,9 @@ class KnowledgeBasePermissionTests(unittest.TestCase):
             owner = create_user(session, "delete-kb-cleanup@example.com", "Delete KB Cleanup")
             kb = create_knowledge_base(session, owner.id, KnowledgeBaseCreate(name="Delete KB Cleanup"))
 
-            with (
-                patch(
-                    "app.services.cleanup_service.delete_knowledge_base_vectors",
-                    side_effect=RuntimeError("qdrant offline"),
-                ),
+            with patch(
+                "app.services.cleanup_service.cleanup_external_resources",
+                side_effect=RuntimeError("object storage offline"),
             ):
                 delete_knowledge_base(session, owner.id, kb.id)
 

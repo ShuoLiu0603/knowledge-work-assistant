@@ -8,11 +8,11 @@
 
 ### 检索与 Agent 编排
 
-> 基于 FastAPI、PostgreSQL、Qdrant、Celery 与 LangChain 构建 Agentic RAG 系统；在 BEIR/SciFact 完整测试集（5,183 篇语料、300 条查询）上，Dense + BM25 + RRF 取得 nDCG@10 68.47%、Recall@10 83.22%、MRR@10 64.62%，nDCG@10 相比 Dense 提升 4.62 个百分点；25 个项目定制 golden cases 连续运行 3 轮，在 75 条轨迹上取得 98.67% 严格轨迹准确率、100% 工具类型准确率和 0% 直接回答误调用率。
+> 基于 FastAPI、PostgreSQL pgvector、Celery 与 LangChain 构建 Agentic RAG 系统；在 BEIR/SciFact 完整测试集（5,183 篇语料、300 条查询）上，Dense + BM25 + RRF 取得 nDCG@10 68.47%、Recall@10 83.22%、MRR@10 64.62%，nDCG@10 相比 Dense 提升 4.62 个百分点；25 个项目定制 golden cases 连续运行 3 轮，在 75 条轨迹上取得 98.67% 严格轨迹准确率、100% 工具类型准确率和 0% 直接回答误调用率。
 
 ### 长期记忆与工程质量
 
-> 在 LongMemEval-S 30 题分层子集、14,841 个历史 turn 上实现 Turn Recall Any@5 95.83%、Recall All@5 83.33% 和 Top-5 Reader QA 83.33%；建立 310 项后端回归测试与统一质量门禁，完成 24 个 Alembic 版本的完整迁移链、真实 PostgreSQL/Qdrant/Redis/MinIO/Celery 冒烟及前端生产构建。
+> 在 LongMemEval-S 30 题分层子集、14,841 个历史 turn 上实现 Turn Recall Any@5 95.83%、Recall All@5 83.33% 和 Top-5 Reader QA 83.33%；建立 310 项后端回归测试与统一质量门禁，完成 24 个 Alembic 版本的完整迁移链、真实 PostgreSQL pgvector/Redis/MinIO/Celery 冒烟及前端生产构建。
 
 不能写“测试覆盖率 100%”：当前统计的是测试数量与通过率，没有生成语句或分支覆盖率报告。RGB 和 LongMemEval 的 DeepSeek Judge 结果也不能写成官方榜单成绩。
 
@@ -20,10 +20,10 @@
 
 除明确标注为 Reader-only 或受控工具 observation 的评测外，本轮生产链路使用：
 
-- Docker Compose 中的 PostgreSQL 16、Qdrant、Redis 7、MinIO、FastAPI、Celery Worker/Beat 和前端。
+- Docker Compose 中的 PostgreSQL 16 + pgvector、Redis 7、MinIO、FastAPI、Celery Worker/Beat 和前端。
 - 真实 `deepseek-v4-flash` 与真实 embedding API，不 mock 模型。
 - 生产 Agent、生产 Memory/RAG 工具、生产权限检查和生产检索实现。
-- 数据库评测写入隔离的 `rag_app_eval`，Qdrant 使用名称包含 `eval` 的独立集合；脚本结束后清理临时数据。
+- 数据库评测写入隔离的 `rag_app_eval`；脚本结束后清理临时数据。
 - 主栈端到端 smoke 只创建临时知识库；知识库和精确匹配的 smoke 用户均在运行后删除。
 
 ## 2. BEIR/SciFact 公开检索基准
@@ -106,7 +106,7 @@ Reader 直接获得 5 篇外部文档，每题只生成一次，不运行项目 
 
 ### 5.2 真实项目运行时 Agent 的多次 Memory
 
-原始日期化 turn 写入隔离 PostgreSQL 和独立 Memory Qdrant 集合；Memory 与 RAG 都真实可用。评测用户没有知识库，所以误调 RAG 会沿生产链路返回空证据。
+原始日期化 turn 写入隔离 PostgreSQL 的 `user_memories.embedding`；Memory 与 RAG 都真实可用。评测用户没有知识库，所以误调 RAG 会沿生产链路返回空证据。
 
 | 指标 | 默认预算 6/4/2/3 | 上限探测 20/20/10/10 |
 |---|---:|---:|
@@ -133,19 +133,19 @@ Reader 直接获得 5 篇外部文档，每题只生成一次，不运行项目 
 
 | 检查项 | 2026-07-15 结果 |
 |---|---|
-| 后端完整回归（生产容器依赖、真实 Qdrant） | **310/310 通过**，233.58 秒 |
+| 后端完整回归（生产容器依赖） | **310/310 通过**，233.58 秒 |
 | 评测脚本静态回归 | 4/4 通过 |
 | Python `compileall` | 通过 |
 | Alembic 完整迁移链 | 24 revisions 通过，head=`20260713_0024` |
 | 真实 PostgreSQL 主库 / `rag_app_eval` | 均已升级到 head |
 | 前端 TypeScript + Vite build | 通过，534 modules transformed |
 | 开发 / 生产 Compose config | 均通过 |
-| `/api/health`、`/api/ready` | HTTP 200；database/redis/qdrant/minio/worker 全部 ok |
+| `/api/health`、`/api/ready` | HTTP 200；database/redis/pgvector/minio/worker 全部 ok |
 | 端到端 smoke | 注册→建库→上传→Celery 索引→4 chunks→问答→1 citation→清理，**27.49 秒** |
 
 前端主 JS 为 586.29 kB、gzip 181.05 kB，Vite 仍提示主 chunk 超过 500 kB，不能表述为“前端性能已优化完成”。
 
-宿主机直接运行统一门禁时为 309/310：唯一失败是宿主机无法解析 Docker 内部主机名 `qdrant`，导致外部清理审计断言失败；同一用例在 Docker 网络中连接真实 Qdrant 后通过，完整生产容器回归为 310/310。该差异属于运行位置配置，不是功能回归。
+历史宿主机与容器内的统一门禁存在一项运行位置配置差异；后续变更应以隔离的 PostgreSQL pgvector 环境重新执行完整门禁，不应复用该历史结果来证明迁移后的通过率。
 
 ### 在线 3 题 RAG 小评测
 
@@ -183,7 +183,7 @@ python scripts/smoke_demo.py --question "住宿报销上限是多少？"
 python scripts/run_eval.py --email <email> --password <password> --kb-id <kb_id>
 ```
 
-运行时 Agent 评测必须将 `DATABASE_URL` 指向名称包含 `eval` 的隔离数据库，并分别设置名称包含 `eval` 的知识库和 Memory Qdrant collection。禁止对生产数据运行带 `--allow-database-seed` 的命令。
+运行时 Agent 评测必须将 `DATABASE_URL` 指向名称包含 `eval` 的隔离数据库。禁止对生产数据运行带 `--allow-database-seed` 的命令。
 
 本轮机器可读产物位于 `.run/p0/rerun_20260715/`：
 

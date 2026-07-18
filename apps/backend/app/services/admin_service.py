@@ -322,17 +322,6 @@ def delete_admin_user(
         )
         cleanup_job_ids.append(cleanup_job.id)
         db.delete(knowledge_base)
-    for memory_id in memory_ids:
-        cleanup_job = create_external_cleanup_job(
-            db,
-            actor_user_id=actor_user_id,
-            resource_type="user_memory",
-            resource_id=memory_id,
-            object_keys=[],
-            metadata={"deleted_with_user_id": user.id},
-        )
-        cleanup_job_ids.append(cleanup_job.id)
-
     audit_metadata = {
         "email": user.email,
         "owned_knowledge_base_count": len(owned_knowledge_bases),

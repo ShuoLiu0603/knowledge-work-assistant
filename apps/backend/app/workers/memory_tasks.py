@@ -20,13 +20,11 @@ from app.services.memory_service import (
     process_user_memory,
     reconcile_user_memories,
     should_update_conversation_summary,
-    sync_memory_vectors_by_ids,
     to_memory_action_dict,
     update_conversation_summary,
 )
 from app.services.agent_service import apply_deferred_memory_update, attach_agent_run_to_message
 from app.services.conversation_service import acquire_conversation_run_lease, release_conversation_run_lease
-from app.memory import commands as memory_commands
 from app.memory import jobs as memory_jobs
 from app.memory import reconcile as memory_reconcile
 from app.memory.types import MemoryAction
@@ -126,11 +124,8 @@ def process_memory_update_job(self, job_id: str) -> dict:
                 lease_token=lease_token,
                 actions=action_dicts,
             )
-            sync_memory_ids = memory_commands.pop_queued_memory_vector_sync_ids(db)
             if completed is None:
                 return {"job_id": job_id, "status": "lease_lost"}
-            if sync_memory_ids:
-                sync_memory_vectors_by_ids(db, sync_memory_ids)
             return {
                 "job_id": completed.id,
                 "status": completed.status,
@@ -590,24 +585,21 @@ def recover_deferred_agent_memory_updates() -> dict:
 
 
 @celery_app.task(
-    name="reconcile_memory_vector_indexes",
+    name="reconcile_memory_embeddings",
     autoretry_for=(Exception,),
     retry_backoff=get_settings().celery_task_retry_backoff_seconds,
     retry_backoff_max=RETRY_BACKOFF_MAX_SECONDS,
     retry_jitter=True,
     **RELIABLE_TASK_OPTIONS,
 )
-def reconcile_memory_vector_indexes() -> dict:
-    if not get_settings().memory_vector_index_enabled:
-        return {"status": "disabled", "user_count": 0, "finding_count": 0, "applied_count": 0}
-
+def reconcile_memory_embeddings() -> dict:
     init_db()
     with SessionLocal() as db:
         user_ids = list(db.scalars(select(UserMemory.user_id).distinct()).all())
         findings = [
             finding
             for user_id in user_ids
-            for finding in memory_reconcile.reconcile_vector_index(db, user_id, apply=True)
+            for finding in memory_reconcile.reconcile_memory_embeddings(db, user_id, apply=True)
         ]
     return {
         "status": "completed",

@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.db.base import Base
+from app.db.pgvector import ensure_pgvector_extension
 from app.db.runtime_schema import ensure_runtime_schema
 
 settings = get_settings()
@@ -35,6 +36,7 @@ def init_db() -> None:
     if not get_settings().auto_create_tables:
         return
 
+    ensure_pgvector_extension(engine)
     Base.metadata.create_all(bind=engine)
     ensure_runtime_schema(engine)
 

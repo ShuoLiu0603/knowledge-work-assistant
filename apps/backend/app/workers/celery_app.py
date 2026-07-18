@@ -64,8 +64,8 @@ celery_app.conf.update(
             "kwargs": {"dry_run": False},
             "options": {"expires": settings.celery_operational_retention_task_expires_seconds},
         },
-        "reconcile-memory-vector-indexes-daily": {
-            "task": "reconcile_memory_vector_indexes",
+        "reconcile-memory-embeddings-daily": {
+            "task": "reconcile_memory_embeddings",
             "schedule": crontab(hour=(settings.operational_retention_hour_utc + 1) % 24, minute=0),
             "options": {"expires": settings.celery_operational_retention_task_expires_seconds},
         },

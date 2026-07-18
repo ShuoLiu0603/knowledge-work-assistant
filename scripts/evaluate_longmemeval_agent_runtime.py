@@ -28,12 +28,6 @@ from app.db.models.user import User
 from app.db.models.user_memory import UserMemory
 from app.db.session import SessionLocal
 from app.llm.provider import get_llm_provider
-from app.memory.vector_index import (
-    ensure_memory_collection,
-    get_qdrant_client,
-    memory_collection_name,
-    qdrant_models,
-)
 from scripts.evaluate_longmemeval_memory import (
     DEFAULT_CACHE,
     DEFAULT_DATA_DIR,
@@ -121,7 +115,6 @@ def main() -> int:
     finally:
         apply_runtime_budget(original_budget)
         cleanup_cases(cases)
-        cleanup_vector_collection()
 
     summary = summarize(results, budgets)
     args.summary.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -136,10 +129,6 @@ def validate_evaluation_database() -> None:
     if "eval" not in database_name and not settings.database_url.startswith("sqlite"):
         raise RuntimeError(
             "Refusing to seed a non-evaluation database. Use a database whose name contains 'eval'."
-        )
-    if settings.memory_vector_index_enabled and "eval" not in settings.memory_qdrant_collection.casefold():
-        raise RuntimeError(
-            "Refusing to seed a non-evaluation Qdrant collection. Its name must contain 'eval'."
         )
 
 
@@ -214,7 +203,6 @@ def assign_storage_ids(cases: list[dict]) -> None:
 
 def seed_cases(cases: list[dict], embeddings: dict[str, list[float]]) -> None:
     settings = get_settings()
-    reset_vector_collection()
     with SessionLocal() as db:
         cleanup_cases(cases, db=db)
         for index, case in enumerate(cases, start=1):
@@ -235,7 +223,6 @@ def seed_cases(cases: list[dict], embeddings: dict[str, list[float]]) -> None:
             ]
             db.bulk_insert_mappings(UserMemory, mappings)
             db.commit()
-            seed_memory_vectors(mappings)
             print(f"Agentic LongMemEval seed: {index}/{len(cases)}", flush=True)
 
 
@@ -302,67 +289,6 @@ def cleanup_cases(cases: list[dict], db=None) -> None:
     finally:
         if owns_session:
             db.close()
-
-
-def reset_vector_collection() -> None:
-    if not get_settings().memory_vector_index_enabled:
-        return
-    cleanup_vector_collection()
-    ensure_memory_collection()
-
-
-def cleanup_vector_collection() -> None:
-    settings = get_settings()
-    if not settings.memory_vector_index_enabled or "eval" not in settings.memory_qdrant_collection.casefold():
-        return
-    client = get_qdrant_client()
-    collection_name = memory_collection_name()
-    if client.collection_exists(collection_name):
-        client.delete_collection(collection_name=collection_name)
-
-
-def seed_memory_vectors(mappings: list[dict]) -> None:
-    if not get_settings().memory_vector_index_enabled:
-        return
-    models = qdrant_models()
-    client = get_qdrant_client()
-    points = [
-        models.PointStruct(
-            id=mapping["id"],
-            vector=mapping["embedding"],
-            payload=memory_vector_payload(mapping),
-        )
-        for mapping in mappings
-    ]
-    for index in range(0, len(points), 100):
-        client.upsert(
-            collection_name=memory_collection_name(),
-            points=points[index : index + 100],
-            wait=True,
-        )
-
-
-def memory_vector_payload(mapping: dict) -> dict:
-    return {
-        "user_id": mapping["user_id"],
-        "memory_id": mapping["id"],
-        "status": mapping["status"],
-        "kind": mapping["kind"],
-        "category": mapping["category"],
-        "canonical_key": mapping["canonical_key"],
-        "memory_layer": mapping["memory_layer"],
-        "profile_slot": mapping["profile_slot"],
-        "scope_type": mapping["scope_type"],
-        "scope_id": mapping["scope_id"],
-        "pinned": mapping["pinned"],
-        "revision": mapping["revision"],
-        "expires_at": None,
-        "content_hash": mapping["content_hash"],
-        "source_conversation_id": None,
-        "source_message_id": None,
-        "embedding_model": mapping["embedding_model"],
-        "embedding_dimension": mapping["embedding_dimension"],
-    }
 
 
 def run_scenario(

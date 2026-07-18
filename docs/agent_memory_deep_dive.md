@@ -13,7 +13,7 @@
 - 知识库范围、成员权限、文档密级和历史 provenance 由后端校验。
 - PostgreSQL 是业务数据和长期记忆的权威来源。
 - Redis 用于短期缓存、Celery broker、会话协调租约和任务状态。
-- Qdrant 用于文档向量检索；长期记忆向量索引在当前模板中默认启用，但可通过配置关闭，且始终只是可重建的加速索引。
+- PostgreSQL 的 pgvector 列用于文档与长期记忆的向量存储和检索；长期记忆语义召回默认启用，也可通过配置关闭。
 - MinIO 保存上传的原始文档。
 - Celery Worker 执行文档、记忆、摘要、清理和保留任务；Celery Beat 负责周期恢复。
 
@@ -23,7 +23,7 @@
 2. Agent 不能扩大当前用户的知识库访问范围。
 3. 每次成功执行 `rag(query)` 都必须产生真实 RetrievalLog；发生过 RAG 的 completed run 必须保留检索 provenance。
 4. 自动记忆只接受来自当前 user Message 的证据。
-5. PostgreSQL memory row 是真相，Qdrant memory point 只是可重建索引。
+5. PostgreSQL memory row 与 embedding 在同一事务中保存，是长期记忆的唯一事实来源。
 6. 用户选择不使用记忆的对话轮不能进入记忆上下文或会话摘要。
 7. 异步任务的重试不能让旧 worker 覆盖新 worker 的结果。
 
@@ -40,7 +40,6 @@ flowchart TB
 
     PG[(PostgreSQL)]
     REDIS[(Redis)]
-    QD[(Qdrant)]
     MINIO[(MinIO)]
     LLM[LLM Provider]
     EMB[Embedding Provider]
@@ -53,16 +52,13 @@ flowchart TB
     AGENT --> LLM
     AGENT -. optional, repeatable .-> MEMORY
     AGENT -. optional, repeatable .-> RAG
-    RAG --> QD
     RAG --> PG
     MEMORY --> PG
     MEMORY --> REDIS
     MEMORY --> EMB
-    MEMORY -. default-enabled, rebuildable .-> QD
     API --> PG
     API --> REDIS
     WORKER --> PG
-    WORKER --> QD
     WORKER --> MINIO
     BEAT --> REDIS
 ```
@@ -71,10 +67,8 @@ flowchart TB
 
 | 组件 | 权威性 | 用途 | 失败后的行为 |
 |---|---|---|---|
-| PostgreSQL | 权威 | 用户、会话、消息、知识库、chunk、AgentRun、日志、长期记忆、任务 | 核心路径失败 |
+| PostgreSQL + pgvector | 权威 | 用户、会话、消息、知识库、chunk、embedding、AgentRun、日志、长期记忆、任务 | 核心路径失败 |
 | Redis | 非权威缓存 + 协调 | 短期记忆、Celery、会话租约、摘要租约 | 开发可部分降级；生产会话协调 fail-closed |
-| Qdrant 文档 collection | 检索索引 | Dense 文档召回 | RAG 无法正常执行 Dense 路线 |
-| Qdrant memory collection | 默认启用的可重建索引 | 回答召回与更新前相关记忆召回 | 回退 PostgreSQL 候选和本地排序 |
 | MinIO | 原文存储 | 上传文档与删除清理 | 文档入库或原文操作失败 |
 
 ## 3. Agent 模块
@@ -198,7 +192,7 @@ Prompt 明确要求：画像或当前上下文已经足够时直接回答；个�
 
 检索层不再执行 LLM Query Rewrite 或子问题拆解；换 query 和是否继续检索由外层 Agent 循环决定。每次 RAG 调用内部只处理一条 query，因此检索逻辑保持为清晰的“两路召回、一次融合”。
 
-Dense 命中不会直接信任 Qdrant payload。系统会按 chunk id 回 PostgreSQL hydration，并再次校验：
+Dense 命中直接来自 PostgreSQL 的 chunk 行；融合前系统仍按 chunk id 读取权威数据，并再次校验：
 
 - chunk 属于目标知识库；
 - 文档状态为 `indexed`；
@@ -508,7 +502,7 @@ user Message commit
 Working memory       Redis recent messages + PostgreSQL fallback
 Conversation state   Conversation.summary + summary_message_count
 Long-term memory     PostgreSQL UserMemory
-Recall index         default-enabled Qdrant memory collection
+Recall index         default-enabled PostgreSQL pgvector query
 Governance           events, recall logs, update jobs, audit, retention
 ```
 
@@ -525,8 +519,8 @@ Governance           events, recall logs, update jobs, audit, retention
 | `memory/commands.py` | 原子 memory row 变更和事件记录 |
 | `memory/events.py` | append-only UserMemoryEvent |
 | `memory/jobs.py` | durable job 创建、dispatch claim、失败记录 |
-| `memory/vector_index.py` | 默认启用、可重建的 Qdrant memory point 增删查 |
-| `memory/reconcile.py` | 过期、重复、冲突和向量漂移检查/修复 |
+| `memory/vector_index.py` | 基于 PostgreSQL pgvector 的 active memory 语义查询与 SQLite 测试回退 |
+| `memory/reconcile.py` | 过期、重复、冲突及缺失/无效 embedding 检查与回填 |
 | `services/memory_service.py` | 兼容门面、跨模块事务和 API 用例 |
 | `workers/memory_tasks.py` | job worker、summary worker、Beat recovery |
 
@@ -598,7 +592,7 @@ Governance           events, recall logs, update jobs, audit, retention
 
 但当前自动分类只生成 `profile` 或 `semantic`。`episodic/procedural` 目前主要是数据标签，召回时与其他 non-profile memory 走同一相关性路径，尚未形成独立存储或不同衰减策略。
 
-`scope_type/scope_id` 已存在于数据库和 Qdrant payload，但公开创建 API 不允许用户选择 scope，正常创建默认：
+`scope_type/scope_id` 存在于数据库行中，但公开创建 API 不允许用户选择 scope，正常创建默认：
 
 ```text
 scope_type = user
@@ -749,9 +743,9 @@ Agent 目标召回：
 
 #### 无阈值语义排序
 
-Embedding 和 Qdrant 只负责对 bounded candidates 排序，不以相似度分数直接判断记忆是否相关、重复、补充或冲突。回答链路把 top-K 候选交给 Agent，更新链路把 top-K 候选交给 Memory Judge；语义关系由 LLM 在结构化契约内判断。
+Embedding 与 pgvector 只负责对 bounded candidates 排序，不以相似度分数直接判断记忆是否相关、重复、补充或冲突。回答链路把 top-K 候选交给 Agent，更新链路把 top-K 候选交给 Memory Judge；语义关系由 LLM 在结构化契约内判断。
 
-#### Qdrant 关闭或无命中
+#### pgvector 关闭或无命中
 
 1. PostgreSQL 读取 Profile 与 bounded recent active candidates。
 2. 计算 query embedding。
@@ -759,17 +753,17 @@ Embedding 和 Qdrant 只负责对 bounded candidates 排序，不以相似度分
 4. 按 cosine similarity 排序非 Profile memory。
 5. sticky 在前，ranked candidates 在后，按 recall limit 截断。
 
-#### Qdrant 开启
+#### pgvector 开启
 
 1. query embedding。
-2. Qdrant 按 `user_id + status=active` 过滤。
-3. 返回 bounded top-K point，不设置 score threshold。
+2. PostgreSQL 按 `user_id + status=active`、expiry、模型和维度过滤。
+3. pgvector 返回 bounded top-K memory id，不设置 score threshold。
 4. PostgreSQL 按 id 再校验 owner、status 和 expiry。
 5. vector 结果与 bounded semantic 结果合并为 `hybrid`。
 
-#### Embedding/Qdrant 失败
+#### Embedding/pgvector 查询失败
 
-- Qdrant 失败 -> 本地 semantic。
+- pgvector 查询失败 -> 有界 PostgreSQL semantic 候选。
 - query embedding 失败 -> lexical ranking。
 - lexical ranking 保留 bounded top-K，由后续 LLM 判断是否相关。
 - 候选数量仍受 recall limit 和 candidate limit 约束。
@@ -833,7 +827,7 @@ flowchart TD
     TURN[Committed user + assistant turn]
     EXTRACT[LLM Candidate Extractor]
     CAND[Structured candidates]
-    RELATED[Exact/key + Qdrant + PG fallback]
+    RELATED[Exact/key + pgvector + bounded PG candidates]
     JUDGE[Mandatory LLM Memory Judge]
     OPS[One final operation per candidate]
     EVID[Evidence and sensitivity guards]
@@ -871,10 +865,10 @@ Extractor 只收到：
 
 - PostgreSQL exact content hash；
 - PostgreSQL canonical key、category 与 pending；
-- Qdrant 当前用户 active memory 全量语义近邻；
+- PostgreSQL pgvector 当前用户 active memory 语义近邻；
 - 最近 PostgreSQL Editor candidates 作为有界回退。
 
-结果按 memory id 去重，exact、canonical 和 Qdrant 命中优先，最终最多 `MEMORY_EDITOR_CONTEXT_LIMIT` 条。
+结果按 memory id 去重，exact、canonical 和 pgvector 命中优先，最终最多 `MEMORY_EDITOR_CONTEXT_LIMIT` 条。
 
 #### 第二阶段：Memory Judge
 
@@ -1056,35 +1050,34 @@ dispatch claim 和 lease 防止连续扫描造成投递风暴。
 
 用户可以重试自己的 failed、明确未投递 queued 或过期 processing job。但只要存在更新的同用户 job，重放旧 job 返回 409，避免历史任务覆盖新事实。
 
-### 5.17 Qdrant memory index 与 reconcile
+### 5.17 PostgreSQL pgvector memory embedding 与 reconcile
 
-Qdrant memory index 在代码、开发模板和生产模板中均默认开启：
+PostgreSQL pgvector 记忆语义召回在代码、开发模板和生产模板中均默认开启：
 
 ```dotenv
 MEMORY_VECTOR_INDEX_ENABLED=true
 ```
 
-PostgreSQL 始终是权威数据源；Qdrant 只保存可重建 active memory point。回答阶段的 `memory(query)` 与更新阶段的候选相关记忆召回都会优先使用该索引，失败时回退 PostgreSQL 有界候选。
+PostgreSQL 是记忆内容和 embedding 的唯一存储。回答阶段的 `memory(query)` 与更新阶段的候选相关记忆召回都会优先使用 pgvector 查询，失败时回退 PostgreSQL 有界候选。
 
-开启后 point payload 至少包含 user_id、memory_id、status、category、kind、canonical_key、layer、scope 和 revision。
+开启后查询按 user_id、status、expiry、embedding model/dimension 过滤；memory row 本身保存 category、kind、canonical_key、layer、scope 和 revision。
 
 写入顺序以 PostgreSQL 为先：
 
-1. 数据库事务提交 memory。
-2. best-effort upsert/delete Qdrant point。
-3. 向量失败不回滚 PostgreSQL。
+1. 数据库事务提交 memory 及其 embedding。
+2. active memory 的 pgvector 查询直接读取该行。
+3. 不存在跨服务同步或由异步任务覆盖独立向量副本的窗口。
 
-这会允许短暂漂移，因此提供 reconcile：
+reconcile 用于处理历史数据、嵌入模型迁移或异常写入后的缺失/无效 embedding：
 
-- 检查 missing point；
-- 检查 stale revision/content；
-- 检查 unexpected point；
+- 检查 missing embedding；
+- 检查 embedding dimension 或内容异常；
 - 检查过期 memory；
 - 检查 exact/profile duplicate 与 semantic relation candidate；
 - dry-run 只报告；
-- apply 执行修复并写 vector_sync/vector_delete event/audit。
+- apply 重新生成 embedding 并写 `embedding_backfill` event/audit。
 
-Celery Beat 每日在 operational retention 之后执行一次仅针对向量索引的全用户 reconcile，自动回填 missing point 并修复 stale/unexpected point，不自动合并或删除 PostgreSQL 记忆。用户或管理员仍可显式调用完整 reconcile 检查过期、exact/profile duplicate 和待 LLM 审阅的 semantic relation candidate。
+Celery Beat 每日在 operational retention 之后执行一次全用户 embedding reconcile，自动回填 active memory 的 missing/invalid embedding，不自动合并或删除 PostgreSQL 记忆。用户或管理员仍可显式调用完整 reconcile 检查过期、exact/profile duplicate 和待 LLM 审阅的 semantic relation candidate。
 
 ### 5.18 删除、恢复与 purge
 
@@ -1116,8 +1109,7 @@ Celery Beat 每日在 operational retention 之后执行一次仅针对向量索
 3. 脱敏能通过 memory id 关联的 job actions 与 job user/assistant text。
 4. 递归脱敏 AgentRun state/trace 中的关联数据。
 5. 物理删除 UserMemory row。
-6. 创建 external cleanup job 删除 Qdrant point。
-7. 保留不含正文/hash/source 的治理审计事实。
+6. 保留不含正文/hash/source 的治理审计事实。
 
 Purge 不删除原始聊天消息，也不能保证删除所有无法通过 memory id 建立关联的文本副本。
 
@@ -1194,18 +1186,18 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 |---|---|---|
 | Redis short cache 失败 | 继续 | PostgreSQL history |
 | Redis conversation lease 在生产失败 | 拒绝 | HTTP 503，防止并发错序 |
-| Memory Qdrant 失败 | 继续 | PostgreSQL semantic/lexical |
+| Memory pgvector 查询失败 | 继续 | 有界 PostgreSQL semantic/lexical |
 | Embedding 失败 | 继续或写入失败 | Recall 保留 sticky/lexical；写入按 sync/async 语义记录失败 |
 | Recall log 写失败 | 继续 | rollback 日志事务，不丢回答 |
 | Candidate Extractor / Memory Judge 失败 | 继续 | Judge fail-closed ignore；async job 异常按 worker 策略重试 |
 | Memory Judge 返回不确定关系 | 继续 | 可裁决 pending；Judge 异常或非法目标则 fail-closed ignore |
 | Memory DB transaction 失败 | 继续回答 | 整批 operation 回滚 |
-| Qdrant memory sync 失败 | 继续 | PostgreSQL 保持成功；手工 reconcile |
+| Memory embedding backfill 失败 | 继续 | 保留 reconcile finding，等待下一次修复 |
 | Summary dispatch 失败 | 继续 | Beat 按 cursor 恢复 |
 | Summary LLM 失败/空结果 | 继续 | Celery retry + Beat |
 | Broker dispatch memory job 失败 | 继续 | durable queued job + Beat |
 | Worker 在 lease 期间死亡 | 继续 | lease 过期后重新 claim |
-| Purge Qdrant 删除失败 | DB purge 成功 | external cleanup job failed/retryable |
+| Purge memory | DB purge 成功 | memory row 与 embedding 在同一事务中删除 |
 | RAG RetrievalLog 缺失 | 不继续 | AgentRun failed，answer/citations 清空 |
 | 撤销知识库权限 | 历史不可见 | fail-closed 404 或列表过滤 |
 
@@ -1240,11 +1232,7 @@ Chat 侧简化 MemoryPanel 的“删除”调用 soft delete；真正物理删�
 | `REDIS_URL` | localhost:6379/0 | cache、broker、lease |
 | `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` | 3 | Redis 建连超时 |
 | `REDIS_SOCKET_TIMEOUT_SECONDS` | 3 | Redis 操作超时 |
-| `QDRANT_URL` | localhost:6333 | Qdrant 地址 |
-| `QDRANT_COLLECTION` | knowledge_chunks | 文档向量 collection |
-| `MEMORY_QDRANT_COLLECTION` | user_memories | 记忆向量 collection |
-| `MEMORY_VECTOR_INDEX_ENABLED` | true | 是否启用记忆 Qdrant 索引；回答召回与更新前相关记忆召回共用 |
-| `QDRANT_TIMEOUT_SECONDS` | 10 | Qdrant SDK 超时 |
+| `MEMORY_VECTOR_INDEX_ENABLED` | true | 是否启用基于 PostgreSQL pgvector 的记忆召回；回答召回与更新前相关记忆召回共用 |
 | `HEALTHCHECK_TIMEOUT_SECONDS` | 3 | readiness 外部依赖超时 |
 | `MINIO_ENDPOINT` | localhost:9000 | MinIO 地址 |
 | `MINIO_ACCESS_KEY` | minioadmin | MinIO 访问凭据 |
@@ -1342,7 +1330,7 @@ max(
 | `MEMORY_UPDATE_MODE` | sync | `sync` / `async` / `disabled` |
 | `MEMORY_MAX_OPERATIONS` | 3 | 一次候选提取允许的候选数；每条候选固定触发 Judge |
 | `MEMORY_EDITOR_CONTEXT_LIMIT` | 30 | 每条候选提供给 Memory Judge 的相关记忆上限 |
-| `MEMORY_EDITOR_CANDIDATE_LIMIT` | 80 | Qdrant 不可用时更新链路的 PostgreSQL 最近候选池上限 |
+| `MEMORY_EDITOR_CANDIDATE_LIMIT` | 80 | 更新链路 PostgreSQL 最近候选池上限 |
 | `MEMORY_RECALL_CANDIDATE_LIMIT` | 120 | bounded semantic fallback 候选上限 |
 | `MEMORY_SOURCE_MAX_CHARS` | 700 | 记忆来源文本保留上限 |
 | `MEMORY_SUMMARY_DELTA_MAX_CHARS` | 12000 | 送入 memory review 的摘要增量上限 |
@@ -1431,14 +1419,14 @@ broker visibility timeout 取“显式下限”与“memory lease x multiplier�
 |---|---|---|---|
 | 用户、权限、知识库、会话、消息 | PostgreSQL | - | 按 FK/cascade 和 service 治理 |
 | 原始文档 | MinIO | - | external cleanup job 删除对象 |
-| 文档 chunk 正文与 metadata | PostgreSQL | Qdrant 文档向量 | 先删 DB 业务状态，异步清理向量 |
+| 文档 chunk 正文、metadata 与 embedding | PostgreSQL + pgvector | - | 删除文档后由 FK/cascade 一并删除 |
 | Redis short memory | PostgreSQL Message 可回退 | Redis | TTL/best-effort 删除 |
 | 会话摘要 | PostgreSQL Conversation | - | 会话删除 cascade |
-| 长期记忆 | PostgreSQL UserMemory | Qdrant memory index | soft delete/restore 或 purge |
+| 长期记忆 | PostgreSQL UserMemory（含 embedding） | - | soft delete/restore 或 purge |
 | Agent/LLM/retrieval/recall 日志 | PostgreSQL | - | retention 或明确 purge 脱敏 |
 | durable memory/cleanup job | PostgreSQL | Redis 只是 broker | lease、retry、retention |
 
-权限判定不依赖 Qdrant 的最终正确性：检索 payload 先做范围筛选，回表解析与 service 层再验证用户、知识库、部门和密级边界。用户记忆不能扩大知识库可见范围，也不能替代企业事实证据。
+权限判定不依赖向量排序结果：检索 SQL 先做范围筛选，chunk 读取与 service 层再验证用户、知识库、部门和密级边界。用户记忆不能扩大知识库可见范围，也不能替代企业事实证据。
 
 ## 9. 验证与测试覆盖
 
@@ -1469,7 +1457,7 @@ python scripts/check_project.py
 
 - 当前是单个受预算约束的 tool-using Agent，不包含 Supervisor、Reviewer 或子 Agent。
 - 当前没有激活 cross-encoder reranker；每次 RAG 调用使用 Dense + BM25 + 无权重 RRF。
-- Qdrant memory index 是 best-effort acceleration，短暂漂移需 reconcile 修复。
+- pgvector embedding 与记忆行共同持久化；reconcile 只回填缺失或无效的 active-memory embedding。
 - citations 表示提供给模型的证据集合，不是逐句事实核验结果。
 - Redis 不可用时，生产会话并发控制 fail closed；这会牺牲可用性以防止跨进程错序。
 - `MEMORY_CONTEXT_MIN_SECTION_CHARS` 只在字符预算模式下生效；标准对话链路使用 token budget。

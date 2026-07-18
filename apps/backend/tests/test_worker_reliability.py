@@ -60,8 +60,8 @@ class WorkerReliabilityTests(unittest.TestCase):
             "recover_stale_conversation_summaries",
         )
         self.assertEqual(
-            schedules["reconcile-memory-vector-indexes-daily"]["task"],
-            "reconcile_memory_vector_indexes",
+            schedules["reconcile-memory-embeddings-daily"]["task"],
+            "reconcile_memory_embeddings",
         )
         self.assertFalse(schedules["apply-operational-retention-daily"]["kwargs"]["dry_run"])
 

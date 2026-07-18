@@ -251,15 +251,11 @@ class DocumentServiceTests(unittest.TestCase):
             session.commit()
             document_id = document.id
 
-            with (
-                patch("app.services.cleanup_service.remove_object") as remove_object,
-                patch("app.services.cleanup_service.delete_document_vectors") as delete_vectors,
-            ):
+            with patch("app.services.cleanup_service.remove_object") as remove_object:
                 delete_document(session, user.id, document_id)
 
             self.assertIsNone(session.get(Document, document_id))
             remove_object.assert_called_once_with("objects/delete-me.md")
-            delete_vectors.assert_called_once_with(document_id)
             audit_log = session.scalar(select(AuditLog).where(AuditLog.action == "document.delete"))
             self.assertIsNotNone(audit_log)
             self.assertEqual(audit_log.resource_id, document_id)
@@ -291,19 +287,19 @@ class DocumentServiceTests(unittest.TestCase):
             session.commit()
             document_id = document.id
 
-            with (
-                patch("app.services.cleanup_service.delete_document_vectors", side_effect=RuntimeError("qdrant offline")),
-                patch("app.services.cleanup_service.remove_object") as remove_object,
-            ):
+            with patch(
+                "app.services.cleanup_service.remove_object",
+                side_effect=RuntimeError("object storage offline"),
+            ) as remove_object:
                 delete_document(session, user.id, document_id)
 
             self.assertIsNone(session.get(Document, document_id))
-            remove_object.assert_not_called()
+            remove_object.assert_called_once_with("objects/cleanup.md")
             cleanup_job = session.scalar(select(ExternalCleanupJob).where(ExternalCleanupJob.resource_id == document_id))
             self.assertIsNotNone(cleanup_job)
             self.assertEqual(cleanup_job.status, "failed")
             self.assertEqual(cleanup_job.attempts, 1)
-            self.assertIn("qdrant offline", cleanup_job.error_message)
+            self.assertIn("object storage offline", cleanup_job.error_message)
             cleanup_audit = session.scalar(select(AuditLog).where(AuditLog.action == "document.external_cleanup"))
             self.assertIsNotNone(cleanup_audit)
             self.assertEqual(cleanup_audit.outcome, "failed")
@@ -311,15 +307,11 @@ class DocumentServiceTests(unittest.TestCase):
             self.assertEqual(delete_audit.extra_metadata["cleanup_status"], "failed")
             self.assertEqual(delete_audit.extra_metadata["cleanup_job_id"], cleanup_job.id)
 
-            with (
-                patch("app.services.cleanup_service.delete_document_vectors") as delete_vectors,
-                patch("app.services.cleanup_service.remove_object") as retry_remove_object,
-            ):
+            with patch("app.services.cleanup_service.remove_object") as retry_remove_object:
                 retried = run_external_cleanup_job(session, cleanup_job.id)
 
             self.assertEqual(retried.status, "completed")
             self.assertEqual(retried.attempts, 2)
-            delete_vectors.assert_called_once_with(document_id)
             retry_remove_object.assert_called_once_with("objects/cleanup.md")
 
     def test_non_admin_cannot_upload_to_public_knowledge_base(self) -> None:

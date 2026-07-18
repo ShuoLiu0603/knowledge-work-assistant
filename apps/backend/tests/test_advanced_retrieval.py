@@ -83,7 +83,7 @@ class AdvancedRetrievalTests(unittest.TestCase):
             hydrated = hydrate_retrieved_chunks(
                 session,
                 [
-                    make_chunk(indexed_chunk.id, score=0.9, content="stale qdrant payload"),
+                    make_chunk(indexed_chunk.id, score=0.9, content="stale dense payload"),
                     make_chunk(failed_chunk.id, score=0.8),
                     make_chunk("missing-chunk", score=0.7),
                 ],
